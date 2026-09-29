@@ -145,3 +145,65 @@ add_test(NAME event_test COMMAND event_test ${test_run_options})
 add_test(NAME cipher_context_test COMMAND cipher_context_test ${test_run_options})
 add_test(NAME crypto_rnd_test COMMAND crypto_rnd_test ${test_run_options})
 add_test(NAME digest_context_test COMMAND digest_context_test ${test_run_options})
+
+if(WITH_PROPERTY_TESTS)
+  include(FetchContent)
+  # 'default_generator' (reflect-cpp based derivation) is not needed and
+  # disabling it avoids fetching one more dependency
+  set(HEGEL_REFLECTION OFF CACHE BOOL "" FORCE)
+  if(WITH_ASAN)
+    set(HEGEL_SANITIZE "address" CACHE STRING "" FORCE)
+  endif()
+  FetchContent_Declare(
+    hegel
+    GIT_REPOSITORY https://github.com/hegeldev/hegel-cpp.git
+    GIT_TAG v0.13.1
+  )
+  FetchContent_MakeAvailable(hegel)
+
+  # hegel's public API passes standard library types (std::string,
+  # std::function, etc.) across the library boundary, so it must be built
+  # against the same standard library as the tests
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(hegel PRIVATE ${libcxx_options})
+  endif()
+  # marking hegel headers as system ones so that our strict warning flags
+  # (including -Werror) are not applied to them
+  get_target_property(hegel_include_directories hegel INTERFACE_INCLUDE_DIRECTORIES)
+  set_target_properties(hegel PROPERTIES
+    INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${hegel_include_directories}"
+  )
+
+  add_executable(gtid_set_property_test gtid_set_property_test.cpp)
+  target_include_directories(gtid_set_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(gtid_set_property_test
+    PRIVATE
+      binlog_server_compiler_flags
+      binsrv::lib_gtids
+      Boost::unit_test_framework
+      hegel
+  )
+  set_target_properties(gtid_set_property_test PROPERTIES
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+  )
+
+  add_executable(event_property_test event_property_test.cpp)
+  target_include_directories(event_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(event_property_test
+    PRIVATE
+      binlog_server_compiler_flags
+      binsrv::lib_gtids
+      binsrv::lib_events
+      Boost::unit_test_framework
+      ZLIB::ZLIB
+      hegel
+  )
+  set_target_properties(event_property_test PROPERTIES
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+  )
+
+  add_test(NAME gtid_set_property_test COMMAND gtid_set_property_test ${test_run_options})
+  add_test(NAME event_property_test COMMAND event_property_test ${test_run_options})
+endif()

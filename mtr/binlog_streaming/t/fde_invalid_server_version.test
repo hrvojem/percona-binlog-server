@@ -1,0 +1,113 @@
+#
+# Checks that a FORMAT_DESCRIPTION event whose server version string cannot
+# be parsed (e.g. "8.4.6_custom") is rejected with a regular error instead of
+# terminating the Binlog Server utility.
+#
+# A real server never writes such a string, so the test patches the
+# FORMAT_DESCRIPTION event of an already closed binlog file on the server
+# side (the server sends events of closed binlog files as they are on disk).
+#
+
+--source ../include/have_binsrv.inc
+
+--source ../include/v80_v84_compatibility_defines.inc
+
+# in case of --repeat=N, we need to start from a fresh binary log to make
+# this test deterministic
+--echo *** Resetting replication at the very beginning of the test.
+--disable_query_log
+eval $stmt_reset_binary_logs_and_gtids;
+--enable_query_log
+
+--echo
+--echo *** Determining the first binary log name.
+--let $first_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+
+# identifying backend storage type ('file' or 's3')
+--source ../include/identify_storage_backend.inc
+
+# creating data directory, configuration file, etc.
+--let $binsrv_connect_timeout = 20
+--let $binsrv_read_timeout = 60
+--let $binsrv_idle_time = 10
+--let $binsrv_verify_checksum = TRUE
+--let $binsrv_replication_mode = position
+--source ../include/set_up_binsrv_environment.inc
+
+--echo
+--echo *** Creating a simple table and filling it with some data.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(DEFAULT);
+
+--echo
+--echo *** Flushing the first binary log and switching to the second one.
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES(DEFAULT);
+
+--echo
+--echo *** Replacing the server version in the FORMAT_DESCRIPTION event of the
+--echo *** first binary log with a string that is not a valid version.
+--let PATCHED_BINLOG_PATH = $binlog_base_dir$first_binlog
+# keeping the real major / minor / patch so that the server itself treats the
+# event the same way as before, only the suffix is invalid for the utility
+--let PATCHED_SERVER_VERSION = `SELECT CONCAT(SUBSTRING_INDEX(@@global.version, '-', 1), '_custom')`
+--perl
+  use strict;
+  use warnings;
+  use Compress::Zlib qw(crc32);
+
+  my $file = $ENV{'PATCHED_BINLOG_PATH'};
+  my $version = $ENV{'PATCHED_SERVER_VERSION'};
+
+  my $common_header_length = 19;
+  my $footer_length = 4;
+  my $format_description_code = 15;
+  # right after the 4-byte binlog magic
+  my $event_offset = 4;
+  # post header: binlog_version (2 bytes) + server_version (50 bytes)
+  my $server_version_offset = $common_header_length + 2;
+  my $server_version_length = 50;
+
+  open(my $fh, '+<:raw', $file) or die "cannot open '$file': $!";
+  seek($fh, $event_offset, 0) or die "cannot seek in '$file': $!";
+  read($fh, my $header, $common_header_length) == $common_header_length
+    or die "cannot read the event common header";
+  ord(substr($header, 4, 1)) == $format_description_code
+    or die "the first event is not a FORMAT_DESCRIPTION event";
+  my $event_size = unpack('V', substr($header, 9, 4));
+
+  seek($fh, $event_offset, 0) or die "cannot seek in '$file': $!";
+  read($fh, my $event, $event_size) == $event_size
+    or die "cannot read the FORMAT_DESCRIPTION event";
+
+  length($version) < $server_version_length or die "server version is too long";
+  substr($event, $server_version_offset, $server_version_length) =
+    pack("a$server_version_length", $version);
+  # FORMAT_DESCRIPTION events always have a checksum footer
+  my $payload_size = $event_size - $footer_length;
+  substr($event, $payload_size, $footer_length) =
+    pack('V', crc32(substr($event, 0, $payload_size)));
+
+  seek($fh, $event_offset, 0) or die "cannot seek in '$file': $!";
+  print $fh $event or die "cannot write to '$file': $!";
+  close($fh) or die "cannot close '$file': $!";
+EOF
+
+--echo
+--echo *** Executing the Binlog Server utility. It must fail with a regular
+--echo *** error (exit code 1) instead of being terminated.
+--error 1
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null
+
+--echo
+--echo *** Dropping the table.
+DROP TABLE t1;
+
+--echo
+--echo *** Removing the patched binary log.
+--disable_query_log
+eval $stmt_reset_binary_logs_and_gtids;
+--enable_query_log
+
+# cleaning up
+--source ../include/tear_down_binsrv_environment.inc

@@ -1,0 +1,55 @@
+*** Resetting replication at the very beginning of the test.
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+
+*** Determining binlog file directory from the server.
+
+*** Creating a temporary directory <BINSRV_STORAGE_PATH> for storing
+*** binlog files downloaded via the Binlog Server utility.
+
+*** Creating a simple table (GNO 1) and inserting a record (GNO 2).
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES();
+
+*** Executing the Binlog Server utility and fetching all events.
+
+*** 1. Executing the Binlog Server utility in the 'search_by_gtid_set'
+***    mode with the maximum valid GNO (accepted, but not covered)
+include/read_file_to_var.inc
+
+*** 2. Executing the Binlog Server utility in the 'search_by_gtid_set'
+***    mode with GNO 0
+include/read_file_to_var.inc
+
+*** 3. Executing the Binlog Server utility in the 'search_by_gtid_set'
+***    mode with the maximum valid GNO + 1
+include/read_file_to_var.inc
+
+*** 4. Executing the Binlog Server utility in the 'search_by_gtid_set'
+***    mode with GNO 2^64 + 1 (must not wrap around to GNO 1)
+include/read_file_to_var.inc
+
+*** 5. Executing the Binlog Server utility in the 'search_by_gtid_set'
+***    mode with a 21-digit GNO
+include/read_file_to_var.inc
+
+*** 6. Executing the Binlog Server utility in the 'search_by_gtid_set'
+***    mode with an interval whose upper bound is the maximum valid
+***    GNO + 1
+include/read_file_to_var.inc
+
+*** 7. Executing the Binlog Server utility in the 'search_by_gtid_set'
+***    mode with an interval whose upper bound is UINT64_MAX
+include/read_file_to_var.inc
+
+*** Removing the search result file.
+
+*** Dropping the table.
+DROP TABLE t1;
+
+*** Removing the Binlog Server utility storage directory.
+
+*** Removing the Binlog Server utility log file.
+
+*** Removing the Binlog Server utility configuration file.

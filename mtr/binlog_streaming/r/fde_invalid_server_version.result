@@ -1,0 +1,36 @@
+*** Resetting replication at the very beginning of the test.
+
+*** Determining the first binary log name.
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+
+*** Determining binlog file directory from the server.
+
+*** Creating a temporary directory <BINSRV_STORAGE_PATH> for storing
+*** binlog files downloaded via the Binlog Server utility.
+
+*** Creating a simple table and filling it with some data.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(DEFAULT);
+
+*** Flushing the first binary log and switching to the second one.
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES(DEFAULT);
+
+*** Replacing the server version in the FORMAT_DESCRIPTION event of the
+*** first binary log with a string that is not a valid version.
+
+*** Executing the Binlog Server utility. It must fail with a regular
+*** error (exit code 1) instead of being terminated.
+
+*** Dropping the table.
+DROP TABLE t1;
+
+*** Removing the patched binary log.
+
+*** Removing the Binlog Server utility storage directory.
+
+*** Removing the Binlog Server utility log file.
+
+*** Removing the Binlog Server utility configuration file.

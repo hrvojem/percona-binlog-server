@@ -1,0 +1,42 @@
+*** Resetting replication at the very beginning of the test.
+
+*** Determining the first binary log name.
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+
+*** Determining binlog file directory from the server.
+
+*** Creating a temporary directory <BINSRV_STORAGE_PATH> for storing
+*** binlog files downloaded via the Binlog Server utility.
+
+*** Creating a simple table and inserting a record in a transaction
+*** with a tagged GTID.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+SET gtid_next = 'AUTOMATIC:pbs_oversized_tag_test';
+INSERT INTO t1 VALUES(DEFAULT);
+SET gtid_next = 'AUTOMATIC';
+
+*** Flushing the first binary log and switching to the second one.
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES(DEFAULT);
+
+*** Changing the encoded tag length in the GTID_TAGGED_LOG event of the
+*** first binary log to 40 (above the maximum of 32).
+
+*** Executing the Binlog Server utility. It must fail.
+
+*** Checking that the error is not reported as a memory allocation
+*** failure.
+include/assert_grep.inc [oversized tag must not be reported as bad_alloc]
+
+*** Dropping the table.
+DROP TABLE t1;
+
+*** Removing the patched binary log.
+
+*** Removing the Binlog Server utility storage directory.
+
+*** Removing the Binlog Server utility log file.
+
+*** Removing the Binlog Server utility configuration file.

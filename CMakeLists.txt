@@ -72,6 +72,11 @@ if(WITH_ASAN)
   target_link_options(binlog_server_compiler_flags INTERFACE "-fsanitize=address")
 endif()
 
+# Property-based tests use Hegel (https://hegel.dev), which is fetched at
+# configure time together with a prebuilt native engine library (libhegel),
+# so they are disabled by default to keep regular / packaging builds offline
+option(WITH_PROPERTY_TESTS "Build Hegel property-based tests (downloads hegel-cpp and libhegel)" OFF)
+
 find_package(Boost 1.90.0 EXACT REQUIRED COMPONENTS url json asio)
 
 find_package(MySQL REQUIRED)

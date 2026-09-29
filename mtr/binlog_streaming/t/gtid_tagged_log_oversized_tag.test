@@ -1,0 +1,91 @@
+#
+# Checks that a GTID_TAGGED_LOG event whose tag is longer than the maximum
+# of 32 characters is rejected with a regular "invalid data" error, not with
+# a misleading memory allocation (bad_alloc) error.
+#
+# A real server never writes such a tag, so the test patches the encoded tag
+# length of a GTID_TAGGED_LOG event in an already closed binlog file on the
+# server side (the server sends events of closed binlog files as they are on
+# disk). The Binlog Server utility is run in position-based mode, so that the
+# server does not need to decode GTID events itself.
+#
+
+--source ../include/have_binsrv.inc
+
+--source ../include/v80_v84_compatibility_defines.inc
+if ($lts_series != v84)
+{
+  --skip Tagged GTIDs require MySQL Server 8.4
+}
+
+# in case of --repeat=N, we need to start from a fresh binary log to make
+# this test deterministic
+--echo *** Resetting replication at the very beginning of the test.
+--disable_query_log
+eval $stmt_reset_binary_logs_and_gtids;
+--enable_query_log
+
+--echo
+--echo *** Determining the first binary log name.
+--let $first_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+
+# identifying backend storage type ('file' or 's3')
+--source ../include/identify_storage_backend.inc
+
+# creating data directory, configuration file, etc.
+--let $binsrv_connect_timeout = 20
+--let $binsrv_read_timeout = 60
+--let $binsrv_idle_time = 10
+--let $binsrv_verify_checksum = TRUE
+--let $binsrv_replication_mode = position
+--source ../include/set_up_binsrv_environment.inc
+
+--echo
+--echo *** Creating a simple table and inserting a record in a transaction
+--echo *** with a tagged GTID.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+SET gtid_next = 'AUTOMATIC:pbs_oversized_tag_test';
+INSERT INTO t1 VALUES(DEFAULT);
+SET gtid_next = 'AUTOMATIC';
+
+--echo
+--echo *** Flushing the first binary log and switching to the second one.
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES(DEFAULT);
+
+--echo
+--echo *** Changing the encoded tag length in the GTID_TAGGED_LOG event of the
+--echo *** first binary log to 40 (above the maximum of 32).
+--let PATCHED_BINLOG_PATH = $binlog_base_dir$first_binlog
+--let PATCHED_EVENT_CODE = 42
+--let PATCHED_TAG = pbs_oversized_tag_test
+--let PATCHED_TAG_LENGTH = 40
+--let PATCHED_BINLOG_HAS_CHECKSUMS = `SELECT @@global.binlog_checksum = 'CRC32'`
+--source ../include/patch_tag_length_in_binlog.inc
+
+--echo
+--echo *** Executing the Binlog Server utility. It must fail.
+--error 1
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null
+
+--echo
+--echo *** Checking that the error is not reported as a memory allocation
+--echo *** failure.
+--let $assert_text = oversized tag must not be reported as bad_alloc
+--let $assert_file = $binsrv_log_path
+--let $assert_count = 0
+--let $assert_select = bad_alloc
+--source include/assert_grep.inc
+
+--echo
+--echo *** Dropping the table.
+DROP TABLE t1;
+
+--echo
+--echo *** Removing the patched binary log.
+--disable_query_log
+eval $stmt_reset_binary_logs_and_gtids;
+--enable_query_log
+
+# cleaning up
+--source ../include/tear_down_binsrv_environment.inc

@@ -33,7 +33,6 @@
 #include <limits>
 #include <optional>
 #include <ostream>
-#include <source_location>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -48,10 +47,11 @@
 // NOLINTNEXTLINE(misc-include-cleaner)
 #include <boost/test/unit_test.hpp>
 
-#include <boost/test/framework.hpp>
 #include <boost/test/unit_test_suite.hpp>
 
 #include <hegel/hegel.h>
+
+#include "property_test_helpers.hpp"
 
 #include "binsrv/replication_mode_type.hpp"
 
@@ -97,23 +97,8 @@ constexpr std::uint64_t max_generated_microseconds{9'000'000'000'000'000ULL};
 // <tag> ::= [a-zA-Z_][a-zA-Z0-9_]{0,31} (see the grammar in gtid_set.cpp)
 constexpr std::string_view tag_pattern{"[a-zA-Z_][a-zA-Z0-9_]{0,31}"};
 
-// runs a Hegel property inside the current Boost.Test test case: the test
-// case name is used both in the failure report and as the Hegel example
-// database key, so that a failure found once is replayed first next time
-void run_property(
-    const std::function<void(hegel::TestCase &)> &body,
-    const std::source_location location = std::source_location::current()) {
-  hegel::test(body,
-              hegel::TestLocation{
-                  boost::unit_test::framework::current_test_case().p_name.get(),
-                  location.file_name(), static_cast<int>(location.line())});
-}
-
-void require(bool condition, const std::string &message) {
-  if (!condition) {
-    throw std::runtime_error{message};
-  }
-}
+using property_testing::require;
+using property_testing::run_property;
 
 [[nodiscard]] std::string to_string(const events::event &value) {
   std::ostringstream stream;

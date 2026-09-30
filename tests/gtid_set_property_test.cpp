@@ -30,7 +30,6 @@
 #include <limits>
 #include <ostream>
 #include <set>
-#include <source_location>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -47,10 +46,11 @@
 // NOLINTNEXTLINE(misc-include-cleaner)
 #include <boost/test/unit_test.hpp>
 
-#include <boost/test/framework.hpp>
 #include <boost/test/unit_test_suite.hpp>
 
 #include <hegel/hegel.h>
+
+#include "property_test_helpers.hpp"
 
 #include "binsrv/gtids/common_types.hpp"
 #include "binsrv/gtids/gtid.hpp"
@@ -87,23 +87,8 @@ constexpr std::string_view tag_pattern{"[a-zA-Z_][a-zA-Z0-9_]{0,31}"};
 using model_gtid = std::tuple<std::size_t, std::size_t, gno_t>;
 using model_type = std::set<model_gtid>;
 
-// runs a Hegel property inside the current Boost.Test test case: the test
-// case name is used both in the failure report and as the Hegel example
-// database key, so that a failure found once is replayed first next time
-void run_property(
-    const std::function<void(hegel::TestCase &)> &body,
-    const std::source_location location = std::source_location::current()) {
-  hegel::test(body,
-              hegel::TestLocation{
-                  boost::unit_test::framework::current_test_case().p_name.get(),
-                  location.file_name(), static_cast<int>(location.line())});
-}
-
-void require(bool condition, const std::string &message) {
-  if (!condition) {
-    throw std::runtime_error{message};
-  }
-}
+using property_testing::require;
+using property_testing::run_property;
 
 [[nodiscard]] uuid pool_uuid(std::size_t index) {
   return uuid{uuid_pool.at(index)};

@@ -204,6 +204,21 @@ if(WITH_PROPERTY_TESTS)
     CXX_EXTENSIONS NO
   )
 
+  add_executable(storage_property_test storage_property_test.cpp)
+  target_include_directories(storage_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(storage_property_test
+    PRIVATE
+      binlog_server_compiler_flags
+      binsrv::lib_binsrv
+      Boost::unit_test_framework
+      hegel
+  )
+  set_target_properties(storage_property_test PROPERTIES
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+  )
+
   add_test(NAME gtid_set_property_test COMMAND gtid_set_property_test ${test_run_options})
   add_test(NAME event_property_test COMMAND event_property_test ${test_run_options})
+  add_test(NAME storage_property_test COMMAND storage_property_test ${test_run_options})
 endif()

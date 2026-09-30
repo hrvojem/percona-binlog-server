@@ -534,13 +534,13 @@ set(operations_source_files
   src/operations/version_operation.cpp
 )
 
-set(binsrv_source_files
-  # main application files
+set(app_source_files
   src/app.cpp
 
   src/app_version.hpp
+)
 
-  # binlog files
+set(binsrv_source_files
   src/binsrv/basic_logger_fwd.hpp
   src/binsrv/basic_logger.hpp
   src/binsrv/basic_logger.cpp
@@ -666,6 +666,29 @@ set(binsrv_source_files
   src/binsrv/time_unit.cpp
 )
 
+add_library(lib_binsrv STATIC ${binsrv_source_files})
+target_link_libraries(lib_binsrv
+  PUBLIC
+    binsrv::lib_util
+    binsrv::lib_easymysql
+    binsrv::lib_gtids
+    binsrv::lib_events
+    binsrv::lib_models
+    binsrv::lib_opensslpp
+    Boost::headers Boost::json Boost::url
+  PRIVATE
+    binlog_server_compiler_flags
+    aws-cpp-sdk-s3-crt
+    OpenSSL::Crypto
+)
+# it is not possible to propagate CXX_EXTENSIONS and CXX_STANDARD_REQUIRED
+# via interface library (binlog_server_compiler_flags)
+set_target_properties(lib_binsrv PROPERTIES
+  CXX_STANDARD_REQUIRED YES
+  CXX_EXTENSIONS NO
+)
+add_library(binsrv::lib_binsrv ALIAS lib_binsrv)
+
 set(mysql_harness_source_files
   extra/mysql_protocol/mysql/harness/net_ts/buffer.h
 
@@ -712,7 +735,7 @@ set(minimysql_source_files
 )
 
 add_executable(binlog_server
-  ${binsrv_source_files}
+  ${app_source_files}
   ${operations_source_files}
   ${minimysql_source_files}
   ${mysql_protocol_source_files}
@@ -722,6 +745,7 @@ target_include_directories(binlog_server PRIVATE "${PROJECT_SOURCE_DIR}/extra/my
 target_link_libraries(binlog_server
   PRIVATE
     binlog_server_compiler_flags
+    binsrv::lib_binsrv
     binsrv::lib_util
     binsrv::lib_easymysql
     binsrv::lib_gtids

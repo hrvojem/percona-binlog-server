@@ -5,3 +5,6 @@
 
 # Visual Studio Code option directory
 .vscode/
+
+# Python bytecode cache directory
+__pycache__/

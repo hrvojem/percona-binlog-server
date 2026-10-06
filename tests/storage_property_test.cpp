@@ -44,7 +44,16 @@
 // - purging the oldest binlogs from another storage instance in purging mode
 //   (as the 'purge_binlogs' operation does while 'fetch' / 'pull' keeps
 //   running) leaves a storage that can be opened again at any moment and
-//   holds exactly the remaining binlogs.
+//   holds exactly the remaining binlogs;
+// - opening a storage in which one file was damaged afterwards (deleted,
+//   truncated, extended, a byte changed, a JSON value replaced, an unexpected
+//   file added, binlog index entries dropped, duplicated, swapped or added,
+//   or the metadata of every binlog damaged) never crashes and fails only
+//   with a regular exception; damage that breaks the storage structure is
+//   rejected when streaming, damage the storage is designed to tolerate (a
+//   changed byte in binlog data, extra data at the end of the last binlog) is
+//   accepted with unchanged binlog records, and opening for queries skips
+//   exactly the binlogs whose metadata cannot be read.
 //
 // The generated events are not real binlog events, but each one starts with
 // a valid 19-byte common header (type code, event size), which is all the
@@ -67,6 +76,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <new>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -799,6 +809,189 @@ void require_same_events(const event_list &received,
 }
 
 // ---------------------------------------------------------------------------
+// damaged storage files
+// ---------------------------------------------------------------------------
+
+enum class damage_kind : std::uint8_t {
+  delete_file,
+  truncate_file,
+  change_byte,
+  append_garbage,
+  replace_text,
+  add_unexpected_file,
+  index_drop_entry,
+  index_duplicate_entry,
+  index_swap_entries,
+  index_add_entry,
+  index_crlf_line_endings,
+  damage_every_binlog_metadata
+};
+
+constexpr std::array damage_kind_names{
+    std::string_view{"delete_file"},
+    std::string_view{"truncate_file"},
+    std::string_view{"change_byte"},
+    std::string_view{"append_garbage"},
+    std::string_view{"replace_text"},
+    std::string_view{"add_unexpected_file"},
+    std::string_view{"index_drop_entry"},
+    std::string_view{"index_duplicate_entry"},
+    std::string_view{"index_swap_entries"},
+    std::string_view{"index_add_entry"},
+    std::string_view{"index_crlf_line_endings"},
+    std::string_view{"damage_every_binlog_metadata"}};
+
+// the damage to apply; file, positions and replacement are chosen from these
+// values modulo what the storage holds
+struct damage {
+  damage_kind kind;
+  std::size_t target;
+  std::size_t position;
+  std::size_t other_position;
+  std::uint8_t mask;
+  std::string text;
+};
+
+std::ostream &operator<<(std::ostream &output, const damage &value) {
+  return output << damage_kind_names.at(static_cast<std::size_t>(value.kind))
+                << "(target " << value.target << ", position "
+                << value.position << ", other position "
+                << value.other_position << ", mask "
+                << static_cast<unsigned>(value.mask) << ", text '"
+                << value.text << "')";
+}
+
+[[nodiscard]] gs::Generator<damage> damages() {
+  return gs::compose([](const hegel::TestCase &tc) {
+    const auto position{[&tc] {
+      return tc.draw(gs::integers<std::size_t>(
+          {.min_value = 0U, .max_value = 1U << 20U}));
+    }};
+    damage result{
+        .kind = static_cast<damage_kind>(tc.draw(gs::integers<std::size_t>(
+            {.min_value = 0U,
+             .max_value = std::size(damage_kind_names) - 1U}))),
+        .target = position(),
+        .position = position(),
+        .other_position = position(),
+        .mask = tc.draw(gs::integers<std::uint8_t>({.min_value = 1U, .max_value = 255U})),
+        .text = {}};
+    // JSON values of other types and out-of-range numbers, unexpected file
+    // names, and binlog index entries
+    result.text = tc.draw(gs::sampled_from<std::string>(
+        {"", "null", "-1", "0", "1.5", "1e999", "18446744073709551616",
+         "\"\"", "\"x\"", "[]", "{}", "true", "\"11111111-aaaa-1111-aaaa-"
+         "111111111111:0\"", "\"2026-10-06T99:99:99\"", "binlog.000099",
+         "binlog.000099.json", "notes.txt", "./binlog.000001",
+         "./binlog.000099", "../binlog.000001", "binlog.index",
+         "./binlog.index", "./", "./binlog.0000001", "./binlog.00000a"}));
+    return result;
+  });
+}
+
+[[nodiscard]] std::vector<std::string>
+storage_file_names(const std::filesystem::path &directory) {
+  std::vector<std::string> result;
+  for (const auto &entry : std::filesystem::directory_iterator{directory}) {
+    result.push_back(entry.path().filename().string());
+  }
+  std::ranges::sort(result);
+  return result;
+}
+
+[[nodiscard]] std::string read_text(const std::filesystem::path &path) {
+  const auto bytes{read_file(path)};
+  std::string result(std::size(bytes), '\0');
+  std::ranges::transform(bytes, std::begin(result), [](std::byte value) {
+    return static_cast<char>(std::to_integer<unsigned char>(value));
+  });
+  return result;
+}
+
+void write_text(const std::filesystem::path &path, std::string_view content) {
+  std::ofstream output{path, std::ios::binary | std::ios::trunc};
+  output.write(std::data(content),
+               static_cast<std::streamsize>(std::size(content)));
+  if (!output) {
+    throw std::runtime_error{"cannot write '" + path.string() + "'"};
+  }
+}
+
+[[nodiscard]] std::vector<std::string> split_lines(std::string_view text) {
+  std::vector<std::string> result;
+  std::size_t start{0U};
+  while (start < std::size(text)) {
+    const auto end{text.find('\n', start)};
+    const auto line{text.substr(start, end - start)};
+    if (!line.empty()) {
+      result.emplace_back(line);
+    }
+    if (end == std::string_view::npos) {
+      break;
+    }
+    start = end + 1U;
+  }
+  return result;
+}
+
+[[nodiscard]] std::string join_lines(const std::vector<std::string> &lines,
+                                     std::string_view ending = "\n") {
+  std::string result;
+  for (const auto &line : lines) {
+    result += line;
+    result += ending;
+  }
+  return result;
+}
+
+[[nodiscard]] bool same_records(const binsrv::binlog_record &first,
+                                const binsrv::binlog_record &second) {
+  return first.name == second.name && first.size == second.size &&
+         first.previous_gtids == second.previous_gtids &&
+         first.added_gtids == second.added_gtids &&
+         first.timestamps.is_empty() == second.timestamps.is_empty() &&
+         (first.timestamps.is_empty() ||
+          (first.timestamps.get_min_timestamp() ==
+               second.timestamps.get_min_timestamp() &&
+           first.timestamps.get_max_timestamp() ==
+               second.timestamps.get_max_timestamp())) &&
+         first.last_sequence_number == second.last_sequence_number &&
+         first.encryption.has_value() == second.encryption.has_value();
+}
+
+// what opening a storage led to
+struct open_outcome {
+  std::optional<binsrv::binlog_record_container> records;
+  std::string error;
+};
+
+// opens a storage, turning a regular exception into a rejection; anything
+// else (a crash, std::terminate, a non-standard exception or an allocation
+// failure reported for corrupted data) fails the property
+[[nodiscard]] open_outcome
+open_storage(const std::filesystem::path &config_path,
+             binsrv::storage_construction_mode_type construction_mode) {
+  open_outcome result{};
+  try {
+    const auto storage{make_storage(config_path, construction_mode)};
+    result.records = storage->get_binlog_records();
+  } catch (const std::bad_alloc &e) {
+    throw std::runtime_error{std::string{"rejected with std::bad_alloc: "} +
+                             e.what()};
+  } catch (const std::exception &e) {
+    const std::string message{e.what()};
+    if (message.find("bad_alloc") != std::string::npos) {
+      throw std::runtime_error{"rejected with an allocation failure: " +
+                               message};
+    }
+    result.error = message;
+  } catch (...) {
+    throw std::runtime_error{"rejected with a non-standard exception"};
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // running a sequence of operations
 // ---------------------------------------------------------------------------
 
@@ -807,7 +1000,8 @@ enum class checked_properties : std::uint8_t {
   checkpoint_size_bound,
   read_back,
   concurrent_read_back,
-  purge_reopenable
+  purge_reopenable,
+  damaged_files
 };
 
 [[nodiscard]] bool reads_back(checked_properties properties) noexcept {
@@ -969,6 +1163,278 @@ public:
     check();
   }
 
+  // damages one file (or every binlog metadata file) of a copy of the
+  // storage as it is on disk now, and opens the copy for streaming and for
+  // queries
+  void check_damaged_copy(const damage &value) {
+    const auto copy_directory{root_.path() / "damaged"};
+    std::filesystem::remove_all(copy_directory);
+    std::filesystem::copy(storage_directory_, copy_directory,
+                          std::filesystem::copy_options::recursive);
+    const auto copy_config{
+        write_config(root_.path(), copy_directory, settings_)};
+
+    // the binlog records as the undamaged files describe them
+    const auto reference_outcome{open_storage(
+        copy_config, binsrv::storage_construction_mode_type::querying_only)};
+    require(reference_outcome.records.has_value(),
+            "the undamaged storage cannot be opened for queries: " +
+                reference_outcome.error);
+    const auto &reference{*reference_outcome.records};
+    require(!reference.empty(), "the undamaged storage has no binlogs");
+
+    const auto files{storage_file_names(copy_directory)};
+    const std::string index_name{
+        binsrv::storage_core::default_binlog_index_name};
+    const std::string metadata_name{binsrv::storage_core::metadata_name};
+    const auto is_binlog_metadata{[&metadata_name](const std::string &name) {
+      return name != metadata_name && name.ends_with(".json");
+    }};
+    const auto last_binlog{reference.back().name.str()};
+
+    // what the damage must lead to when opening for streaming
+    enum class expectation : std::uint8_t { rejected, accepted, either };
+    auto expected{expectation::either};
+    // the binlogs whose metadata files were damaged
+    std::vector<std::string> damaged_metadata;
+    std::ostringstream description_stream;
+    description_stream << value << ':';
+    std::string description{description_stream.str()};
+
+    const auto target_name{files[value.target % std::size(files)]};
+    const auto target_path{copy_directory / target_name};
+    const bool target_is_data{target_name != index_name &&
+                              target_name != metadata_name &&
+                              !is_binlog_metadata(target_name)};
+    const auto binlog_of_metadata{[](const std::string &name) {
+      return name.substr(0U, std::size(name) - std::string_view{".json"}.size());
+    }};
+    const auto index_path{copy_directory / index_name};
+
+    switch (value.kind) {
+    case damage_kind::delete_file:
+      std::filesystem::remove(target_path);
+      description += " deleting '" + target_name + "'";
+      expected = expectation::rejected;
+      if (is_binlog_metadata(target_name)) {
+        damaged_metadata.push_back(binlog_of_metadata(target_name));
+      }
+      break;
+    case damage_kind::truncate_file: {
+      const auto size{std::filesystem::file_size(target_path)};
+      if (size == 0U) {
+        return;
+      }
+      const auto new_size{value.position % size};
+      std::filesystem::resize_file(target_path, new_size);
+      description += " truncating '" + target_name + "' to " +
+                     std::to_string(new_size) + " bytes";
+      if (target_is_data) {
+        // a binlog shorter than its metadata says cannot be recovered
+        const auto record_it{std::ranges::find(
+            reference, target_name,
+            [](const binsrv::binlog_record &record) {
+              return record.name.str();
+            })};
+        if (record_it != std::cend(reference) && new_size < record_it->size) {
+          expected = expectation::rejected;
+        }
+      }
+      if (is_binlog_metadata(target_name)) {
+        damaged_metadata.push_back(binlog_of_metadata(target_name));
+      }
+      break;
+    }
+    case damage_kind::change_byte: {
+      auto content{read_text(target_path)};
+      if (content.empty()) {
+        return;
+      }
+      auto &byte{content[value.position % std::size(content)]};
+      byte = static_cast<char>(static_cast<unsigned char>(byte) ^ value.mask);
+      write_text(target_path, content);
+      description += " changing a byte of '" + target_name + "'";
+      // the storage does not check binlog data (there is a TODO for it), so
+      // a changed byte there leaves the records as they are
+      if (target_is_data) {
+        expected = expectation::accepted;
+      }
+      if (is_binlog_metadata(target_name)) {
+        damaged_metadata.push_back(binlog_of_metadata(target_name));
+      }
+      break;
+    }
+    case damage_kind::append_garbage: {
+      auto content{read_text(target_path)};
+      content += value.text.empty() ? std::string{"garbage"} : value.text;
+      write_text(target_path, content);
+      description += " appending to '" + target_name + "'";
+      if (target_is_data) {
+        // extra data at the end of the last binlog is what an interrupted
+        // write leaves behind and is truncated on startup; anywhere else the
+        // sizes no longer match
+        expected = target_name == last_binlog ? expectation::accepted
+                                              : expectation::rejected;
+      }
+      if (is_binlog_metadata(target_name)) {
+        damaged_metadata.push_back(binlog_of_metadata(target_name));
+      }
+      break;
+    }
+    case damage_kind::replace_text: {
+      if (target_is_data) {
+        return;
+      }
+      auto content{read_text(target_path)};
+      const auto start{value.position % (std::size(content) + 1U)};
+      const auto length{std::min(value.other_position % 24U,
+                                 std::size(content) - start)};
+      content.replace(start, length, value.text);
+      write_text(target_path, content);
+      description += " replacing '" + target_name + "' bytes " +
+                     std::to_string(start) + ".." +
+                     std::to_string(start + length) + " with '" + value.text +
+                     "'";
+      if (is_binlog_metadata(target_name)) {
+        damaged_metadata.push_back(binlog_of_metadata(target_name));
+      }
+      break;
+    }
+    case damage_kind::add_unexpected_file: {
+      auto name{value.text};
+      if (name.empty() || name.find('/') != std::string::npos ||
+          std::filesystem::exists(copy_directory / name)) {
+        name = "unexpected.bin";
+      }
+      write_text(copy_directory / name, "unexpected");
+      description += " adding '" + name + "'";
+      expected = expectation::rejected;
+      break;
+    }
+    case damage_kind::index_drop_entry:
+    case damage_kind::index_duplicate_entry:
+    case damage_kind::index_swap_entries:
+    case damage_kind::index_add_entry:
+    case damage_kind::index_crlf_line_endings: {
+      auto lines{split_lines(read_text(index_path))};
+      if (lines.empty()) {
+        return;
+      }
+      const auto first{value.position % std::size(lines)};
+      const auto second{value.other_position % std::size(lines)};
+      const auto first_it{
+          std::next(std::begin(lines), static_cast<std::ptrdiff_t>(first))};
+      std::string ending{"\n"};
+      switch (value.kind) {
+      case damage_kind::index_drop_entry:
+        lines.erase(first_it);
+        description += " dropping binlog index entry " + std::to_string(first);
+        expected = expectation::rejected;
+        break;
+      case damage_kind::index_duplicate_entry:
+        lines.insert(first_it, *first_it);
+        description +=
+            " duplicating binlog index entry " + std::to_string(first);
+        expected = expectation::rejected;
+        break;
+      case damage_kind::index_swap_entries:
+        if (first == second) {
+          return;
+        }
+        std::iter_swap(first_it, std::next(std::begin(lines),
+                                           static_cast<std::ptrdiff_t>(second)));
+        description += " swapping binlog index entries " +
+                       std::to_string(first) + " and " + std::to_string(second);
+        break;
+      case damage_kind::index_add_entry:
+        if (value.text.empty() ||
+            std::ranges::find(lines, value.text) != std::cend(lines)) {
+          return;
+        }
+        lines.insert(first_it, value.text);
+        description += " adding binlog index entry '" + value.text + "'";
+        expected = expectation::rejected;
+        break;
+      default:
+        ending = "\r\n";
+        description += " using CRLF line endings in the binlog index";
+        break;
+      }
+      write_text(index_path, join_lines(lines, ending));
+      break;
+    }
+    case damage_kind::damage_every_binlog_metadata:
+      for (const auto &name : files) {
+        if (is_binlog_metadata(name)) {
+          const auto path{copy_directory / name};
+          std::filesystem::resize_file(path,
+                                       std::filesystem::file_size(path) / 2U);
+          damaged_metadata.push_back(binlog_of_metadata(name));
+        }
+      }
+      description += " truncating every binlog metadata file to half";
+      expected = expectation::rejected;
+      break;
+    }
+
+    // opening for queries: binlogs with readable metadata are returned as
+    // they were, the others are skipped
+    const auto queried{open_storage(
+        copy_config, binsrv::storage_construction_mode_type::querying_only)};
+    if (queried.records.has_value()) {
+      for (const auto &record : *queried.records) {
+        const auto name{record.name.str()};
+        if (std::ranges::find(damaged_metadata, name) !=
+            std::cend(damaged_metadata)) {
+          continue;
+        }
+        const auto reference_it{std::ranges::find(
+            reference, record.name, &binsrv::binlog_record::name)};
+        require(reference_it != std::cend(reference),
+                description + ": opening for queries returned an unknown "
+                              "binlog '" + name + "'");
+        if (value.kind != damage_kind::damage_every_binlog_metadata &&
+            target_name != metadata_name) {
+          require(same_records(record, *reference_it),
+                  description + ": opening for queries returned a changed "
+                                "record for '" + name + "'");
+        }
+      }
+      if (value.kind == damage_kind::damage_every_binlog_metadata) {
+        require(queried.records->empty(),
+                description + ": opening for queries returned " +
+                    std::to_string(std::size(*queried.records)) +
+                    " binlog(s) with unreadable metadata");
+      }
+    }
+
+    // opening for streaming
+    const auto streamed{open_storage(
+        copy_config, binsrv::storage_construction_mode_type::streaming)};
+    if (expected == expectation::rejected) {
+      require(!streamed.records.has_value(),
+              description + ": the storage was opened for streaming");
+    }
+    if (expected == expectation::accepted) {
+      require(streamed.records.has_value(),
+              description + ": the storage was rejected: " + streamed.error);
+      require(std::size(*streamed.records) == std::size(reference),
+              description + ": opened with " +
+                  std::to_string(std::size(*streamed.records)) +
+                  " binlogs instead of " + std::to_string(std::size(reference)));
+      for (std::size_t index{0U}; index < std::size(reference); ++index) {
+        require(same_records((*streamed.records)[index], reference[index]),
+                description + ": opened with a changed record for '" +
+                    reference[index].name.str() + "'");
+      }
+      // extra data at the end of the last binlog is cut off
+      require(std::filesystem::file_size(copy_directory / last_binlog) ==
+                  reference.back().size,
+              description + ": the last binlog was not truncated to " +
+                  std::to_string(reference.back().size) + " bytes");
+    }
+  }
+
 private:
   storage_settings settings_;
   checked_properties properties_;
@@ -1128,7 +1594,8 @@ private:
     const auto unflushed{
         unflushed_complete_size(current, state.transactions_on_disk)};
 
-    if (properties_ == checked_properties::model_agreement) {
+    if (properties_ == checked_properties::model_agreement ||
+        properties_ == checked_properties::damaged_files) {
       const auto expected_position{state.file_size + unflushed +
                                    model_.get_incomplete_size()};
       require(storage_->get_current_position() == expected_position,
@@ -1167,11 +1634,18 @@ private:
 void run_storage_property(hegel::TestCase &tc, checked_properties properties) {
   const auto settings{tc.draw("settings", storage_settings_generator())};
   const auto ops{tc.draw("ops", gs::vectors(operations()))};
+  std::optional<damage> damage_value;
+  if (properties == checked_properties::damaged_files) {
+    damage_value = tc.draw("damage", damages());
+  }
   storage_harness harness{settings, properties};
   for (const auto &op : ops) {
     harness.apply(op);
   }
   harness.finish();
+  if (damage_value.has_value()) {
+    harness.check_damaged_copy(*damage_value);
+  }
 }
 
 } // anonymous namespace
@@ -1203,5 +1677,11 @@ BOOST_AUTO_TEST_CASE(StoragePurgeKeepsStorageReopenable) {
 BOOST_AUTO_TEST_CASE(StorageConcurrentReadBackMatchesDisk) {
   run_property([](hegel::TestCase &tc) {
     run_storage_property(tc, checked_properties::concurrent_read_back);
+  });
+}
+
+BOOST_AUTO_TEST_CASE(StorageOpeningOfDamagedFilesFailsCleanly) {
+  run_property([](hegel::TestCase &tc) {
+    run_storage_property(tc, checked_properties::damaged_files);
   });
 }

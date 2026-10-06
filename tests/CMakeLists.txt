@@ -251,9 +251,38 @@ if(WITH_PROPERTY_TESTS)
     CXX_EXTENSIONS NO
   )
 
+  # connection_context (the MySQL protocol side of the replication source
+  # listener) is part of the executable's minimysql sources, so it is
+  # compiled into the test directly, together with the protocol codec headers
+  add_executable(minimysql_property_test
+    minimysql_property_test.cpp
+    "${PROJECT_SOURCE_DIR}/src/minimysql/connection_context.cpp"
+    "${PROJECT_SOURCE_DIR}/src/minimysql/caching_sha2_password_authenticator.cpp"
+  )
+  target_include_directories(minimysql_property_test
+    PRIVATE
+      "${PROJECT_SOURCE_DIR}/src"
+      "${PROJECT_SOURCE_DIR}/extra/mysql_protocol"
+  )
+  target_link_libraries(minimysql_property_test
+    PRIVATE
+      binlog_server_compiler_flags
+      binsrv::lib_opensslpp
+      binsrv::lib_util
+      Boost::headers
+      MySQL::client
+      Boost::unit_test_framework
+      hegel
+  )
+  set_target_properties(minimysql_property_test PROPERTIES
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+  )
+
   add_test(NAME gtid_set_property_test COMMAND gtid_set_property_test ${test_run_options})
   add_test(NAME event_property_test COMMAND event_property_test ${test_run_options})
   add_test(NAME storage_property_test COMMAND storage_property_test ${test_run_options})
   add_test(NAME indexed_event_block_property_test COMMAND indexed_event_block_property_test ${test_run_options})
   add_test(NAME cipher_context_property_test COMMAND cipher_context_property_test ${test_run_options})
+  add_test(NAME minimysql_property_test COMMAND minimysql_property_test ${test_run_options})
 endif()

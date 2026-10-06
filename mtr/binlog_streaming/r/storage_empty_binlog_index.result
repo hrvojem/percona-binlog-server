@@ -1,0 +1,39 @@
+*** Resetting replication at the very beginning of the test.
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+
+*** Determining binlog file directory from the server.
+
+*** Creating a temporary directory <BINSRV_STORAGE_PATH> for storing
+*** binlog files downloaded via the Binlog Server utility.
+
+*** Creating a simple table and filling it with some data.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(DEFAULT);
+
+*** Executing the Binlog Server utility and fetching all events.
+
+*** Emptying the binlog index in the storage.
+
+*** Executing the Binlog Server utility in the 'search_by_timestamp'
+*** mode. It must fail with a regular error (exit code 1).
+include/read_file_to_var.inc
+
+*** Executing the Binlog Server utility in the 'search_by_gtid_set'
+*** mode. It must fail with a regular error (exit code 1).
+include/read_file_to_var.inc
+
+*** Executing the Binlog Server utility in the 'fetch' mode. It must
+*** fail with a regular error (exit code 1).
+
+*** Removing the search result file.
+
+*** Dropping the table.
+DROP TABLE t1;
+
+*** Removing the Binlog Server utility storage directory.
+
+*** Removing the Binlog Server utility log file.
+
+*** Removing the Binlog Server utility configuration file.

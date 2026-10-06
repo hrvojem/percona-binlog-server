@@ -30,7 +30,15 @@
 //   components;
 // - the filesystem storage backend accepts exactly "file://<path>" URIs of
 //   existing directories, and object URIs point inside that directory;
-// - storage_config::get_masked_uri() hides credentials and keeps the rest.
+// - storage_config::get_masked_uri() hides credentials and keeps the rest;
+// - a keyring file is accepted exactly when it has the supported version,
+//   unique key IDs, supported ciphers and keys of the right length, and then
+//   holds exactly the keys written to it;
+// - a configuration file is accepted exactly when its sections pass the
+//   documented checks, and then holds exactly the values written to it;
+// - damaged keyring and configuration files (truncated, a byte changed, a
+//   part replaced with a JSON value of another type) are rejected with a
+//   regular exception, never with a crash or an allocation failure.
 
 #include <array>
 #include <cstddef>
@@ -38,12 +46,24 @@
 #include <ctime>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <functional>
 #include <limits>
+#include <new>
 #include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
+
+#include <boost/json/array.hpp>
+#include <boost/json/object.hpp>
+#include <boost/json/serialize.hpp>
+#include <boost/json/value.hpp>
+
+#include <boost/lexical_cast.hpp>
 
 #include <boost/url/parse.hpp>
 #include <boost/url/scheme.hpp>
@@ -61,6 +81,10 @@
 #include "property_test_helpers.hpp"
 
 #include "binsrv/filesystem_storage_backend.hpp"
+#include "binsrv/keyring_record.hpp"
+#include "binsrv/keyring_record_collection.hpp"
+#include "binsrv/log_severity.hpp"
+#include "binsrv/main_config.hpp"
 #include "binsrv/size_unit.hpp"
 #include "binsrv/storage_backend_type.hpp"
 #include "binsrv/storage_config.hpp"
@@ -427,6 +451,466 @@ private:
   return config;
 }
 
+
+// ---------------------------------------------------------------------------
+// keyring and configuration files
+// ---------------------------------------------------------------------------
+
+void write_file(const std::filesystem::path &path, std::string_view content) {
+  std::ofstream output{path, std::ios::binary | std::ios::trunc};
+  output.write(std::data(content),
+               static_cast<std::streamsize>(std::size(content)));
+  if (!output) {
+    throw std::runtime_error{"cannot write '" + path.string() + "'"};
+  }
+}
+
+// runs a loader, turning a regular exception into a rejection (its message
+// is returned); anything else fails the property
+[[nodiscard]] std::optional<std::string>
+load_cleanly(const std::function<void()> &loader) {
+  try {
+    loader();
+  } catch (const std::bad_alloc &e) {
+    throw std::runtime_error{std::string{"rejected with std::bad_alloc: "} +
+                             e.what()};
+  } catch (const std::exception &e) {
+    const std::string message{e.what()};
+    if (message.find("bad_alloc") != std::string::npos) {
+      throw std::runtime_error{"rejected with an allocation failure: " +
+                               message};
+    }
+    return message;
+  } catch (...) {
+    throw std::runtime_error{"rejected with a non-standard exception"};
+  }
+  return std::nullopt;
+}
+
+// damages a text: truncation, a changed byte, or a part replaced with a JSON
+// value of another type
+[[nodiscard]] std::string damage_text(const hegel::TestCase &tc,
+                                      std::string text) {
+  const auto kind{
+      tc.draw(gs::integers<int>({.min_value = 0, .max_value = 2}))};
+  const auto position{tc.draw(gs::integers<std::size_t>(
+      {.min_value = 0U, .max_value = std::size(text)}))};
+  if (kind == 0) {
+    text.resize(position);
+  } else if (kind == 1) {
+    if (position < std::size(text)) {
+      text[position] = static_cast<char>(
+          static_cast<unsigned char>(text[position]) ^
+          tc.draw(gs::integers<std::uint8_t>(
+              {.min_value = 1U, .max_value = 255U})));
+    }
+  } else {
+    const auto length{tc.draw(gs::integers<std::size_t>(
+        {.min_value = 0U, .max_value = std::size(text) - position}))};
+    text.replace(position, length,
+                 tc.draw(gs::sampled_from<std::string>(
+                     {"", "null", "-1", "0", "1.5", "1e999",
+                      "18446744073709551616", "\"\"", "\"x\"", "[]", "{}",
+                      "true", "\"ZZ\"", "\"0\"", "[[[[[[[[[[[[[[[[[[[["})));
+  }
+  return text;
+}
+
+struct cipher_choice {
+  std::string_view name;
+  // the key length, for ciphers the keyring supports
+  std::optional<std::size_t> key_size;
+};
+
+constexpr std::array<cipher_choice, 11> keyring_ciphers{
+    {{.name = "AES-128-ECB", .key_size = 16U},
+     {.name = "AES-256-ECB", .key_size = 32U},
+     {.name = "AES-192-CBC", .key_size = 24U},
+     {.name = "AES-128-CTR", .key_size = 16U},
+     {.name = "AES-256-CTR", .key_size = 32U},
+     {.name = "AES-192-GCM", .key_size = 24U},
+     // a cipher OpenSSL knows in a mode the keyring does not support, and
+     // unknown names
+     {.name = "AES-128-OFB", .key_size = std::nullopt},
+     {.name = "AES-512-CTR", .key_size = std::nullopt},
+     {.name = "AES-128", .key_size = std::nullopt},
+     {.name = "", .key_size = std::nullopt},
+     {.name = "AES-128-CTR ", .key_size = std::nullopt}}};
+
+struct keyring_key {
+  std::string id;
+  std::size_t cipher;
+  std::vector<std::uint8_t> data;
+  // the hex text written to the file (normally the hex of 'data')
+  std::string data_hex;
+  bool valid_hex;
+};
+
+struct keyring_spec {
+  std::uint32_t version;
+  std::vector<keyring_key> keys;
+};
+
+[[nodiscard]] std::string to_hex(const std::vector<std::uint8_t> &data,
+                                 bool lowercase) {
+  static constexpr std::string_view upper{"0123456789ABCDEF"};
+  static constexpr std::string_view lower{"0123456789abcdef"};
+  const auto digits{lowercase ? lower : upper};
+  std::string result;
+  for (const auto byte : data) {
+    result += digits[byte >> 4U];
+    result += digits[byte & 0x0FU];
+  }
+  return result;
+}
+
+// a valid keyring with at most one defect, so that every check is exercised
+// on its own (with several defects, any one check would reject the file)
+[[nodiscard]] gs::Generator<keyring_spec> keyring_specs() {
+  return gs::compose([](const hegel::TestCase &tc) {
+    keyring_spec spec{.version = 1U, .keys = {}};
+    static constexpr std::size_t supported_ciphers{6U};
+    const auto count{tc.draw(
+        gs::integers<std::size_t>({.min_value = 0U, .max_value = 5U}))};
+    for (std::size_t index{0U}; index < count; ++index) {
+      keyring_key key{};
+      key.id = tc.draw(gs::one_of({gs::sampled_from<std::string>(
+                                       {"alpha", "beta", "gamma", ""}),
+                                   text_of_size(1U, 8U)}));
+      while (std::ranges::find(spec.keys, key.id, &keyring_key::id) !=
+             std::cend(spec.keys)) {
+        key.id += '#';
+      }
+      key.cipher = tc.draw(gs::integers<std::size_t>(
+          {.min_value = 0U, .max_value = supported_ciphers - 1U}));
+      const auto size{*keyring_ciphers.at(key.cipher).key_size};
+      for (std::size_t byte{0U}; byte < size; ++byte) {
+        key.data.push_back(tc.draw(gs::integers<std::uint8_t>()));
+      }
+      key.data_hex = to_hex(key.data, tc.draw(gs::booleans()));
+      key.valid_hex = true;
+      spec.keys.push_back(std::move(key));
+    }
+
+    if (tc.draw(gs::booleans())) {
+      return spec;
+    }
+    const auto defect{
+        tc.draw(gs::integers<int>({.min_value = 0, .max_value = 5}))};
+    if (defect == 0 || spec.keys.empty()) {
+      spec.version = tc.draw(gs::integers<std::uint32_t>());
+      return spec;
+    }
+    auto &key{spec.keys[tc.draw(gs::integers<std::size_t>(
+        {.min_value = 0U, .max_value = std::size(spec.keys) - 1U}))]};
+    switch (defect) {
+    case 1:
+      // the ID of another key (or of itself, when there is only one key)
+      spec.keys.push_back(key);
+      break;
+    case 2:
+      key.cipher = tc.draw(gs::integers<std::size_t>(
+          {.min_value = supported_ciphers,
+           .max_value = std::size(keyring_ciphers) - 1U}));
+      break;
+    case 3: {
+      const auto size{tc.draw(
+          gs::integers<std::size_t>({.min_value = 0U, .max_value = 40U}))};
+      key.data.resize(size, std::uint8_t{0x5AU});
+      key.data_hex = to_hex(key.data, false);
+      break;
+    }
+    case 4:
+      key.data_hex += '0';
+      key.valid_hex = false;
+      break;
+    default:
+      if (key.data_hex.empty()) {
+        key.data_hex = "zz";
+      } else {
+        key.data_hex[tc.draw(gs::integers<std::size_t>(
+            {.min_value = 0U, .max_value = std::size(key.data_hex) - 1U}))] =
+            tc.draw(gs::sampled_from<char>({'g', 'G', 'x', ' ', '-', '\0',
+                                            '+'}));
+      }
+      key.valid_hex = false;
+      break;
+    }
+    return spec;
+  });
+}
+
+[[nodiscard]] std::string keyring_json(const keyring_spec &spec) {
+  boost::json::array keys;
+  for (const auto &key : spec.keys) {
+    keys.push_back(boost::json::object{
+        {"id", key.id},
+        {"cipher", keyring_ciphers.at(key.cipher).name},
+        {"data_hex", key.data_hex}});
+  }
+  return boost::json::serialize(boost::json::object{
+      {"version", spec.version}, {"keys", std::move(keys)}});
+}
+
+[[nodiscard]] bool model_keyring(const keyring_spec &spec) {
+  if (spec.version != 1U) {
+    return false;
+  }
+  std::vector<std::string> ids;
+  for (const auto &key : spec.keys) {
+    if (std::ranges::find(ids, key.id) != std::cend(ids)) {
+      return false;
+    }
+    ids.push_back(key.id);
+    const auto &cipher{keyring_ciphers.at(key.cipher)};
+    if (!key.valid_hex || !cipher.key_size.has_value() ||
+        std::size(key.data) != *cipher.key_size) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// a configuration file as a JSON object, with the outcome the documented
+// checks give for it
+struct config_spec {
+  boost::json::object json;
+  bool valid;
+  std::string description;
+};
+
+// a valid configuration with at most one defect, so that every check is
+// exercised on its own
+[[nodiscard]] gs::Generator<config_spec> config_specs() {
+  return gs::compose([](const hegel::TestCase &tc) {
+    static const std::vector<std::string> defects{
+        "log_level",           "connection_endpoint",
+        "connection_port",     "connection_timeout",
+        "server_id",           "mode",
+        "rewrite_mode",        "rewrite_file_size_unit",
+        "rewrite_file_size",   "source_port_zero",
+        "source_port_range",   "source_read_timeout",
+        "source_write_timeout", "authentication_user",
+        "authentication_password", "authentication_plugin",
+        "backend",             "checkpoint_size",
+        "checkpoint_interval", "encryption_format",
+        "encryption_cipher",   "missing_field"};
+    std::string defect;
+    if (!tc.draw(gs::booleans())) {
+      defect = tc.draw(gs::sampled_from(defects));
+    }
+    config_spec spec{
+        .json = {}, .valid = defect.empty(), .description = defect};
+    const auto is_defect{[&defect](std::string_view name) {
+      return defect == name;
+    }};
+    const auto choose{[&tc](std::initializer_list<std::string> values) {
+      return tc.draw(gs::sampled_from(std::vector<std::string>{values}));
+    }};
+    const auto valid_uint32{[&tc] {
+      return static_cast<std::int64_t>(tc.draw(gs::integers<std::uint32_t>(
+          {.min_value = 1U,
+           .max_value = std::numeric_limits<std::uint32_t>::max()})));
+    }};
+    const auto out_of_range{[&tc](std::int64_t max_value) {
+      return tc.draw(gs::sampled_from<std::int64_t>(
+          {-1, max_value + 1, std::numeric_limits<std::int64_t>::min()}));
+    }};
+    // unit texts that are valid, or not, for the given symbols
+    const auto unit_text{[&tc](std::string_view symbols, bool valid,
+                               const auto &symbol_table) {
+      return tc.draw(unit_texts(symbols).filter(
+          [valid, &symbol_table](const std::string &text) {
+            return model_unit(text, symbol_table).has_value() == valid;
+          }));
+    }};
+    static constexpr auto uint16_max{
+        static_cast<std::int64_t>(std::numeric_limits<std::uint16_t>::max())};
+    static constexpr auto uint32_max{
+        static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())};
+
+    // logger
+    spec.json["logger"] = boost::json::object{
+        {"level", is_defect("log_level")
+                      ? choose({"verbose", "", "ERROR", "error "})
+                      : choose({"trace", "debug", "info", "warning", "error",
+                                "fatal"})},
+        {"file", ""}};
+
+    // connection: either a DNS SRV name, or both host and port
+    boost::json::object connection;
+    const bool use_dns{tc.draw(gs::booleans())};
+    bool has_host{!use_dns};
+    bool has_port{!use_dns};
+    bool has_dns{use_dns};
+    if (is_defect("connection_endpoint")) {
+      const auto broken{tc.draw(gs::sampled_from<std::string>(
+          {"nothing", "host only", "port only", "dns and host",
+           "dns and port", "all"}))};
+      spec.description += " (" + broken + ")";
+      has_host = broken == "host only" || broken == "dns and host" ||
+                 broken == "all";
+      has_port = broken == "port only" || broken == "dns and port" ||
+                 broken == "all";
+      has_dns = broken.starts_with("dns") || broken == "all";
+    }
+    if (has_host) {
+      connection["host"] = tc.draw(text_of_size(0U, 12U));
+    }
+    if (has_port) {
+      connection["port"] =
+          is_defect("connection_port")
+              ? out_of_range(uint16_max)
+              : static_cast<std::int64_t>(tc.draw(gs::integers<std::uint16_t>()));
+    }
+    if (has_dns) {
+      connection["dns_srv_name"] = tc.draw(text_of_size(0U, 12U));
+    }
+    if (is_defect("connection_port") && !has_port) {
+      // nothing to put out of range
+      spec.valid = true;
+    }
+    connection["user"] = tc.draw(text_of_size(0U, 8U));
+    connection["password"] = tc.draw(text_of_size(0U, 8U));
+    connection["connect_timeout"] = is_defect("connection_timeout")
+                                        ? out_of_range(uint32_max)
+                                        : valid_uint32();
+    connection["read_timeout"] = valid_uint32();
+    connection["write_timeout"] = valid_uint32();
+    spec.json["connection"] = std::move(connection);
+
+    // replication
+    boost::json::object replication;
+    replication["server_id"] =
+        is_defect("server_id") ? out_of_range(uint32_max) : valid_uint32();
+    replication["idle_time"] = valid_uint32();
+    replication["verify_checksum"] = tc.draw(gs::booleans());
+    const bool with_rewrite{is_defect("rewrite_mode") ||
+                            is_defect("rewrite_file_size_unit") ||
+                            is_defect("rewrite_file_size") ||
+                            tc.draw(gs::integers<int>(
+                                {.min_value = 0, .max_value = 3})) == 0};
+    std::string mode{with_rewrite ? "gtid" : choose({"position", "gtid"})};
+    if (is_defect("mode")) {
+      mode = choose({"row", "", "GTID"});
+    } else if (is_defect("rewrite_mode")) {
+      mode = "position";
+    }
+    replication["mode"] = mode;
+    if (with_rewrite) {
+      std::string file_size;
+      if (is_defect("rewrite_file_size_unit")) {
+        file_size = unit_text("KMGTP_kB", false, size_symbols);
+      } else if (is_defect("rewrite_file_size")) {
+        file_size = std::to_string(tc.draw(gs::integers<std::uint32_t>(
+            {.min_value = 0U, .max_value = 1023U})));
+      } else {
+        file_size = tc.draw(gs::sampled_from<std::string>(
+            {"1024", "1K", "16M", "1G", "4096"}));
+      }
+      replication["rewrite"] = boost::json::object{
+          {"base_file_name", "rewritten"}, {"file_size", file_size}};
+    }
+    spec.json["replication"] = std::move(replication);
+
+    // replication source
+    boost::json::object source;
+    if (is_defect("source_port_zero")) {
+      source["port"] = 0;
+    } else if (is_defect("source_port_range")) {
+      source["port"] = out_of_range(uint16_max);
+    } else {
+      source["port"] = static_cast<std::int64_t>(tc.draw(
+          gs::integers<std::uint16_t>({.min_value = 1U, .max_value = 65535U})));
+    }
+    source["read_timeout"] = is_defect("source_read_timeout")
+                                 ? std::int64_t{0}
+                                 : valid_uint32();
+    source["write_timeout"] = is_defect("source_write_timeout")
+                                  ? std::int64_t{0}
+                                  : valid_uint32();
+    source["authentication"] = boost::json::object{
+        {"user", is_defect("authentication_user") ? std::string{}
+                                                  : choose({"rpl", "replica"})},
+        {"password", is_defect("authentication_password")
+                         ? std::string{}
+                         : choose({"password", "p@ss\"word\\"})},
+        {"plugin", is_defect("authentication_plugin")
+                       ? choose({"mysql_native_password", "",
+                                 "caching_sha2_password "})
+                       : std::string{"caching_sha2_password"}}};
+    spec.json["replication_source"] = std::move(source);
+
+    // keyring (optional, its file is not read when the configuration is
+    // loaded)
+    if (tc.draw(gs::booleans())) {
+      spec.json["keyring"] =
+          boost::json::object{{"uri", "file:///nonexistent/keyring.json"}};
+    }
+
+    // storage
+    boost::json::object storage;
+    storage["backend"] = is_defect("backend") ? choose({"nfs", "", "FILE"})
+                                              : choose({"file", "s3"});
+    storage["uri"] = tc.draw(text_of_size(0U, 16U));
+    if (is_defect("checkpoint_size") || tc.draw(gs::booleans())) {
+      storage["checkpoint_size"] = unit_text(
+          "KMGTP_kB", !is_defect("checkpoint_size"), size_symbols);
+    }
+    if (is_defect("checkpoint_interval") || tc.draw(gs::booleans())) {
+      storage["checkpoint_interval"] = unit_text(
+          "smhdSMHDw", !is_defect("checkpoint_interval"), time_symbols);
+    }
+    if (is_defect("encryption_format") || is_defect("encryption_cipher") ||
+        tc.draw(gs::booleans())) {
+      storage["encryption"] = boost::json::object{
+          {"format", is_defect("encryption_format") ? choose({"aes", ""})
+                                                    : std::string{"generic"}},
+          {"kek_id", "alpha"},
+          {"cipher", is_defect("encryption_cipher")
+                         ? choose({"AES-256-CBC", "AES-128-GCM", "AES-512-CTR",
+                                   ""})
+                         : choose({"AES-128-CTR", "AES-192-CTR",
+                                   "AES-256-CTR"})}};
+    }
+    spec.json["storage"] = std::move(storage);
+
+    if (is_defect("missing_field")) {
+      const auto [section, field]{
+          tc.draw(gs::sampled_from<std::pair<std::string, std::string>>(
+              {{"logger", "level"},
+               {"connection", "user"},
+               {"replication", "server_id"},
+               {"replication", "mode"},
+               {"replication_source", "authentication"},
+               {"storage", "uri"},
+               {"storage", ""},
+               {"logger", ""}}))};
+      if (field.empty()) {
+        spec.json.erase(section);
+      } else {
+        spec.json[section].as_object().erase(field);
+      }
+      spec.description += " (" + section + (field.empty() ? "" : "." + field) +
+                          ")";
+    }
+    return spec;
+  });
+}
+
+// the value of a member of a nested JSON object, or null
+[[nodiscard]] const boost::json::value &
+json_at(const boost::json::object &root, std::string_view section,
+        std::string_view field) {
+  static const boost::json::value null_value{};
+  const auto *section_value{root.if_contains(section)};
+  if (section_value == nullptr || !section_value->is_object()) {
+    return null_value;
+  }
+  const auto *field_value{section_value->as_object().if_contains(field)};
+  return field_value == nullptr ? null_value : *field_value;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -722,5 +1206,165 @@ BOOST_AUTO_TEST_CASE(StorageUriMaskingHidesCredentials) {
                 parsed->encoded_path() == uri.encoded_path(),
             "'" + uri_text + "' was masked as '" + masked +
                 "', which points elsewhere");
+  });
+}
+
+BOOST_AUTO_TEST_CASE(KeyringFileMatchesModel) {
+  run_property([](hegel::TestCase &tc) {
+    const auto spec{tc.draw("keyring", keyring_specs())};
+    const scratch_directory scratch;
+    const auto path{scratch.path() / "keyring.json"};
+    const auto text{keyring_json(spec)};
+    write_file(path, text);
+
+    std::optional<binsrv::keyring_record_collection> keyring;
+    const auto error{load_cleanly([&] { keyring.emplace(path.string()); })};
+    const bool expected{model_keyring(spec)};
+    require(keyring.has_value() == expected,
+            "'" + text + "' was " +
+                (expected ? "rejected: " + error.value_or("") : "accepted"));
+    if (!keyring.has_value()) {
+      return;
+    }
+    for (const auto &key : spec.keys) {
+      require(keyring->contains_key(key.id),
+              "key '" + key.id + "' is missing");
+      const auto &record{keyring->get_key(key.id)};
+      require(record.get<"cipher">() == keyring_ciphers.at(key.cipher).name,
+              "key '" + key.id + "' has cipher '" + record.get<"cipher">() +
+                  "'");
+      require(record.get<"data_hex">().to_hex_string() ==
+                  to_hex(key.data, false),
+              "key '" + key.id + "' has data " +
+                  record.get<"data_hex">().to_hex_string());
+    }
+    static constexpr std::string_view absent_id{"no such key \x01"};
+    require(!keyring->contains_key(absent_id), "an absent key was found");
+    bool absent_rejected{false};
+    try {
+      [[maybe_unused]] const auto &absent{keyring->get_key(absent_id)};
+    } catch (const std::out_of_range &) {
+      absent_rejected = true;
+    }
+    require(absent_rejected, "getting an absent key did not throw");
+    [[maybe_unused]] const auto description{keyring->get_description()};
+  });
+}
+
+BOOST_AUTO_TEST_CASE(KeyringDamagedFileFailsCleanly) {
+  run_property([](hegel::TestCase &tc) {
+    auto spec{tc.draw("keyring", keyring_specs())};
+    const scratch_directory scratch;
+    const auto path{scratch.path() / "keyring.json"};
+    const auto text{damage_text(tc, keyring_json(spec))};
+    write_file(path, text);
+    [[maybe_unused]] const auto error{load_cleanly([&] {
+      const binsrv::keyring_record_collection keyring{path.string()};
+      [[maybe_unused]] const auto description{keyring.get_description()};
+    })};
+  });
+}
+
+BOOST_AUTO_TEST_CASE(ConfigFileMatchesModel) {
+  run_property([](hegel::TestCase &tc) {
+    const auto spec{tc.draw("config", config_specs())};
+    const scratch_directory scratch;
+    const auto path{scratch.path() / "config.json"};
+    const auto text{boost::json::serialize(spec.json)};
+    write_file(path, text);
+
+    std::optional<binsrv::main_config> config;
+    const auto error{load_cleanly([&] { config.emplace(path.string()); })};
+    require(config.has_value() == spec.valid,
+            "'" + text + "' was " +
+                (spec.valid ? "rejected: " + error.value_or("")
+                            : "accepted, expected a rejection for: " +
+                                  spec.description));
+    if (!config.has_value()) {
+      return;
+    }
+    const auto &root{config->root()};
+    const auto &json{spec.json};
+    const auto same_string{[&](std::string_view section,
+                               std::string_view field,
+                               const std::string &actual) {
+      require(json_at(json, section, field).as_string() == actual,
+              std::string{section} + '.' + std::string{field} + " is '" +
+                  actual + "' in '" + text + "'");
+    }};
+    const auto same_number{[&](std::string_view section,
+                               std::string_view field, std::uint64_t actual) {
+      require(json_at(json, section, field).to_number<std::uint64_t>() ==
+                  actual,
+              std::string{section} + '.' + std::string{field} + " is " +
+                  std::to_string(actual) + " in '" + text + "'");
+    }};
+    const auto &logger{root.get<"logger">()};
+    same_string("logger", "level",
+                std::string{binsrv::to_string_view(logger.get<"level">())});
+    const auto &connection{root.get<"connection">()};
+    same_string("connection", "user", connection.get<"user">());
+    same_string("connection", "password", connection.get<"password">());
+    if (connection.get<"host">().has_value()) {
+      same_string("connection", "host", *connection.get<"host">());
+    }
+    if (connection.get<"port">().has_value()) {
+      same_number("connection", "port", *connection.get<"port">());
+    }
+    if (connection.get<"dns_srv_name">().has_value()) {
+      same_string("connection", "dns_srv_name",
+                  *connection.get<"dns_srv_name">());
+    }
+    same_number("connection", "connect_timeout",
+                connection.get<"connect_timeout">());
+    same_number("connection", "read_timeout",
+                connection.get<"read_timeout">());
+    same_number("connection", "write_timeout",
+                connection.get<"write_timeout">());
+    const auto &replication{root.get<"replication">()};
+    same_number("replication", "server_id", replication.get<"server_id">());
+    same_number("replication", "idle_time", replication.get<"idle_time">());
+    require(json_at(json, "replication", "verify_checksum").as_bool() ==
+                replication.get<"verify_checksum">(),
+            "replication.verify_checksum differs");
+    same_string("replication", "mode",
+                boost::lexical_cast<std::string>(replication.get<"mode">()));
+    const auto &source{root.get<"replication_source">()};
+    same_number("replication_source", "port", source.get<"port">());
+    same_number("replication_source", "read_timeout",
+                source.get<"read_timeout">());
+    same_number("replication_source", "write_timeout",
+                source.get<"write_timeout">());
+    const auto &storage{root.get<"storage">()};
+    same_string("storage", "backend",
+                boost::lexical_cast<std::string>(storage.get<"backend">()));
+    same_string("storage", "uri", storage.get<"uri">());
+    if (storage.get<"checkpoint_size">().has_value()) {
+      const auto expected{model_unit(
+          json_at(json, "storage", "checkpoint_size").as_string(),
+          size_symbols)};
+      require(expected == storage.get<"checkpoint_size">()->get_value(),
+              "storage.checkpoint_size differs in '" + text + "'");
+    }
+    if (storage.get<"checkpoint_interval">().has_value()) {
+      const auto expected{model_unit(
+          json_at(json, "storage", "checkpoint_interval").as_string(),
+          time_symbols)};
+      require(expected == storage.get<"checkpoint_interval">()->get_value(),
+              "storage.checkpoint_interval differs in '" + text + "'");
+    }
+    require(root.get<"keyring">().has_value() == json.contains("keyring"),
+            "keyring section presence differs in '" + text + "'");
+  });
+}
+
+BOOST_AUTO_TEST_CASE(ConfigDamagedFileFailsCleanly) {
+  run_property([](hegel::TestCase &tc) {
+    const auto spec{tc.draw("config", config_specs())};
+    const scratch_directory scratch;
+    const auto path{scratch.path() / "config.json"};
+    write_file(path, damage_text(tc, boost::json::serialize(spec.json)));
+    [[maybe_unused]] const auto error{
+        load_cleanly([&] { const binsrv::main_config config{path.string()}; })};
   });
 }

@@ -357,7 +357,7 @@ public:
   // complete transaction takes the next one, a discarded transaction gives
   // its number back (it is going to be received again)
   [[nodiscard]] binsrv::gtids::gno_t get_current_gno() const noexcept {
-    return committed_transactions_ + 1ULL;
+    return committed_transactions_ + 1U;
   }
   [[nodiscard]] bool is_first_event_of_transaction() const noexcept {
     return incomplete_.events.empty();

@@ -305,12 +305,15 @@ void require_matches_model(const gtid_set &gtids, const model_type &model) {
 }
 
 [[nodiscard]] gs::Generator<gno_t> out_of_range_upper_bounds() {
+  // the first GNO above the valid range, typed as gno_t ('+ 1ULL' would make
+  // it 'unsigned long long', a different type from 'std::uint64_t' on Linux)
+  static constexpr gno_t first_out_of_range_gno{binsrv::gtids::max_gno + 1U};
   // the edges are listed explicitly: UINT64_MAX is where 'upper + 1'
   // (half-open interval conversion) wraps around
   return gs::one_of(
-      {gs::just(binsrv::gtids::max_gno + 1ULL),
+      {gs::just(first_out_of_range_gno),
        gs::just(std::numeric_limits<gno_t>::max()),
-       gs::integers<gno_t>({.min_value = binsrv::gtids::max_gno + 1ULL,
+       gs::integers<gno_t>({.min_value = first_out_of_range_gno,
                             .max_value = std::numeric_limits<gno_t>::max()})});
 }
 

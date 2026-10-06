@@ -42,6 +42,11 @@
 // The generated events are not real binlog events, but each one starts with
 // a valid 19-byte common header (type code, event size), which is all the
 // reading side relies on.
+//
+// Each test case may also run with an encrypted storage (a generated key
+// encryption key from a test keyring and an AES-CTR data cipher). Then the
+// files on disk are checked by size only and must differ from the plaintext,
+// while the read-back property checks the decrypted content.
 
 #include <algorithm>
 #include <cassert>
@@ -149,9 +154,15 @@ private:
   }
 };
 
+struct encryption_settings {
+  std::string kek_id;
+  std::string data_cipher;
+};
+
 struct storage_settings {
   bool gtid_mode;
   std::optional<std::uint64_t> checkpoint_size;
+  std::optional<encryption_settings> encryption;
   // block sizes used by the sender_context readers
   std::size_t tailing_reader_block_size;
   std::size_t fresh_reader_block_size;
@@ -165,13 +176,37 @@ std::ostream &operator<<(std::ostream &output,
   } else {
     output << "no checkpoint_size";
   }
+  if (settings.encryption.has_value()) {
+    output << ", encrypted with " << settings.encryption->data_cipher
+           << " (KEK '" << settings.encryption->kek_id << "')";
+  }
   return output << ", reader block sizes " << settings.tailing_reader_block_size
                 << " / " << settings.fresh_reader_block_size;
 }
 
+// the keys of the test keyring (the same as in the MTR suite's
+// generate_keyring_data_file.inc): every supported key encryption key mode
+constexpr std::string_view keyring_name{"keyring_data.json"};
+constexpr std::string_view keyring_content{R"({"version": 1, "keys": [
+  {"id": "alpha16", "cipher": "AES-128-ECB", "data_hex": "000102030405060708090A0B0C0D0E0F"},
+  {"id": "alpha32", "cipher": "AES-256-ECB", "data_hex": "000102030405060708090A0B0C0D0E0F000102030405060708090A0B0C0D0E0F"},
+  {"id": "beta24", "cipher": "AES-192-CBC", "data_hex": "101112131415161718191A1B1C1D1E1F1011121314151617"},
+  {"id": "gamma16", "cipher": "AES-128-CTR", "data_hex": "202122232425262728292A2B2C2D2E2F"},
+  {"id": "gamma32", "cipher": "AES-256-CTR", "data_hex": "202122232425262728292A2B2C2D2E2F202122232425262728292A2B2C2D2E2F"},
+  {"id": "delta24", "cipher": "AES-192-GCM", "data_hex": "303132333435363738393A3B3C3D3E3F3031323334353637"}
+]})"};
+const std::vector<std::string> keyring_key_ids{"alpha16", "alpha32", "beta24",
+                                               "gamma16", "gamma32", "delta24"};
+// with a block-mode (ECB / CBC) key encryption key, the file key length must
+// be a multiple of its 16-byte block, which rules out AES-192 data keys (the
+// storage rejects such a configuration at startup)
+const std::vector<std::string> block_mode_key_ids{"alpha16", "alpha32",
+                                                  "beta24"};
+
 // writes a configuration file for a local filesystem storage in
 // 'storage_directory'; the connection / replication source sections are
 // required by the configuration schema but are not used by the storage
+// (an encrypted storage uses the keyring file from 'directory')
 [[nodiscard]] std::filesystem::path
 write_config(const std::filesystem::path &directory,
              const std::filesystem::path &storage_directory,
@@ -182,6 +217,15 @@ write_config(const std::filesystem::path &directory,
   if (settings.checkpoint_size.has_value()) {
     storage_section << R"(, "checkpoint_size": ")" << *settings.checkpoint_size
                     << '"';
+  }
+  std::string keyring_section;
+  if (settings.encryption.has_value()) {
+    storage_section << R"(, "encryption": { "format": "generic", "kek_id": ")"
+                    << settings.encryption->kek_id << R"(", "cipher": ")"
+                    << settings.encryption->data_cipher << R"(" })";
+    keyring_section = R"(
+  "keyring": { "uri": "file://)" +
+                      (directory / keyring_name).generic_string() + R"(" },)";
   }
 
   const auto config_path{directory /
@@ -204,7 +248,8 @@ write_config(const std::filesystem::path &directory,
     "authentication": {
       "user": "rpl", "password": "password", "plugin": "caching_sha2_password"
     }
-  },
+  },)" << keyring_section
+         << R"(
   "storage": { )"
          << storage_section.str() << R"( }
 })";
@@ -328,12 +373,25 @@ constexpr std::size_t max_event_size{512U};
              {.min_value = min_event_size, .max_value = max_block_size})})};
     storage_settings result{.gtid_mode = tc.draw(gs::booleans()),
                             .checkpoint_size = std::nullopt,
+                            .encryption = std::nullopt,
                             .tailing_reader_block_size = 0U,
                             .fresh_reader_block_size = 0U};
     if (tc.draw(gs::booleans())) {
       result.checkpoint_size = tc.draw(gs::integers<std::uint64_t>(
           {.min_value = min_checkpoint_size,
            .max_value = max_checkpoint_size}));
+    }
+    if (tc.draw(gs::booleans())) {
+      const auto kek_id{tc.draw(gs::sampled_from(keyring_key_ids))};
+      const bool block_mode_kek{std::ranges::find(block_mode_key_ids, kek_id) !=
+                                std::cend(block_mode_key_ids)};
+      const auto data_cipher{tc.draw(gs::sampled_from(
+          block_mode_kek
+              ? std::vector<std::string>{"AES-128-CTR", "AES-256-CTR"}
+              : std::vector<std::string>{"AES-128-CTR", "AES-192-CTR",
+                                         "AES-256-CTR"}))};
+      result.encryption =
+          encryption_settings{.kek_id = kek_id, .data_cipher = data_cipher};
     }
     result.tailing_reader_block_size = tc.draw(block_sizes);
     result.fresh_reader_block_size = tc.draw(block_sizes);
@@ -443,8 +501,35 @@ private:
 // transactions
 [[nodiscard]] std::size_t
 match_file_with_model(const std::vector<std::byte> &file_content,
-                      const model_binlog &binlog) {
+                      const model_binlog &binlog, bool encrypted) {
   const auto magic_size{std::size(binsrv::events::magic_binlog_payload)};
+  if (encrypted) {
+    // the content cannot be compared, but the file must still end at a
+    // transaction boundary, and it must not hold the plaintext
+    std::vector<std::byte> plaintext(
+        std::cbegin(binsrv::events::magic_binlog_payload),
+        std::cend(binsrv::events::magic_binlog_payload));
+    std::size_t transactions_on_disk{0U};
+    while (std::size(plaintext) < std::size(file_content)) {
+      require(transactions_on_disk < std::size(binlog.transactions),
+              describe_binlog(binlog) +
+                  " holds more data than its complete transactions (" +
+                  std::to_string(std::size(file_content)) + " bytes)");
+      for (const auto &event :
+           binlog.transactions[transactions_on_disk].events) {
+        plaintext.insert(std::end(plaintext), std::cbegin(event.bytes),
+                         std::cend(event.bytes));
+      }
+      ++transactions_on_disk;
+    }
+    require(std::size(plaintext) == std::size(file_content),
+            describe_binlog(binlog) + " ends in the middle of transaction " +
+                std::to_string(transactions_on_disk) + " (" +
+                std::to_string(std::size(file_content)) + " bytes)");
+    require(plaintext != file_content,
+            describe_binlog(binlog) + " is stored unencrypted");
+    return transactions_on_disk;
+  }
   require(std::size(file_content) >= magic_size &&
               std::equal(std::cbegin(binsrv::events::magic_binlog_payload),
                          std::cend(binsrv::events::magic_binlog_payload),
@@ -491,8 +576,12 @@ void require_record_matches(const binsrv::binlog_record &record,
                             std::size_t transactions_on_disk,
                             std::uint64_t file_size,
                             const binsrv::gtids::gtid_set &earlier_gtids,
-                            bool gtid_mode) {
+                            bool gtid_mode, bool encrypted) {
   const auto label{describe_binlog(binlog) + " record: "};
+  require(record.encryption.has_value() == encrypted,
+          label + (encrypted ? "has no encryption metadata"
+                             : "has encryption metadata in an unencrypted "
+                               "storage"));
   require(record.name == binlog.name, label + "unexpected name '" +
                                           record.name.str() + "'");
   require(record.size == file_size,
@@ -557,7 +646,9 @@ struct disk_state {
 [[nodiscard]] disk_state
 require_disk_matches_model(const std::filesystem::path &storage_directory,
                            const binsrv::binlog_record_container &records,
-                           const storage_model &model, bool gtid_mode) {
+                           const storage_model &model,
+                           const storage_settings &settings) {
+  const bool encrypted{settings.encryption.has_value()};
   const auto &binlogs{model.get_binlogs()};
   require(std::size(records) == std::size(binlogs),
           std::to_string(std::size(records)) + " binlog records instead of " +
@@ -571,7 +662,7 @@ require_disk_matches_model(const std::filesystem::path &storage_directory,
     const auto &binlog{binlogs[index]};
     const auto file_content{read_file(storage_directory / binlog.name.str())};
     const auto transactions_on_disk{
-        match_file_with_model(file_content, binlog)};
+        match_file_with_model(file_content, binlog, encrypted)};
     if (binlog.closed) {
       require(transactions_on_disk == std::size(binlog.transactions),
               describe_binlog(binlog) + " was closed with " +
@@ -580,7 +671,8 @@ require_disk_matches_model(const std::filesystem::path &storage_directory,
                   " complete transaction(s) missing");
     }
     require_record_matches(records[index], binlog, transactions_on_disk,
-                           std::size(file_content), earlier_gtids, gtid_mode);
+                           std::size(file_content), earlier_gtids,
+                           settings.gtid_mode, encrypted);
     earlier_gtids += model_gtids(binlog, transactions_on_disk);
     result.file_size = std::size(file_content);
     result.transactions_on_disk = transactions_on_disk;
@@ -696,6 +788,14 @@ public:
       storage_->flush_event_buffer();
       break;
     case operation_kind::rotate:
+      // a binlog streamed from a server always ends with a ROTATE / STOP
+      // event, so closed binlogs are never empty; the reader relies on that
+      // (an empty binlog in the middle reads as the end of the data), so the
+      // read-back property only rotates binlogs that hold data
+      if (properties_ == checked_properties::read_back &&
+          model_.get_current_binlog().transactions.empty()) {
+        break;
+      }
       // the collector closes a binlog only at a transaction boundary (ROTATE
       // / STOP events) or after discarding the incomplete transaction on a
       // disconnect ('storage::open_binlog()' asserts that no incomplete
@@ -754,6 +854,10 @@ private:
   [[nodiscard]] std::filesystem::path
   prepare_storage_directory(const std::filesystem::path &directory) {
     std::filesystem::create_directories(directory);
+    if (settings_.encryption.has_value()) {
+      std::ofstream keyring{root_.path() / keyring_name};
+      keyring << keyring_content;
+    }
     return write_config(root_.path(), directory, settings_);
   }
 
@@ -825,8 +929,7 @@ private:
     {
       auto crashed{make_storage(crash_config)};
       const auto state{require_disk_matches_model(
-          crash_directory, crashed->get_binlog_records(), model_,
-          settings_.gtid_mode)};
+          crash_directory, crashed->get_binlog_records(), model_, settings_)};
       reopen_current_binlog(*crashed, "crash");
       require(crashed->get_current_position() == state.file_size,
               "crash: resuming at position " +
@@ -840,7 +943,7 @@ private:
   void check() {
     const auto state{require_disk_matches_model(
         storage_directory_, storage_->get_binlog_records(), model_,
-        settings_.gtid_mode)};
+        settings_)};
     const auto &current{model_.get_current_binlog()};
     const auto unflushed{
         unflushed_complete_size(current, state.transactions_on_disk)};

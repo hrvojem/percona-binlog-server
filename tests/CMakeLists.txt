@@ -237,8 +237,23 @@ if(WITH_PROPERTY_TESTS)
     CXX_EXTENSIONS NO
   )
 
+  add_executable(cipher_context_property_test cipher_context_property_test.cpp)
+  target_include_directories(cipher_context_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(cipher_context_property_test
+    PRIVATE
+      binlog_server_compiler_flags
+      binsrv::lib_opensslpp
+      Boost::unit_test_framework
+      hegel
+  )
+  set_target_properties(cipher_context_property_test PROPERTIES
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+  )
+
   add_test(NAME gtid_set_property_test COMMAND gtid_set_property_test ${test_run_options})
   add_test(NAME event_property_test COMMAND event_property_test ${test_run_options})
   add_test(NAME storage_property_test COMMAND storage_property_test ${test_run_options})
   add_test(NAME indexed_event_block_property_test COMMAND indexed_event_block_property_test ${test_run_options})
+  add_test(NAME cipher_context_property_test COMMAND cipher_context_property_test ${test_run_options})
 endif()

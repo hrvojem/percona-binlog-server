@@ -1,0 +1,72 @@
+#
+# Checks that the 'search_by_timestamp' mode rejects timestamps whose time
+# part is out of range (hours above 23, minutes or seconds above 59, negative
+# hours) with 'Invalid timestamp format', instead of silently searching for a
+# different point in time (e.g. "2026-10-06T99:99:99" was treated as
+# "2026-10-10T04:40:39").
+#
+# The storage is empty, so a timestamp that is accepted reaches the next check
+# and is reported as 'Binlog storage is empty'.
+#
+
+--source ../include/have_binsrv.inc
+
+--source ../include/v80_v84_compatibility_defines.inc
+
+# in case of --repeat=N, we need to start from a fresh binary log to make
+# this test deterministic
+--echo *** Resetting replication at the very beginning of the test.
+--disable_query_log
+eval $stmt_reset_binary_logs_and_gtids;
+--enable_query_log
+
+# identifying backend storage type ('file' or 's3')
+--source ../include/identify_storage_backend.inc
+
+# creating data directory, configuration file, etc.
+--let $binsrv_connect_timeout = 20
+--let $binsrv_read_timeout = 60
+--let $binsrv_idle_time = 10
+--let $binsrv_verify_checksum = TRUE
+--let $binsrv_replication_mode = position
+--source ../include/set_up_binsrv_environment.inc
+
+--let $read_from_file = $MYSQL_TMP_DIR/search_result.json
+
+--echo
+--echo *** Executing the Binlog Server utility in the 'search_by_timestamp'
+--echo *** mode with a valid timestamp: the search reaches the storage.
+--error 1
+--exec $BINSRV search_by_timestamp $binsrv_config_file_path 2026-10-06T23:59:59 > $read_from_file
+--source include/read_file_to_var.inc
+--assert(`SELECT JSON_EXTRACT('$result', '$.status') = 'error'`)
+--assert(`SELECT JSON_EXTRACT('$result', '$.message') = 'Binlog storage is empty'`)
+
+--let $invalid_timestamps = 2026-10-06T24:00:00,2026-10-06T23:60:00,2026-10-06T23:59:60,2026-10-06T99:99:99,2026-10-06T-1:00:00
+--let $number_of_timestamps = `SELECT LENGTH('$invalid_timestamps') - LENGTH(REPLACE('$invalid_timestamps', ',', '')) + 1`
+--let $index = 1
+while ($index <= $number_of_timestamps)
+{
+  --let $timestamp = `SELECT SUBSTRING_INDEX(SUBSTRING_INDEX('$invalid_timestamps', ',', $index), ',', -1)`
+  --echo
+  --echo *** Executing the Binlog Server utility in the 'search_by_timestamp'
+  --echo *** mode with an out-of-range time: $timestamp
+  --error 1
+  --exec $BINSRV search_by_timestamp $binsrv_config_file_path $timestamp > $read_from_file
+  --source include/read_file_to_var.inc
+  --assert(`SELECT JSON_EXTRACT('$result', '$.status') = 'error'`)
+  --assert(`SELECT JSON_EXTRACT('$result', '$.message') = 'Invalid timestamp format'`)
+  --inc $index
+}
+
+--echo
+--echo *** Removing the search result file.
+--remove_file $read_from_file
+
+# the search modes do not write the utility log file, which the clean-up
+# expects to exist
+--write_file $binsrv_log_path
+EOF
+
+# cleaning up
+--source ../include/tear_down_binsrv_environment.inc

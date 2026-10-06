@@ -1,0 +1,41 @@
+*** Resetting replication at the very beginning of the test.
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+
+*** Determining binlog file directory from the server.
+
+*** Creating a temporary directory <BINSRV_STORAGE_PATH> for storing
+*** binlog files downloaded via the Binlog Server utility.
+
+*** Executing the Binlog Server utility in the 'search_by_timestamp'
+*** mode with a valid timestamp: the search reaches the storage.
+include/read_file_to_var.inc
+
+*** Executing the Binlog Server utility in the 'search_by_timestamp'
+*** mode with an out-of-range time: 2026-10-06T24:00:00
+include/read_file_to_var.inc
+
+*** Executing the Binlog Server utility in the 'search_by_timestamp'
+*** mode with an out-of-range time: 2026-10-06T23:60:00
+include/read_file_to_var.inc
+
+*** Executing the Binlog Server utility in the 'search_by_timestamp'
+*** mode with an out-of-range time: 2026-10-06T23:59:60
+include/read_file_to_var.inc
+
+*** Executing the Binlog Server utility in the 'search_by_timestamp'
+*** mode with an out-of-range time: 2026-10-06T99:99:99
+include/read_file_to_var.inc
+
+*** Executing the Binlog Server utility in the 'search_by_timestamp'
+*** mode with an out-of-range time: 2026-10-06T-1:00:00
+include/read_file_to_var.inc
+
+*** Removing the search result file.
+
+*** Removing the Binlog Server utility storage directory.
+
+*** Removing the Binlog Server utility log file.
+
+*** Removing the Binlog Server utility configuration file.

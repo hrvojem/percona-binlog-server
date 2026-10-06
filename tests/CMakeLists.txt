@@ -204,7 +204,12 @@ if(WITH_PROPERTY_TESTS)
     CXX_EXTENSIONS NO
   )
 
-  add_executable(storage_property_test storage_property_test.cpp)
+  # sender_context (the COM_BINLOG_DUMP reader) is part of the executable's
+  # operations sources, so it is compiled into the test directly
+  add_executable(storage_property_test
+    storage_property_test.cpp
+    "${PROJECT_SOURCE_DIR}/src/operations/sender_context.cpp"
+  )
   target_include_directories(storage_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
   target_link_libraries(storage_property_test
     PRIVATE
@@ -218,7 +223,22 @@ if(WITH_PROPERTY_TESTS)
     CXX_EXTENSIONS NO
   )
 
+  add_executable(indexed_event_block_property_test indexed_event_block_property_test.cpp)
+  target_include_directories(indexed_event_block_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(indexed_event_block_property_test
+    PRIVATE
+      binlog_server_compiler_flags
+      binsrv::lib_binsrv
+      Boost::unit_test_framework
+      hegel
+  )
+  set_target_properties(indexed_event_block_property_test PROPERTIES
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+  )
+
   add_test(NAME gtid_set_property_test COMMAND gtid_set_property_test ${test_run_options})
   add_test(NAME event_property_test COMMAND event_property_test ${test_run_options})
   add_test(NAME storage_property_test COMMAND storage_property_test ${test_run_options})
+  add_test(NAME indexed_event_block_property_test COMMAND indexed_event_block_property_test ${test_run_options})
 endif()

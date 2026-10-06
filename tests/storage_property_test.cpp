@@ -33,9 +33,18 @@
 //   exactly what is on disk;
 // - the current position accounts for every byte written so far;
 // - with 'storage.checkpoint_size' set to S, complete transactions that are
-//   not yet on disk never add up to S bytes or more.
+//   not yet on disk never add up to S bytes or more;
+// - reading the binlogs back through operations::sender_context (the reader
+//   behind COM_BINLOG_DUMP) returns exactly the events of the complete
+//   transactions on disk, in order, for any block size - both for a reader
+//   that follows the storage as it grows and for a fresh reader.
+//
+// The generated events are not real binlog events, but each one starts with
+// a valid 19-byte common header (type code, event size), which is all the
+// reading side relies on.
 
 #include <algorithm>
+#include <cassert>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -75,6 +84,8 @@
 #include "binsrv/storage.hpp"
 #include "binsrv/storage_core.hpp"
 
+#include "binsrv/events/code_type.hpp"
+#include "binsrv/events/common_header_view.hpp"
 #include "binsrv/events/composite_binlog_name.hpp"
 #include "binsrv/events/protocol_traits_fwd.hpp"
 
@@ -83,7 +94,10 @@
 #include "binsrv/gtids/gtid_set.hpp"
 #include "binsrv/gtids/uuid.hpp"
 
+#include "operations/sender_context.hpp"
+
 #include "util/byte_span_fwd.hpp"
+#include "util/byte_span_inserters.hpp"
 #include "util/ctime_timestamp.hpp"
 #include "util/ctime_timestamp_range.hpp"
 
@@ -138,15 +152,21 @@ private:
 struct storage_settings {
   bool gtid_mode;
   std::optional<std::uint64_t> checkpoint_size;
+  // block sizes used by the sender_context readers
+  std::size_t tailing_reader_block_size;
+  std::size_t fresh_reader_block_size;
 };
 
 std::ostream &operator<<(std::ostream &output,
                          const storage_settings &settings) {
   output << (settings.gtid_mode ? "gtid" : "position") << " mode, ";
   if (settings.checkpoint_size.has_value()) {
-    return output << "checkpoint_size " << *settings.checkpoint_size;
+    output << "checkpoint_size " << *settings.checkpoint_size;
+  } else {
+    output << "no checkpoint_size";
   }
-  return output << "no checkpoint_size";
+  return output << ", reader block sizes " << settings.tailing_reader_block_size
+                << " / " << settings.fresh_reader_block_size;
 }
 
 // writes a configuration file for a local filesystem storage in
@@ -195,10 +215,10 @@ write_config(const std::filesystem::path &directory,
   return config_path;
 }
 
-[[nodiscard]] std::unique_ptr<binsrv::storage>
+[[nodiscard]] binsrv::storage_ptr
 make_storage(const std::filesystem::path &config_path) {
   const binsrv::main_config config{config_path.string()};
-  return std::make_unique<binsrv::storage>(
+  return std::make_shared<binsrv::storage>(
       std::make_shared<binsrv::null_logger>(), config,
       binsrv::storage_construction_mode_type::streaming);
 }
@@ -259,6 +279,8 @@ std::ostream &operator<<(std::ostream &output, const operation &op) {
   return output;
 }
 
+constexpr std::size_t min_event_size{
+    binsrv::events::common_header_view_base::size_in_bytes};
 constexpr std::size_t max_event_size{512U};
 
 [[nodiscard]] gs::Generator<operation> operations() {
@@ -278,7 +300,7 @@ constexpr std::size_t max_event_size{512U};
                      .timestamp = 0U};
     if (kind == operation_kind::write_event) {
       result.event_size = tc.draw(gs::integers<std::size_t>(
-          {.min_value = 1U, .max_value = max_event_size}));
+          {.min_value = min_event_size, .max_value = max_event_size}));
       result.at_transaction_boundary = tc.draw(gs::booleans());
       result.timestamp = tc.draw(gs::integers<std::uint32_t>(
           {.min_value = 0U,
@@ -293,13 +315,28 @@ constexpr std::size_t max_event_size{512U};
   return gs::compose([](const hegel::TestCase &tc) {
     static constexpr std::uint64_t min_checkpoint_size{64ULL};
     static constexpr std::uint64_t max_checkpoint_size{4096ULL};
+    // block sizes smaller than one event make the reader re-fetch with the
+    // exact event size, larger ones make it split blocks into several events;
+    // a block must hold at least one common header (the server uses 1 MiB
+    // blocks, and sender_context treats a shorter block as corruption)
+    static constexpr std::size_t max_small_block_size{64U};
+    static constexpr std::size_t max_block_size{4096U};
+    const auto block_sizes{gs::one_of(
+        {gs::integers<std::size_t>(
+             {.min_value = min_event_size, .max_value = max_small_block_size}),
+         gs::integers<std::size_t>(
+             {.min_value = min_event_size, .max_value = max_block_size})})};
     storage_settings result{.gtid_mode = tc.draw(gs::booleans()),
-                            .checkpoint_size = std::nullopt};
+                            .checkpoint_size = std::nullopt,
+                            .tailing_reader_block_size = 0U,
+                            .fresh_reader_block_size = 0U};
     if (tc.draw(gs::booleans())) {
       result.checkpoint_size = tc.draw(gs::integers<std::uint64_t>(
           {.min_value = min_checkpoint_size,
            .max_value = max_checkpoint_size}));
     }
+    result.tailing_reader_block_size = tc.draw(block_sizes);
+    result.fresh_reader_block_size = tc.draw(block_sizes);
     return result;
   });
 }
@@ -512,6 +549,8 @@ struct disk_state {
   // for the current (last) binlog
   std::uint64_t file_size;
   std::size_t transactions_on_disk;
+  // for every binlog, in order
+  std::vector<std::size_t> transactions_on_disk_per_binlog;
 };
 
 // checks every binlog file and record against the model
@@ -525,7 +564,9 @@ require_disk_matches_model(const std::filesystem::path &storage_directory,
               std::to_string(std::size(binlogs)));
 
   binsrv::gtids::gtid_set earlier_gtids{};
-  disk_state result{.file_size = 0ULL, .transactions_on_disk = 0U};
+  disk_state result{.file_size = 0ULL,
+                    .transactions_on_disk = 0U,
+                    .transactions_on_disk_per_binlog = {}};
   for (std::size_t index{0U}; index < std::size(binlogs); ++index) {
     const auto &binlog{binlogs[index]};
     const auto file_content{read_file(storage_directory / binlog.name.str())};
@@ -541,8 +582,9 @@ require_disk_matches_model(const std::filesystem::path &storage_directory,
     require_record_matches(records[index], binlog, transactions_on_disk,
                            std::size(file_content), earlier_gtids, gtid_mode);
     earlier_gtids += model_gtids(binlog, transactions_on_disk);
-    result = {.file_size = std::size(file_content),
-              .transactions_on_disk = transactions_on_disk};
+    result.file_size = std::size(file_content);
+    result.transactions_on_disk = transactions_on_disk;
+    result.transactions_on_disk_per_binlog.push_back(transactions_on_disk);
   }
   return result;
 }
@@ -559,12 +601,71 @@ unflushed_complete_size(const model_binlog &binlog,
 }
 
 // ---------------------------------------------------------------------------
+// reading binlogs back
+// ---------------------------------------------------------------------------
+
+using event_list = std::vector<std::vector<std::byte>>;
+
+// the events a reader must return: those of the complete transactions on
+// disk, binlog after binlog
+[[nodiscard]] event_list expected_events(const storage_model &model,
+                                         const disk_state &state) {
+  event_list result;
+  const auto &binlogs{model.get_binlogs()};
+  for (std::size_t index{0U}; index < std::size(binlogs); ++index) {
+    const auto &binlog{binlogs[index]};
+    for (std::size_t transaction_index{0U};
+         transaction_index < state.transactions_on_disk_per_binlog[index];
+         ++transaction_index) {
+      for (const auto &event : binlog.transactions[transaction_index].events) {
+        result.push_back(event.bytes);
+      }
+    }
+  }
+  return result;
+}
+
+// reads events until the reader reports that there is no more data
+void read_until_end(operations::sender_context &reader, event_list &received,
+                    std::size_t max_events, std::string_view label) {
+  util::const_byte_span event{};
+  for (std::size_t reads{0U};; ++reads) {
+    require(reads <= max_events,
+            std::string{label} + ": the reader returned more events than "
+                                 "are on disk");
+    require(reader.get_event(event),
+            std::string{label} + ": sender_context::get_event() failed after " +
+                std::to_string(std::size(received)) + " event(s)");
+    if (event.empty()) {
+      return;
+    }
+    received.emplace_back(std::cbegin(event), std::cend(event));
+  }
+}
+
+void require_same_events(const event_list &received,
+                         const event_list &expected, std::string_view label) {
+  const auto common{std::min(std::size(received), std::size(expected))};
+  for (std::size_t index{0U}; index < common; ++index) {
+    require(received[index] == expected[index],
+            std::string{label} + ": event " + std::to_string(index + 1U) +
+                " differs from the one on disk (" +
+                std::to_string(std::size(received[index])) + " bytes read, " +
+                std::to_string(std::size(expected[index])) + " expected)");
+  }
+  require(std::size(received) == std::size(expected),
+          std::string{label} + ": read " + std::to_string(std::size(received)) +
+              " event(s) instead of " + std::to_string(std::size(expected)));
+}
+
+// ---------------------------------------------------------------------------
 // running a sequence of operations
 // ---------------------------------------------------------------------------
 
 enum class checked_properties : std::uint8_t {
   model_agreement,
-  checkpoint_size_bound
+  checkpoint_size_bound,
+  read_back
 };
 
 class storage_harness {
@@ -578,6 +679,7 @@ public:
     const auto status{storage_->open_binlog(model_.get_current_binlog().name)};
     require(status == binsrv::open_binlog_status::created,
             "the first binlog was not reported as created");
+    restart_tailing_reader();
     check();
   }
 
@@ -607,11 +709,16 @@ public:
       break;
     case operation_kind::restart:
       // destroying the storage flushes complete transactions, the
-      // incomplete one is lost
+      // incomplete one is lost (the tailing reader shares ownership of the
+      // storage, so it has to go first for the storage to be destroyed here)
+      tailing_reader_.reset();
       storage_.reset();
       model_.drop_incomplete_transaction();
       storage_ = make_storage(config_path_);
       reopen_current_binlog(*storage_, "restart");
+      // a reader belongs to a storage instance, a replica reconnecting after
+      // a restart starts reading from the beginning again
+      restart_tailing_reader();
       break;
     case operation_kind::crash:
       crash();
@@ -626,9 +733,23 @@ private:
   scratch_directory root_{};
   std::filesystem::path storage_directory_;
   std::filesystem::path config_path_;
-  std::unique_ptr<binsrv::storage> storage_{};
+  binsrv::storage_ptr storage_{};
   storage_model model_{};
   std::uint64_t event_counter_{0ULL};
+  // a reader that is kept across operations and follows the storage as it
+  // grows, as a connected replica does
+  std::unique_ptr<operations::sender_context> tailing_reader_{};
+  event_list tailing_received_{};
+
+  void restart_tailing_reader() {
+    tailing_reader_.reset();
+    tailing_received_.clear();
+    if (properties_ == checked_properties::read_back) {
+      tailing_reader_ = std::make_unique<operations::sender_context>(
+          std::make_shared<binsrv::null_logger>(), storage_,
+          settings_.tailing_reader_block_size);
+    }
+  }
 
   [[nodiscard]] std::filesystem::path
   prepare_storage_directory(const std::filesystem::path &directory) {
@@ -636,7 +757,9 @@ private:
     return write_config(root_.path(), directory, settings_);
   }
 
-  [[nodiscard]] std::vector<std::byte> next_event_bytes(std::size_t size) {
+  [[nodiscard]] std::vector<std::byte>
+  next_event_bytes(std::size_t size, std::uint32_t timestamp) {
+    using header = binsrv::events::common_header_view_base;
     // distinct content for every event, so that misplaced data is detected
     static constexpr std::uint64_t event_multiplier{131ULL};
     static constexpr std::uint64_t byte_multiplier{7ULL};
@@ -646,11 +769,25 @@ private:
       result[index] =
           static_cast<std::byte>((seed + index * byte_multiplier) & 0xFFULL);
     }
+
+    // a valid common header (the reader relies on the type code and the
+    // event size), the event-specific part is left as the pattern above
+    assert(size >= header::size_in_bytes);
+    const auto write_field{[&result](std::size_t offset, auto value) {
+      util::byte_span field{std::next(std::data(result),
+                                      static_cast<std::ptrdiff_t>(offset)),
+                            sizeof value};
+      util::insert_fixed_int_to_byte_span(field, value);
+    }};
+    write_field(header::timestamp_offset, timestamp);
+    write_field(header::type_code_offset,
+                static_cast<std::uint8_t>(binsrv::events::code_type::query));
+    write_field(header::event_size_offset, static_cast<std::uint32_t>(size));
     return result;
   }
 
   void write_event(const operation &op) {
-    auto bytes{next_event_bytes(op.event_size)};
+    auto bytes{next_event_bytes(op.event_size, op.timestamp)};
     const util::ctime_timestamp timestamp{
         static_cast<std::time_t>(op.timestamp)};
     const auto gno{model_.get_current_gno()};
@@ -700,7 +837,7 @@ private:
     std::filesystem::remove_all(crash_directory);
   }
 
-  void check() const {
+  void check() {
     const auto state{require_disk_matches_model(
         storage_directory_, storage_->get_binlog_records(), model_,
         settings_.gtid_mode)};
@@ -715,6 +852,22 @@ private:
               "current position " +
                   std::to_string(storage_->get_current_position()) +
                   " instead of " + std::to_string(expected_position));
+      return;
+    }
+
+    if (properties_ == checked_properties::read_back) {
+      const auto expected{expected_events(model_, state)};
+      read_until_end(*tailing_reader_, tailing_received_, std::size(expected),
+                     "tailing reader");
+      require_same_events(tailing_received_, expected, "tailing reader");
+
+      operations::sender_context fresh_reader{
+          std::make_shared<binsrv::null_logger>(), storage_,
+          settings_.fresh_reader_block_size};
+      event_list fresh_received;
+      read_until_end(fresh_reader, fresh_received, std::size(expected),
+                     "fresh reader");
+      require_same_events(fresh_received, expected, "fresh reader");
       return;
     }
 
@@ -748,5 +901,11 @@ BOOST_AUTO_TEST_CASE(StorageMatchesModel) {
 BOOST_AUTO_TEST_CASE(StorageRespectsCheckpointSize) {
   run_property([](hegel::TestCase &tc) {
     run_storage_property(tc, checked_properties::checkpoint_size_bound);
+  });
+}
+
+BOOST_AUTO_TEST_CASE(StorageReadBackMatchesDisk) {
+  run_property([](hegel::TestCase &tc) {
+    run_storage_property(tc, checked_properties::read_back);
   });
 }

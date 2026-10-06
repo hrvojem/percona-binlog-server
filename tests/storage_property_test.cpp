@@ -37,7 +37,10 @@
 // - reading the binlogs back through operations::sender_context (the reader
 //   behind COM_BINLOG_DUMP) returns exactly the events of the complete
 //   transactions on disk, in order, for any block size - both for a reader
-//   that follows the storage as it grows and for a fresh reader.
+//   that follows the storage as it grows and for a fresh reader;
+// - a reader running on another thread while the storage is being written
+//   (as in 'pull' mode, where the collector writes while replicas read)
+//   ends up with exactly the events of the complete transactions on disk.
 //
 // The generated events are not real binlog events, but each one starts with
 // a valid 19-byte common header (type code, event size), which is all the
@@ -49,12 +52,13 @@
 // while the read-back property checks the decrypted content.
 
 #include <algorithm>
-#include <cassert>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -65,9 +69,11 @@
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 // needed for binsrv::gtids::gtid_set_storage
@@ -757,8 +763,68 @@ void require_same_events(const event_list &received,
 enum class checked_properties : std::uint8_t {
   model_agreement,
   checkpoint_size_bound,
-  read_back
+  read_back,
+  concurrent_read_back
 };
+
+[[nodiscard]] bool reads_back(checked_properties properties) noexcept {
+  return properties == checked_properties::read_back ||
+         properties == checked_properties::concurrent_read_back;
+}
+
+// what a reader running on its own thread received; written only by that
+// thread and read only after it has been joined
+struct concurrent_read_result {
+  event_list received;
+  std::string error;
+};
+
+// reads through sender_context until a stop is requested, polling at the
+// end of the data as a blocking COM_BINLOG_DUMP session does; after the stop
+// request it makes one more pass up to the end of the data, so that
+// everything written before the request is read
+void read_concurrently(const std::stop_token &stop,
+                       operations::sender_context &reader,
+                       concurrent_read_result &result) {
+  static constexpr std::size_t max_events{1'000'000U};
+  static constexpr auto max_duration{std::chrono::seconds{60}};
+  const auto deadline{std::chrono::steady_clock::now() + max_duration};
+  bool final_pass{false};
+  util::const_byte_span event{};
+  try {
+    while (true) {
+      if (!reader.get_event(event)) {
+        result.error = "sender_context::get_event() failed after " +
+                       std::to_string(std::size(result.received)) +
+                       " event(s)";
+        return;
+      }
+      if (!event.empty()) {
+        result.received.emplace_back(std::cbegin(event), std::cend(event));
+        if (std::size(result.received) > max_events) {
+          result.error = "the reader returned too many events";
+          return;
+        }
+        continue;
+      }
+      // end of the data
+      if (final_pass) {
+        return;
+      }
+      if (stop.stop_requested()) {
+        final_pass = true;
+        continue;
+      }
+      if (std::chrono::steady_clock::now() > deadline) {
+        result.error = "the reader did not finish in time";
+        return;
+      }
+      std::this_thread::yield();
+    }
+  } catch (const std::exception &e) {
+    result.error = std::string{"exception in the reader: "} + e.what();
+  }
+}
 
 class storage_harness {
 public:
@@ -772,7 +838,32 @@ public:
     require(status == binsrv::open_binlog_status::created,
             "the first binlog was not reported as created");
     restart_tailing_reader();
+    if (properties_ == checked_properties::concurrent_read_back) {
+      concurrent_reader_ = std::make_unique<operations::sender_context>(
+          std::make_shared<binsrv::null_logger>(), storage_,
+          settings_.tailing_reader_block_size);
+      concurrent_thread_ = std::jthread{[this](const std::stop_token &stop) {
+        read_concurrently(stop, *concurrent_reader_, concurrent_result_);
+      }};
+    }
     check();
+  }
+
+  // called after the last operation: for the concurrent property, stops the
+  // reader and compares what it received with what is on disk
+  void finish() {
+    if (properties_ != checked_properties::concurrent_read_back) {
+      return;
+    }
+    concurrent_thread_.request_stop();
+    concurrent_thread_.join();
+    require(concurrent_result_.error.empty(),
+            "concurrent reader: " + concurrent_result_.error);
+    const auto state{require_disk_matches_model(
+        storage_directory_, storage_->get_binlog_records(), model_,
+        settings_)};
+    require_same_events(concurrent_result_.received,
+                        expected_events(model_, state), "concurrent reader");
   }
 
   void apply(const operation &op) {
@@ -792,7 +883,7 @@ public:
       // event, so closed binlogs are never empty; the reader relies on that
       // (an empty binlog in the middle reads as the end of the data), so the
       // read-back property only rotates binlogs that hold data
-      if (properties_ == checked_properties::read_back &&
+      if (reads_back(properties_) &&
           model_.get_current_binlog().transactions.empty()) {
         break;
       }
@@ -808,6 +899,11 @@ public:
               "the next binlog was not reported as created");
       break;
     case operation_kind::restart:
+      // a running server never replaces its storage object while replicas
+      // are reading, so restarts are not part of the concurrent property
+      if (properties_ == checked_properties::concurrent_read_back) {
+        break;
+      }
       // destroying the storage flushes complete transactions, the
       // incomplete one is lost (the tailing reader shares ownership of the
       // storage, so it has to go first for the storage to be destroyed here)
@@ -840,6 +936,12 @@ private:
   // grows, as a connected replica does
   std::unique_ptr<operations::sender_context> tailing_reader_{};
   event_list tailing_received_{};
+  // the reader of the concurrent property; declared in this order so that
+  // the thread is stopped and joined before the reader and the result it
+  // writes to are destroyed
+  std::unique_ptr<operations::sender_context> concurrent_reader_{};
+  concurrent_read_result concurrent_result_{};
+  std::jthread concurrent_thread_{};
 
   void restart_tailing_reader() {
     tailing_reader_.reset();
@@ -991,6 +1093,7 @@ void run_storage_property(hegel::TestCase &tc, checked_properties properties) {
   for (const auto &op : ops) {
     harness.apply(op);
   }
+  harness.finish();
 }
 
 } // anonymous namespace
@@ -1010,5 +1113,11 @@ BOOST_AUTO_TEST_CASE(StorageRespectsCheckpointSize) {
 BOOST_AUTO_TEST_CASE(StorageReadBackMatchesDisk) {
   run_property([](hegel::TestCase &tc) {
     run_storage_property(tc, checked_properties::read_back);
+  });
+}
+
+BOOST_AUTO_TEST_CASE(StorageConcurrentReadBackMatchesDisk) {
+  run_property([](hegel::TestCase &tc) {
+    run_storage_property(tc, checked_properties::concurrent_read_back);
   });
 }

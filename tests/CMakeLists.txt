@@ -311,6 +311,20 @@ if(WITH_PROPERTY_TESTS)
     CXX_EXTENSIONS NO
   )
 
+  add_executable(config_value_property_test config_value_property_test.cpp)
+  target_include_directories(config_value_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(config_value_property_test
+    PRIVATE
+      binlog_server_compiler_flags
+      binsrv::lib_binsrv
+      Boost::unit_test_framework
+      hegel
+  )
+  set_target_properties(config_value_property_test PROPERTIES
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+  )
+
   add_test(NAME gtid_set_property_test COMMAND gtid_set_property_test ${test_run_options})
   add_test(NAME event_property_test COMMAND event_property_test ${test_run_options})
   add_test(NAME storage_property_test COMMAND storage_property_test ${test_run_options})
@@ -319,4 +333,5 @@ if(WITH_PROPERTY_TESTS)
   add_test(NAME minimysql_property_test COMMAND minimysql_property_test ${test_run_options})
   add_test(NAME rewriter_property_test COMMAND rewriter_property_test ${test_run_options})
   add_test(NAME reader_context_property_test COMMAND reader_context_property_test ${test_run_options})
+  add_test(NAME config_value_property_test COMMAND config_value_property_test ${test_run_options})
 endif()

@@ -1,0 +1,726 @@
+// Copyright (c) 2026 Percona and/or its affiliates.
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License, version 2.0,
+// as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License, version 2.0, for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, write to the Free Software
+// Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+
+// Property-based tests for the parsers of values that come from users (the
+// configuration file and the command line) or from servers, built with Hegel
+// (https://hegel.dev):
+// - binsrv::size_unit ("checkpoint_size", "file_size": "512M") and
+//   binsrv::time_unit ("checkpoint_interval", "connect_timeout": "30s")
+//   accept exactly <digits>[<unit>] whose value fits in 64 bits, with the
+//   value an independent model computes, and print back to the same value;
+// - binsrv::events::composite_binlog_name ("binlog.000042") accepts exactly
+//   the canonical names, prints them back unchanged and never wraps around;
+// - util::ctime_timestamp (the "search_by_timestamp" argument) accepts
+//   exactly the valid "YYYY-MM-DDTHH:MM:SS[.fraction]" timestamps, with the
+//   value an independent calendar model computes;
+// - util::semantic_version (the server version from FORMAT_DESCRIPTION
+//   events) accepts exactly "<major>.<minor>.<patch>[-<extra>]" with 8-bit
+//   components;
+// - the filesystem storage backend accepts exactly "file://<path>" URIs of
+//   existing directories, and object URIs point inside that directory;
+// - storage_config::get_masked_uri() hides credentials and keeps the rest.
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <ctime>
+#include <exception>
+#include <filesystem>
+#include <limits>
+#include <optional>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+
+#include <boost/url/parse.hpp>
+#include <boost/url/scheme.hpp>
+#include <boost/url/url.hpp>
+
+#define BOOST_TEST_MODULE ConfigValuePropertyTests
+// this include is needed as it provides the 'main()' function
+// NOLINTNEXTLINE(misc-include-cleaner)
+#include <boost/test/unit_test.hpp>
+
+#include <boost/test/unit_test_suite.hpp>
+
+#include <hegel/hegel.h>
+
+#include "property_test_helpers.hpp"
+
+#include "binsrv/filesystem_storage_backend.hpp"
+#include "binsrv/size_unit.hpp"
+#include "binsrv/storage_backend_type.hpp"
+#include "binsrv/storage_config.hpp"
+#include "binsrv/time_unit.hpp"
+
+#include "binsrv/events/composite_binlog_name.hpp"
+
+#include "util/ctime_timestamp.hpp"
+#include "util/semantic_version.hpp"
+
+namespace {
+
+namespace gs = hegel::generators;
+
+using property_testing::require;
+using property_testing::run_property;
+
+[[nodiscard]] gs::Generator<std::string>
+text_of_size(std::size_t min_size, std::size_t max_size,
+             std::optional<std::uint32_t> max_codepoint = std::nullopt) {
+  gs::TextParams params{};
+  params.min_size = min_size;
+  params.max_size = max_size;
+  params.max_codepoint = max_codepoint;
+  return gs::text(params);
+}
+
+[[nodiscard]] bool is_digit(char character) noexcept {
+  return character >= '0' && character <= '9';
+}
+
+// the decimal value of a string of digits, if it fits in 64 bits
+[[nodiscard]] std::optional<std::uint64_t>
+model_decimal(std::string_view digits) {
+  std::uint64_t result{0U};
+  for (const char digit : digits) {
+    if (!is_digit(digit) ||
+        __builtin_mul_overflow(result, std::uint64_t{10U}, &result) ||
+        __builtin_add_overflow(result,
+                               static_cast<std::uint64_t>(digit - '0'),
+                               &result)) {
+      return std::nullopt;
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// size_unit and time_unit
+// ---------------------------------------------------------------------------
+
+struct unit_symbol {
+  char symbol;
+  std::uint64_t multiplier;
+};
+
+constexpr std::array<unit_symbol, 5> size_symbols{
+    {{.symbol = 'K', .multiplier = 1ULL << 10U},
+     {.symbol = 'M', .multiplier = 1ULL << 20U},
+     {.symbol = 'G', .multiplier = 1ULL << 30U},
+     {.symbol = 'T', .multiplier = 1ULL << 40U},
+     {.symbol = 'P', .multiplier = 1ULL << 50U}}};
+
+constexpr std::array<unit_symbol, 4> time_symbols{
+    {{.symbol = 's', .multiplier = 1ULL},
+     {.symbol = 'm', .multiplier = 60ULL},
+     {.symbol = 'h', .multiplier = 60ULL * 60ULL},
+     {.symbol = 'd', .multiplier = 60ULL * 60ULL * 24ULL}}};
+
+// the value of "<digits>[<symbol>]", or nothing when the text is not of that
+// form or the value does not fit in 64 bits
+template <std::size_t N>
+[[nodiscard]] std::optional<std::uint64_t>
+model_unit(std::string_view text, const std::array<unit_symbol, N> &symbols) {
+  std::size_t digits{0U};
+  while (digits < std::size(text) && is_digit(text[digits])) {
+    ++digits;
+  }
+  if (digits == 0U) {
+    return std::nullopt;
+  }
+  const auto base{model_decimal(text.substr(0U, digits))};
+  if (!base.has_value()) {
+    return std::nullopt;
+  }
+  const auto suffix{text.substr(digits)};
+  if (suffix.empty()) {
+    return base;
+  }
+  if (std::size(suffix) != 1U) {
+    return std::nullopt;
+  }
+  for (const auto &[symbol, multiplier] : symbols) {
+    if (symbol == suffix.front()) {
+      std::uint64_t value{};
+      if (__builtin_mul_overflow(*base, multiplier, &value)) {
+        return std::nullopt;
+      }
+      return value;
+    }
+  }
+  return std::nullopt;
+}
+
+// unit texts: mostly well-formed, with numbers of every magnitude (including
+// ones near and beyond 64 bits) and both known and unknown unit symbols
+[[nodiscard]] gs::Generator<std::string> unit_texts(std::string_view symbols) {
+  const std::string symbol_choices{symbols};
+  return gs::one_of(
+      {gs::compose([symbol_choices](const hegel::TestCase &tc) {
+         std::string result{tc.draw(gs::one_of(
+             {gs::integers<std::uint64_t>().map(
+                  [](std::uint64_t value) { return std::to_string(value); }),
+              gs::from_regex("[0-9]{1,24}", true)}))};
+         // nothing, a known symbol, or an unknown one
+         const auto suffix{tc.draw(gs::integers<std::size_t>(
+             {.min_value = 0U, .max_value = 2U}))};
+         if (suffix == 1U) {
+           result += symbol_choices[tc.draw(gs::integers<std::size_t>(
+               {.min_value = 0U,
+                .max_value = std::size(symbol_choices) - 1U}))];
+         } else if (suffix == 2U) {
+           result += tc.draw(text_of_size(1U, 2U, 0x7FU));
+         }
+         return result;
+       }),
+       gs::from_regex("[-+ ]?[0-9]{0,3}[ _.,]?[0-9]{0,3}[KMGTPkmgtpsdh_ B]{0,2}",
+                      true),
+       text_of_size(0U, 8U)});
+}
+
+template <typename Unit, std::size_t N>
+void check_unit(std::string_view text,
+                const std::array<unit_symbol, N> &symbols) {
+  const auto expected{model_unit(text, symbols)};
+  std::optional<Unit> parsed;
+  try {
+    parsed.emplace(text);
+  } catch (const std::logic_error &) {
+    // std::invalid_argument and std::out_of_range
+  } catch (const std::exception &e) {
+    throw std::runtime_error{"'" + std::string{text} +
+                             "' was rejected with an unexpected exception: " +
+                             e.what()};
+  }
+  if (!expected.has_value()) {
+    require(!parsed.has_value(),
+            "'" + std::string{text} + "' was accepted as " +
+                std::to_string(parsed->get_value()));
+    return;
+  }
+  require(parsed.has_value(), "'" + std::string{text} +
+                                  "' was rejected, expected " +
+                                  std::to_string(*expected));
+  require(parsed->get_value() == *expected,
+          "'" + std::string{text} + "' was parsed as " +
+              std::to_string(parsed->get_value()) + ", expected " +
+              std::to_string(*expected));
+  const auto printed{parsed->to_string()};
+  const Unit reparsed{printed};
+  require(reparsed.get_value() == *expected,
+          "'" + std::string{text} + "' printed as '" + printed +
+              "' which parses as " + std::to_string(reparsed.get_value()));
+  [[maybe_unused]] const auto description{parsed->get_description()};
+}
+
+// ---------------------------------------------------------------------------
+// timestamps
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] bool is_leap_year(std::int64_t year) noexcept {
+  return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+}
+
+[[nodiscard]] std::int64_t days_in_month(std::int64_t year,
+                                         std::int64_t month) noexcept {
+  static constexpr std::array<std::int64_t, 12> days{31, 28, 31, 30, 31, 30,
+                                                     31, 31, 30, 31, 30, 31};
+  return month == 2 && is_leap_year(year)
+             ? 29
+             : days[static_cast<std::size_t>(month - 1)];
+}
+
+// days since 1970-01-01 of a proleptic Gregorian date
+[[nodiscard]] std::int64_t days_from_civil(std::int64_t year,
+                                           std::int64_t month,
+                                           std::int64_t day) noexcept {
+  std::int64_t days{0};
+  for (std::int64_t current{1970}; current < year; ++current) {
+    days += is_leap_year(current) ? 366 : 365;
+  }
+  for (std::int64_t current{year}; current < 1970; ++current) {
+    days -= is_leap_year(current) ? 366 : 365;
+  }
+  for (std::int64_t current{1}; current < month; ++current) {
+    days += days_in_month(year, current);
+  }
+  return days + day - 1;
+}
+
+// the range of dates Boost.Date_Time supports
+constexpr std::int64_t min_year{1400};
+constexpr std::int64_t max_year{9999};
+
+struct timestamp_fields {
+  std::int64_t year;
+  std::int64_t month;
+  std::int64_t day;
+  std::int64_t hour;
+  std::int64_t minute;
+  std::int64_t second;
+  std::string fraction;
+};
+
+[[nodiscard]] std::string two_digits(std::int64_t value) {
+  return (value < 10 ? "0" : "") + std::to_string(value);
+}
+
+[[nodiscard]] std::string format_timestamp(const timestamp_fields &fields) {
+  std::string year{std::to_string(fields.year)};
+  year.insert(0U, std::size(year) < 4U ? 4U - std::size(year) : 0U, '0');
+  return year + '-' + two_digits(fields.month) + '-' + two_digits(fields.day) +
+         'T' + two_digits(fields.hour) + ':' + two_digits(fields.minute) +
+         ':' + two_digits(fields.second) + fields.fraction;
+}
+
+[[nodiscard]] std::optional<std::time_t>
+model_timestamp(const timestamp_fields &fields) {
+  if (fields.year < min_year || fields.year > max_year || fields.month < 1 ||
+      fields.month > 12 || fields.day < 1 ||
+      fields.day > days_in_month(fields.year, fields.month) ||
+      fields.hour > 23 || fields.minute > 59 || fields.second > 59) {
+    return std::nullopt;
+  }
+  static constexpr std::int64_t seconds_per_day{86400};
+  // std::int64_t and std::time_t are different types on some platforms
+  const std::time_t result =
+      days_from_civil(fields.year, fields.month, fields.day) *
+          seconds_per_day +
+      fields.hour * 3600 + fields.minute * 60 + fields.second;
+  return result;
+}
+
+[[nodiscard]] gs::Generator<timestamp_fields> timestamp_field_values() {
+  return gs::compose([](const hegel::TestCase &tc) {
+    const auto field{[&tc](std::int64_t min_value, std::int64_t max_value) {
+      return tc.draw(gs::integers<std::int64_t>(
+          {.min_value = min_value, .max_value = max_value}));
+    }};
+    // mostly valid values, sometimes just outside the valid range
+    const bool valid{tc.draw(gs::integers<int>({.min_value = 0,
+                                                .max_value = 3})) != 0};
+    timestamp_fields result{};
+    result.year = valid ? field(1970, 2100) : field(1000, 9999);
+    result.month = valid ? field(1, 12) : field(0, 13);
+    result.day = valid ? field(1, days_in_month(result.year, result.month))
+                       : field(0, 32);
+    result.hour = valid ? field(0, 23) : field(0, 99);
+    result.minute = valid ? field(0, 59) : field(0, 99);
+    result.second = valid ? field(0, 59) : field(0, 99);
+    result.fraction = tc.draw(gs::from_regex("(\\.[0-9]{1,6})?", true));
+    return result;
+  });
+}
+
+[[nodiscard]] std::time_t timestamp_value(std::int64_t year) {
+  return *model_timestamp({.year = year,
+                           .month = year == min_year ? 1 : 12,
+                           .day = year == min_year ? 1 : 31,
+                           .hour = year == min_year ? 0 : 23,
+                           .minute = year == min_year ? 0 : 59,
+                           .second = year == min_year ? 0 : 59,
+                           .fraction = {}});
+}
+
+// ---------------------------------------------------------------------------
+// binlog names and server versions
+// ---------------------------------------------------------------------------
+
+constexpr std::uint32_t max_binlog_sequence_number{999999U};
+
+// whether "<base>.<6 digits>" is the canonical name of a binlog, according
+// to the documented format
+[[nodiscard]] bool model_binlog_name(std::string_view text) {
+  static constexpr std::size_t digits{6U};
+  if (std::size(text) <= digits + 1U) {
+    return false;
+  }
+  const auto separator{std::size(text) - digits - 1U};
+  if (text[separator] != '.') {
+    return false;
+  }
+  const auto number{model_decimal(text.substr(separator + 1U))};
+  const auto base{text.substr(0U, separator)};
+  return number.has_value() && *number != 0U &&
+         base.find('/') == std::string_view::npos;
+}
+
+// the components of "<major>.<minor>.<patch>[-<extra>]", or nothing
+[[nodiscard]] std::optional<std::array<std::uint8_t, 3>>
+model_version(std::string_view text) {
+  if (const auto dash{text.find('-')}; dash != std::string_view::npos) {
+    text = text.substr(0U, dash);
+  }
+  std::array<std::uint8_t, 3> result{};
+  for (std::size_t index{0U}; index < std::size(result); ++index) {
+    const auto dot{text.find('.')};
+    const auto component{text.substr(0U, dot)};
+    const auto value{model_decimal(component)};
+    if (component.empty() || !value.has_value() ||
+        *value > std::numeric_limits<std::uint8_t>::max()) {
+      return std::nullopt;
+    }
+    result.at(index) = static_cast<std::uint8_t>(*value);
+    if (index + 1U == std::size(result)) {
+      if (dot != std::string_view::npos) {
+        return std::nullopt;
+      }
+    } else {
+      if (dot == std::string_view::npos) {
+        return std::nullopt;
+      }
+      text = text.substr(dot + 1U);
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// storage URIs
+// ---------------------------------------------------------------------------
+
+// a fresh directory for one test case, removed afterwards
+class scratch_directory {
+public:
+  scratch_directory() {
+    std::random_device device;
+    path_ = std::filesystem::temp_directory_path() /
+            ("pbs-uri-test-" + std::to_string(device()) + '-' +
+             std::to_string(device()));
+    std::filesystem::create_directories(path_);
+  }
+  scratch_directory(const scratch_directory &) = delete;
+  scratch_directory &operator=(const scratch_directory &) = delete;
+  scratch_directory(scratch_directory &&) = delete;
+  scratch_directory &operator=(scratch_directory &&) = delete;
+  ~scratch_directory() {
+    std::error_code error;
+    std::filesystem::remove_all(path_, error);
+  }
+
+  [[nodiscard]] const std::filesystem::path &path() const noexcept {
+    return path_;
+  }
+
+private:
+  std::filesystem::path path_;
+};
+
+[[nodiscard]] binsrv::storage_config make_storage_config(std::string uri) {
+  binsrv::storage_config config{};
+  config.get<"backend">() = binsrv::storage_backend_type::file;
+  config.get<"uri">() = std::move(uri);
+  return config;
+}
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// properties
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(SizeUnitMatchesModel) {
+  run_property([](hegel::TestCase &tc) {
+    const auto text{tc.draw("text", unit_texts("KMGTP_kB"))};
+    check_unit<binsrv::size_unit>(text, size_symbols);
+  });
+}
+
+BOOST_AUTO_TEST_CASE(TimeUnitMatchesModel) {
+  run_property([](hegel::TestCase &tc) {
+    const auto text{tc.draw("text", unit_texts("smhdSMHDw"))};
+    check_unit<binsrv::time_unit>(text, time_symbols);
+  });
+}
+
+BOOST_AUTO_TEST_CASE(BinlogNameRoundTrip) {
+  run_property([](hegel::TestCase &tc) {
+    const auto base{
+        tc.draw("base", gs::from_regex("[A-Za-z0-9_.-]{1,16}", true))};
+    const auto number{tc.draw(
+        "number", gs::integers<std::uint32_t>(
+                      {.min_value = 1U,
+                       .max_value = max_binlog_sequence_number}))};
+    const binsrv::events::composite_binlog_name name{base, number};
+    const auto text{name.str()};
+    const auto parsed{binsrv::events::composite_binlog_name::parse(text)};
+    require(parsed == name, "'" + text + "' parsed as '" + parsed.str() + "'");
+
+    // the next binlog: the sequence number plus one, never wrapping around
+    std::optional<binsrv::events::composite_binlog_name> next;
+    try {
+      next.emplace(name.next());
+    } catch (const std::invalid_argument &) {
+    }
+    if (number == max_binlog_sequence_number) {
+      require(!next.has_value(), "the binlog after '" + text + "' is '" +
+                                     next->str() + "'");
+    } else {
+      require(next.has_value() && next->get_base_name() == base &&
+                  next->get_sequence_number() == number + 1U,
+              "wrong binlog after '" + text + "'");
+    }
+  });
+}
+
+BOOST_AUTO_TEST_CASE(BinlogNameParsingMatchesModel) {
+  run_property([](hegel::TestCase &tc) {
+    const auto text{tc.draw(
+        "text",
+        gs::one_of(
+            {gs::from_regex("[a-z/ .\\x00-]{0,6}[.-]?[0-9+ -]{4,8}", true),
+             text_of_size(0U, 16U)}))};
+    std::optional<binsrv::events::composite_binlog_name> parsed;
+    try {
+      parsed.emplace(binsrv::events::composite_binlog_name::parse(text));
+    } catch (const std::invalid_argument &) {
+    }
+    const bool expected{model_binlog_name(text)};
+    require(parsed.has_value() == expected,
+            "'" + text + "' was " + (expected ? "rejected" : "accepted"));
+    if (parsed.has_value()) {
+      require(parsed->str() == text,
+              "'" + text + "' printed back as '" + parsed->str() + "'");
+    }
+  });
+}
+
+BOOST_AUTO_TEST_CASE(TimestampRoundTrip) {
+  run_property([](hegel::TestCase &tc) {
+    const auto value{tc.draw(
+        "value", gs::integers<std::time_t>(
+                     {.min_value = timestamp_value(min_year),
+                      .max_value = timestamp_value(max_year)}))};
+    const util::ctime_timestamp timestamp{value};
+    const auto text{timestamp.iso_extended_str()};
+    util::ctime_timestamp parsed{};
+    require(util::ctime_timestamp::try_parse(text, parsed),
+            "'" + text + "' was rejected");
+    require(parsed.get_value() == value,
+            "'" + text + "' parsed as " + std::to_string(parsed.get_value()) +
+                ", expected " + std::to_string(value));
+  });
+}
+
+BOOST_AUTO_TEST_CASE(TimestampParsingMatchesModel) {
+  run_property([](hegel::TestCase &tc) {
+    const auto fields{tc.draw("fields", timestamp_field_values())};
+    const auto text{format_timestamp(fields)};
+    const auto expected{model_timestamp(fields)};
+    util::ctime_timestamp parsed{};
+    const bool accepted{util::ctime_timestamp::try_parse(text, parsed)};
+    if (!expected.has_value()) {
+      require(!accepted, "'" + text + "' was accepted as " +
+                             parsed.iso_extended_str());
+      return;
+    }
+    require(accepted, "'" + text + "' was rejected");
+    require(parsed.get_value() == *expected,
+            "'" + text + "' parsed as " + std::to_string(parsed.get_value()) +
+                ", expected " + std::to_string(*expected));
+  });
+}
+
+BOOST_AUTO_TEST_CASE(TimestampParsingOfArbitraryTextIsSane) {
+  run_property([](hegel::TestCase &tc) {
+    const auto text{tc.draw(
+        "text",
+        gs::one_of({gs::sampled_from<std::string>(
+                        {"not-a-date-time", "+infinity", "-infinity",
+                         "not_a_date_time", "2026-10-06", "2026-10-06T",
+                         "20261006T120000", "2026-10-06 12:00:00",
+                         "2026-Oct-06 12:00:00", "2026-10-06T12:00"}),
+                    gs::from_regex("[0-9]{1,5}-[0-9]{1,3}-[0-9]{1,3}T[0-9]{1,"
+                                   "3}:[0-9]{1,3}(:[0-9]{1,3})?[.,0-9]{0,4}",
+                                   true),
+                    text_of_size(0U, 24U)}))};
+    util::ctime_timestamp parsed{};
+    if (!util::ctime_timestamp::try_parse(text, parsed)) {
+      return;
+    }
+    // an accepted timestamp is a real point in time that prints and parses
+    // back to itself
+    require(parsed.get_value() >= timestamp_value(min_year) &&
+                parsed.get_value() <= timestamp_value(max_year),
+            "'" + text + "' was accepted as " +
+                std::to_string(parsed.get_value()) +
+                ", outside of the supported date range");
+    const auto printed{parsed.iso_extended_str()};
+    util::ctime_timestamp reparsed{};
+    require(util::ctime_timestamp::try_parse(printed, reparsed) &&
+                reparsed == parsed,
+            "'" + text + "' was accepted, but printed as '" + printed +
+                "' which does not parse back");
+  });
+}
+
+BOOST_AUTO_TEST_CASE(SemanticVersionParsingMatchesModel) {
+  run_property([](hegel::TestCase &tc) {
+    const auto text{tc.draw(
+        "text",
+        gs::one_of({gs::from_regex("[0-9]{1,3}(\\.[0-9]{1,3}){2}(-[a-z0-9.-]{"
+                                   "0,8})?",
+                                   true),
+                    gs::from_regex("[0-9.+ -]{0,12}", true),
+                    text_of_size(0U, 12U)}))};
+    const auto expected{model_version(text)};
+    std::optional<util::semantic_version> parsed;
+    try {
+      parsed.emplace(text);
+    } catch (const std::invalid_argument &) {
+    }
+    require(parsed.has_value() == expected.has_value(),
+            "'" + text + "' was " +
+                (expected.has_value() ? "rejected" : "accepted"));
+    if (!parsed.has_value()) {
+      return;
+    }
+    require(parsed->get_major() == expected->at(0U) &&
+                parsed->get_minor() == expected->at(1U) &&
+                parsed->get_patch() == expected->at(2U),
+            "'" + text + "' parsed as " + parsed->get_string());
+  });
+}
+
+BOOST_AUTO_TEST_CASE(SemanticVersionEncodingRoundTrip) {
+  run_property([](hegel::TestCase &tc) {
+    // the encoding has two decimal digits per component
+    const auto component{[&tc](const char *name) {
+      return tc.draw(name, gs::integers<std::uint8_t>(
+                               {.min_value = 0U, .max_value = 99U}));
+    }};
+    const util::semantic_version version{component("major"),
+                                         component("minor"),
+                                         component("patch")};
+    const util::semantic_version decoded{version.get_encoded()};
+    require(decoded.get_major() == version.get_major() &&
+                decoded.get_minor() == version.get_minor() &&
+                decoded.get_patch() == version.get_patch(),
+            version.get_string() + " decoded as " + decoded.get_string());
+    const util::semantic_version reparsed{version.get_string()};
+    require(reparsed.get_encoded() == version.get_encoded(),
+            version.get_string() + " parsed back as " + reparsed.get_string());
+  });
+}
+
+BOOST_AUTO_TEST_CASE(FilesystemStorageUriMatchesModel) {
+  run_property([](hegel::TestCase &tc) {
+    const scratch_directory scratch;
+    // a directory whose name needs percent-encoding in a URI
+    const auto directory_name{tc.draw(
+        "directory", gs::from_regex("[A-Za-z0-9 %#?@:;=&+,!$'()._~-]{1,12}",
+                                    true)
+                         .filter([](const std::string &value) {
+                           return value != "." && value != "..";
+                         }))};
+    const auto root{scratch.path() / directory_name};
+    std::filesystem::create_directories(root);
+
+    // what a user may write in the configuration file
+    boost::urls::url uri;
+    uri.set_scheme_id(boost::urls::scheme::file);
+    uri.set_encoded_authority("");
+    const bool with_host{tc.draw("with_host", gs::booleans())};
+    const bool with_port{tc.draw("with_port", gs::booleans())};
+    const bool with_userinfo{tc.draw("with_userinfo", gs::booleans())};
+    const bool with_query{tc.draw("with_query", gs::booleans())};
+    const bool with_fragment{tc.draw("with_fragment", gs::booleans())};
+    // a path with a NUL character (%00 in the URI) names no directory, even
+    // when the part before it does
+    const bool with_nul{tc.draw("with_nul", gs::booleans())};
+    if (with_host) {
+      uri.set_host("localhost");
+    }
+    if (with_port) {
+      uri.set_port_number(8080U);
+    }
+    if (with_userinfo) {
+      uri.set_userinfo("user:secret");
+    }
+    std::string path{root.generic_string()};
+    if (with_nul) {
+      path += std::string_view{"\0suffix", 7U};
+    }
+    uri.set_path(path);
+    if (with_query) {
+      uri.set_query("region=x");
+    }
+    if (with_fragment) {
+      uri.set_fragment("part");
+    }
+    const std::string uri_text{uri.c_str()};
+    const bool expected{!with_host && !with_port && !with_userinfo &&
+                        !with_query && !with_fragment && !with_nul};
+
+    std::optional<binsrv::filesystem_storage_backend> backend;
+    try {
+      backend.emplace(make_storage_config(uri_text));
+    } catch (const std::invalid_argument &) {
+    }
+    require(backend.has_value() == expected,
+            "'" + uri_text + "' was " + (expected ? "rejected" : "accepted"));
+    if (!backend.has_value()) {
+      return;
+    }
+    require(backend->get_description() ==
+                "local filesystem - " + root.generic_string(),
+            "'" + uri_text + "' opened as '" + backend->get_description() +
+                "'");
+    // object URIs point to the object inside the root directory
+    static constexpr std::string_view object_name{"binlog.000001"};
+    const auto object_uri{backend->get_object_uri(object_name)};
+    const auto parsed{boost::urls::parse_absolute_uri(object_uri)};
+    require(parsed.has_value() &&
+                std::filesystem::path{std::string{parsed->path()}} ==
+                    root / object_name,
+            "object URI '" + object_uri + "' does not point to '" +
+                (root / object_name).generic_string() + "'");
+  });
+}
+
+BOOST_AUTO_TEST_CASE(StorageUriMaskingHidesCredentials) {
+  run_property([](hegel::TestCase &tc) {
+    boost::urls::url uri;
+    uri.set_scheme(tc.draw("scheme", gs::sampled_from<std::string>(
+                                         {"s3", "http", "https"})));
+    const auto user{tc.draw("user", text_of_size(1U, 12U))};
+    const auto password{tc.draw("password", text_of_size(0U, 12U))};
+    uri.set_user(user);
+    uri.set_password(password);
+    uri.set_host(tc.draw("host", gs::from_regex("[a-z0-9]{1,8}(\\.[a-z0-9]{"
+                                                "1,8}){0,2}",
+                                                true)));
+    if (tc.draw("with_port", gs::booleans())) {
+      uri.set_port_number(tc.draw("port", gs::integers<std::uint16_t>()));
+    }
+    uri.set_path(tc.draw("path", text_of_size(0U, 16U)));
+    const std::string uri_text{uri.c_str()};
+
+    const auto masked{make_storage_config(uri_text).get_masked_uri()};
+    const auto parsed{boost::urls::parse_absolute_uri(masked)};
+    require(parsed.has_value(), "'" + uri_text + "' was masked as '" +
+                                    masked + "', which is not a URI");
+    require(parsed->encoded_userinfo() == "***:***",
+            "'" + uri_text + "' was masked as '" + masked + "'");
+    require(parsed->scheme() == uri.scheme() &&
+                parsed->encoded_host_and_port() ==
+                    uri.encoded_host_and_port() &&
+                parsed->encoded_path() == uri.encoded_path(),
+            "'" + uri_text + "' was masked as '" + masked +
+                "', which points elsewhere");
+  });
+}

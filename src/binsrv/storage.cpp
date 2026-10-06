@@ -38,8 +38,10 @@
 #include "binsrv/gtids/gtid.hpp"
 #include "binsrv/gtids/gtid_set.hpp"
 
+#include "util/byte_range_fwd.hpp"
 #include "util/byte_span.hpp"
 #include "util/ctime_timestamp.hpp"
+#include "util/dynamic_byte_buffer_fwd.hpp"
 #include "util/exception_location_helpers.hpp"
 
 namespace binsrv {
@@ -47,7 +49,21 @@ namespace binsrv {
 storage::storage(basic_logger_ptr logger, const main_config &config,
                  storage_construction_mode_type construction_mode)
     : core_{std::make_unique<storage_core>(std::move(logger), config,
-                                           construction_mode)} {}
+                                           construction_mode)} {
+  const auto &storage_config{config.root().get<"storage">()};
+
+  const auto &checkpoint_size_opt{storage_config.get<"checkpoint_size">()};
+  if (checkpoint_size_opt.has_value()) {
+    checkpoint_size_bytes_ = checkpoint_size_opt->get_value();
+  }
+
+  const auto &checkpoint_interval_opt{
+      storage_config.get<"checkpoint_interval">()};
+  if (checkpoint_interval_opt.has_value()) {
+    checkpoint_interval_seconds_ =
+        std::chrono::seconds{checkpoint_interval_opt->get_value()};
+  }
+}
 
 storage::~storage() {
   if (core_->get_construction_mode() ==
@@ -223,6 +239,13 @@ storage::purge_binlogs(const events::composite_binlog_name &target) {
 [[nodiscard]] std::string storage::get_binlog_uri(
     const events::composite_binlog_name &binlog_name) const {
   return core_->get_binlog_uri(binlog_name);
+}
+
+[[nodiscard]] bool
+storage::fetch_event_block(events::composite_binlog_name &binlog_name,
+                           util::byte_range &range,
+                           util::dynamic_byte_buffer &buffer) const {
+  return core_->fetch_event_block(binlog_name, range, buffer);
 }
 
 [[nodiscard]] std::string storage::get_keyring_description() const {

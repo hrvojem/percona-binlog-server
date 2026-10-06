@@ -40,7 +40,11 @@
 //   that follows the storage as it grows and for a fresh reader;
 // - a reader running on another thread while the storage is being written
 //   (as in 'pull' mode, where the collector writes while replicas read)
-//   ends up with exactly the events of the complete transactions on disk.
+//   ends up with exactly the events of the complete transactions on disk;
+// - purging the oldest binlogs from another storage instance in purging mode
+//   (as the 'purge_binlogs' operation does while 'fetch' / 'pull' keeps
+//   running) leaves a storage that can be opened again at any moment and
+//   holds exactly the remaining binlogs.
 //
 // The generated events are not real binlog events, but each one starts with
 // a valid 19-byte common header (type code, event size), which is all the
@@ -267,11 +271,13 @@ write_config(const std::filesystem::path &directory,
 }
 
 [[nodiscard]] binsrv::storage_ptr
-make_storage(const std::filesystem::path &config_path) {
+make_storage(const std::filesystem::path &config_path,
+             binsrv::storage_construction_mode_type construction_mode =
+                 binsrv::storage_construction_mode_type::streaming) {
   const binsrv::main_config config{config_path.string()};
   return std::make_shared<binsrv::storage>(
       std::make_shared<binsrv::null_logger>(), config,
-      binsrv::storage_construction_mode_type::streaming);
+      construction_mode);
 }
 
 [[nodiscard]] std::vector<std::byte>
@@ -299,7 +305,8 @@ enum class operation_kind : std::uint8_t {
   flush,
   rotate,
   restart,
-  crash
+  crash,
+  purge
 };
 
 struct operation {
@@ -308,6 +315,9 @@ struct operation {
   std::size_t event_size;
   bool at_transaction_boundary;
   std::uint32_t timestamp;
+  // only for purge: how many of the oldest binlogs to purge (at most all but
+  // the current one)
+  std::size_t purge_count;
 };
 
 std::ostream &operator<<(std::ostream &output, const operation &op) {
@@ -326,6 +336,8 @@ std::ostream &operator<<(std::ostream &output, const operation &op) {
     return output << "restart";
   case operation_kind::crash:
     return output << "crash";
+  case operation_kind::purge:
+    return output << "purge(" << op.purge_count << ')';
   }
   return output;
 }
@@ -343,12 +355,19 @@ constexpr std::size_t max_event_size{512U};
          operation_kind::write_event, operation_kind::write_event,
          operation_kind::write_event, operation_kind::write_event,
          operation_kind::discard_incomplete_transaction, operation_kind::flush,
-         operation_kind::rotate, operation_kind::restart,
-         operation_kind::crash}))};
+         operation_kind::rotate, operation_kind::rotate,
+         operation_kind::restart, operation_kind::crash,
+         operation_kind::purge}))};
+    static constexpr std::size_t max_purge_count{3U};
     operation result{.kind = kind,
                      .event_size = 0U,
                      .at_transaction_boundary = false,
-                     .timestamp = 0U};
+                     .timestamp = 0U,
+                     .purge_count = 0U};
+    if (kind == operation_kind::purge) {
+      result.purge_count = tc.draw(gs::integers<std::size_t>(
+          {.min_value = 1U, .max_value = max_purge_count}));
+    }
     if (kind == operation_kind::write_event) {
       result.event_size = tc.draw(gs::integers<std::size_t>(
           {.min_value = min_event_size, .max_value = max_event_size}));
@@ -488,7 +507,19 @@ public:
                         .closed = false});
   }
 
+  // removes the 'count' oldest binlogs (which are closed, so all their
+  // transactions are on disk); their GTIDs stay part of every later
+  // binlog's previous GTIDs
+  void purge(std::size_t count);
+
+  // GTIDs of the transactions in purged binlogs
+  [[nodiscard]] const binsrv::gtids::gtid_set &
+  get_purged_gtids() const noexcept {
+    return purged_gtids_;
+  }
+
 private:
+  binsrv::gtids::gtid_set purged_gtids_{};
   std::vector<model_binlog> binlogs_;
   model_transaction incomplete_{};
   std::uint64_t committed_transactions_{0ULL};
@@ -577,6 +608,17 @@ model_gtids(const model_binlog &binlog, std::size_t number_of_transactions) {
   return result;
 }
 
+void storage_model::purge(std::size_t count) {
+  assert(count < std::size(binlogs_));
+  for (std::size_t index{0U}; index < count; ++index) {
+    purged_gtids_ +=
+        model_gtids(binlogs_[index], std::size(binlogs_[index].transactions));
+  }
+  binlogs_.erase(std::begin(binlogs_),
+                 std::next(std::begin(binlogs_),
+                           static_cast<std::ptrdiff_t>(count)));
+}
+
 void require_record_matches(const binsrv::binlog_record &record,
                             const model_binlog &binlog,
                             std::size_t transactions_on_disk,
@@ -660,7 +702,7 @@ require_disk_matches_model(const std::filesystem::path &storage_directory,
           std::to_string(std::size(records)) + " binlog records instead of " +
               std::to_string(std::size(binlogs)));
 
-  binsrv::gtids::gtid_set earlier_gtids{};
+  binsrv::gtids::gtid_set earlier_gtids{model.get_purged_gtids()};
   disk_state result{.file_size = 0ULL,
                     .transactions_on_disk = 0U,
                     .transactions_on_disk_per_binlog = {}};
@@ -764,7 +806,8 @@ enum class checked_properties : std::uint8_t {
   model_agreement,
   checkpoint_size_bound,
   read_back,
-  concurrent_read_back
+  concurrent_read_back,
+  purge_reopenable
 };
 
 [[nodiscard]] bool reads_back(checked_properties properties) noexcept {
@@ -919,6 +962,9 @@ public:
     case operation_kind::crash:
       crash();
       break;
+    case operation_kind::purge:
+      purge(op.purge_count);
+      break;
     }
     check();
   }
@@ -1018,6 +1064,30 @@ private:
             std::string{label} + ": the existing binlog was created anew");
   }
 
+  // purges the oldest binlogs through a separate storage instance in purging
+  // mode, as a 'purge_binlogs' process does while this one keeps running;
+  // only the purge property uses it
+  void purge(std::size_t requested_count) {
+    const auto &binlogs{model_.get_binlogs()};
+    if (properties_ != checked_properties::purge_reopenable ||
+        std::size(binlogs) < 2U) {
+      return;
+    }
+    // the current (last) binlog cannot be purged
+    const auto count{std::min(requested_count, std::size(binlogs) - 1U)};
+    const auto target{binlogs[count - 1U].name};
+    {
+      const auto purger{make_storage(
+          config_path_, binsrv::storage_construction_mode_type::purging)};
+      const auto [purged, warning]{purger->purge_binlogs(target)};
+      require(warning.empty(), "purge reported a warning: " + warning);
+      require(std::size(purged) == count,
+              "purge removed " + std::to_string(std::size(purged)) +
+                  " binlog(s) instead of " + std::to_string(count));
+    }
+    model_.purge(count);
+  }
+
   // a copy of the storage directory taken now is what a killed process
   // leaves behind: it must be accepted by a new storage, and resuming must
   // start right after what is on disk
@@ -1043,6 +1113,14 @@ private:
   }
 
   void check() {
+    if (properties_ == checked_properties::purge_reopenable) {
+      // after a purge by another process, the running storage's own list of
+      // binlogs is stale by design; what must hold at every moment is that
+      // the storage on disk can be opened again (as after a restart or a
+      // crash) and holds exactly the remaining binlogs
+      crash();
+      return;
+    }
     const auto state{require_disk_matches_model(
         storage_directory_, storage_->get_binlog_records(), model_,
         settings_)};
@@ -1113,6 +1191,12 @@ BOOST_AUTO_TEST_CASE(StorageRespectsCheckpointSize) {
 BOOST_AUTO_TEST_CASE(StorageReadBackMatchesDisk) {
   run_property([](hegel::TestCase &tc) {
     run_storage_property(tc, checked_properties::read_back);
+  });
+}
+
+BOOST_AUTO_TEST_CASE(StoragePurgeKeepsStorageReopenable) {
+  run_property([](hegel::TestCase &tc) {
+    run_storage_property(tc, checked_properties::purge_reopenable);
   });
 }
 

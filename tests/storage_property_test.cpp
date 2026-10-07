@@ -63,6 +63,13 @@
 // encryption key from a test keyring and an AES-CTR data cipher). Then the
 // files on disk are checked by size only and must differ from the plaintext,
 // while the read-back property checks the decrypted content.
+//
+// Every property also has a variant ('...OnS3') that runs the same test
+// cases on the S3 storage backend against an S3-compatible server, given by
+// the environment variables PBS_TEST_S3_ENDPOINT (host:port),
+// PBS_TEST_S3_ACCESS_KEY, PBS_TEST_S3_SECRET_KEY and PBS_TEST_S3_BUCKET; the
+// variants are skipped when these are not set. The storage objects are then
+// read and changed through the backend instead of the filesystem.
 
 #include <algorithm>
 #include <array>
@@ -71,6 +78,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -79,6 +87,7 @@
 #include <new>
 #include <memory>
 #include <numeric>
+#include <source_location>
 #include <optional>
 #include <ostream>
 #include <sstream>
@@ -104,9 +113,13 @@
 
 #include "property_test_helpers.hpp"
 
+#include "binsrv/basic_storage_backend.hpp"
 #include "binsrv/main_config.hpp"
 #include "binsrv/null_logger.hpp"
 #include "binsrv/storage.hpp"
+#include "binsrv/storage_backend_factory.hpp"
+#include "binsrv/storage_backend_type.hpp"
+#include "binsrv/storage_config.hpp"
 #include "binsrv/storage_core.hpp"
 
 #include "binsrv/events/code_type.hpp"
@@ -121,6 +134,7 @@
 
 #include "operations/sender_context.hpp"
 
+#include "util/byte_span.hpp"
 #include "util/byte_span_fwd.hpp"
 #include "util/byte_span_inserters.hpp"
 #include "util/ctime_timestamp.hpp"
@@ -179,7 +193,33 @@ struct encryption_settings {
   std::string data_cipher;
 };
 
+// the S3-compatible server used by the '...OnS3' properties
+struct s3_server {
+  std::string endpoint;
+  std::string access_key;
+  std::string secret_key;
+  std::string bucket;
+};
+
+[[nodiscard]] std::optional<s3_server> s3_server_from_environment() {
+  const auto get{[](const char *name) {
+    const char *value{std::getenv(name)}; // NOLINT(concurrency-mt-unsafe)
+    return value == nullptr ? std::string{} : std::string{value};
+  }};
+  s3_server result{.endpoint = get("PBS_TEST_S3_ENDPOINT"),
+                   .access_key = get("PBS_TEST_S3_ACCESS_KEY"),
+                   .secret_key = get("PBS_TEST_S3_SECRET_KEY"),
+                   .bucket = get("PBS_TEST_S3_BUCKET")};
+  if (result.endpoint.empty() || result.access_key.empty() ||
+      result.secret_key.empty() || result.bucket.empty()) {
+    return std::nullopt;
+  }
+  return result;
+}
+
 struct storage_settings {
+  // set by the '...OnS3' properties, not generated
+  std::optional<s3_server> s3;
   bool gtid_mode;
   std::optional<std::uint64_t> checkpoint_size;
   std::optional<encryption_settings> encryption;
@@ -190,7 +230,8 @@ struct storage_settings {
 
 std::ostream &operator<<(std::ostream &output,
                          const storage_settings &settings) {
-  output << (settings.gtid_mode ? "gtid" : "position") << " mode, ";
+  output << (settings.s3.has_value() ? "S3, " : "filesystem, ")
+         << (settings.gtid_mode ? "gtid" : "position") << " mode, ";
   if (settings.checkpoint_size.has_value()) {
     output << "checkpoint_size " << *settings.checkpoint_size;
   } else {
@@ -223,17 +264,21 @@ const std::vector<std::string> keyring_key_ids{"alpha16", "alpha32", "beta24",
 const std::vector<std::string> block_mode_key_ids{"alpha16", "alpha32",
                                                   "beta24"};
 
-// writes a configuration file for a local filesystem storage in
-// 'storage_directory'; the connection / replication source sections are
+// the storage section members that select where a storage lives, written
+// by 'storage_location::config_members()'
+using location_members = std::string;
+
+// writes a configuration file for a storage at a location (given by its
+// configuration members); the connection / replication source sections are
 // required by the configuration schema but are not used by the storage
 // (an encrypted storage uses the keyring file from 'directory')
 [[nodiscard]] std::filesystem::path
 write_config(const std::filesystem::path &directory,
-             const std::filesystem::path &storage_directory,
+             const location_members &location,
              const storage_settings &settings) {
+  static std::atomic<std::uint64_t> config_counter{0ULL};
   std::ostringstream storage_section;
-  storage_section << R"("backend": "file", "uri": "file://)"
-                  << storage_directory.generic_string() << '"';
+  storage_section << location;
   if (settings.checkpoint_size.has_value()) {
     storage_section << R"(, "checkpoint_size": ")" << *settings.checkpoint_size
                     << '"';
@@ -248,9 +293,8 @@ write_config(const std::filesystem::path &directory,
                       (directory / keyring_name).generic_string() + R"(" },)";
   }
 
-  const auto config_path{directory /
-                         ("config_" + storage_directory.filename().string() +
-                          ".json")};
+  const auto config_path{
+      directory / ("config_" + std::to_string(config_counter++) + ".json")};
   std::ofstream config{config_path};
   config << R"({
   "logger": { "level": "error", "file": "" },
@@ -304,6 +348,195 @@ read_file(const std::filesystem::path &path) {
   });
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// where a storage lives
+// ---------------------------------------------------------------------------
+
+using object_bytes = std::vector<std::byte>;
+
+// the objects of a storage: files in a directory, or objects under a prefix
+// in an S3 bucket
+class storage_location {
+public:
+  storage_location() = default;
+  storage_location(const storage_location &) = delete;
+  storage_location &operator=(const storage_location &) = delete;
+  storage_location(storage_location &&) = delete;
+  storage_location &operator=(storage_location &&) = delete;
+  virtual ~storage_location() = default;
+
+  // the members of the configuration's "storage" section that select it
+  [[nodiscard]] virtual std::string config_members() const = 0;
+  // sorted
+  [[nodiscard]] virtual std::vector<std::string> object_names() = 0;
+  [[nodiscard]] virtual object_bytes read(std::string_view name) = 0;
+  virtual void write(std::string_view name, const object_bytes &content) = 0;
+  virtual void remove(std::string_view name) = 0;
+  // an empty location next to this one, for copies of the storage
+  [[nodiscard]] virtual std::unique_ptr<storage_location>
+  make_sibling(std::string_view label) = 0;
+
+  [[nodiscard]] bool exists(std::string_view name) {
+    const auto names{object_names()};
+    return std::ranges::find(names, name) != std::cend(names);
+  }
+  [[nodiscard]] std::uint64_t size(std::string_view name) {
+    return std::size(read(name));
+  }
+  void clear() {
+    for (const auto &name : object_names()) {
+      remove(name);
+    }
+  }
+  void copy_to(storage_location &target) {
+    target.clear();
+    for (const auto &name : object_names()) {
+      target.write(name, read(name));
+    }
+  }
+};
+
+class directory_location final : public storage_location {
+public:
+  explicit directory_location(std::filesystem::path directory)
+      : directory_{std::move(directory)} {
+    std::filesystem::create_directories(directory_);
+  }
+
+  [[nodiscard]] std::string config_members() const override {
+    return R"("backend": "file", "uri": "file://)" +
+           directory_.generic_string() + '"';
+  }
+  [[nodiscard]] std::vector<std::string> object_names() override {
+    std::vector<std::string> result;
+    for (const auto &entry :
+         std::filesystem::directory_iterator{directory_}) {
+      result.push_back(entry.path().filename().string());
+    }
+    std::ranges::sort(result);
+    return result;
+  }
+  [[nodiscard]] object_bytes read(std::string_view name) override {
+    return read_file(directory_ / name);
+  }
+  void write(std::string_view name, const object_bytes &content) override {
+    std::ofstream output{directory_ / name, std::ios::binary | std::ios::trunc};
+    output.write(
+        reinterpret_cast<const char *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+            std::data(content)),
+        static_cast<std::streamsize>(std::size(content)));
+    if (!output) {
+      throw std::runtime_error{"cannot write '" + std::string{name} + "'"};
+    }
+  }
+  void remove(std::string_view name) override {
+    std::filesystem::remove(directory_ / name);
+  }
+  [[nodiscard]] std::unique_ptr<storage_location>
+  make_sibling(std::string_view label) override {
+    auto sibling_directory{directory_.parent_path() /
+                           (directory_.filename().string() + '-' +
+                            std::string{label})};
+    std::filesystem::remove_all(sibling_directory);
+    return std::make_unique<directory_location>(std::move(sibling_directory));
+  }
+
+private:
+  std::filesystem::path directory_;
+};
+
+// percent-encodes everything except the characters a URI never needs to
+// encode, so that any access key or secret fits into the user info
+[[nodiscard]] std::string percent_encode(std::string_view text) {
+  static constexpr std::string_view digits{"0123456789ABCDEF"};
+  std::string result;
+  for (const char character : text) {
+    const auto byte{static_cast<unsigned char>(character)};
+    if ((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+        (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' ||
+        byte == '_' || byte == '~') {
+      result += character;
+    } else {
+      result += '%';
+      result += digits[byte >> 4U];
+      result += digits[byte & 0x0FU];
+    }
+  }
+  return result;
+}
+
+// objects under a prefix of an S3 bucket, read and written through the S3
+// storage backend; the objects are removed when the location is destroyed
+class s3_location final : public storage_location {
+public:
+  s3_location(s3_server server, std::string prefix,
+              std::filesystem::path buffer_directory)
+      : server_{std::move(server)}, prefix_{std::move(prefix)},
+        buffer_directory_{std::move(buffer_directory)} {
+    std::filesystem::create_directories(buffer_directory_);
+    binsrv::storage_config config{};
+    config.get<"backend">() = binsrv::storage_backend_type::s3;
+    config.get<"uri">() = uri();
+    config.get<"fs_buffer_directory">() = buffer_directory_.string();
+    backend_ = binsrv::storage_backend_factory::create(config);
+  }
+  s3_location(const s3_location &) = delete;
+  s3_location &operator=(const s3_location &) = delete;
+  s3_location(s3_location &&) = delete;
+  s3_location &operator=(s3_location &&) = delete;
+  ~s3_location() override {
+    try {
+      clear();
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+    }
+  }
+
+  [[nodiscard]] std::string config_members() const override {
+    return R"("backend": "s3", "uri": ")" + uri() +
+           R"(", "fs_buffer_directory": ")" + buffer_directory_.string() +
+           '"';
+  }
+  [[nodiscard]] std::vector<std::string> object_names() override {
+    std::vector<std::string> result;
+    for (const auto &[name, size] : backend_->list_objects()) {
+      result.push_back(name);
+    }
+    std::ranges::sort(result);
+    return result;
+  }
+  [[nodiscard]] object_bytes read(std::string_view name) override {
+    return backend_->get_object(name);
+  }
+  void write(std::string_view name, const object_bytes &content) override {
+    backend_->put_object(name, util::const_byte_span{content});
+  }
+  void remove(std::string_view name) override {
+    backend_->remove_object(name);
+  }
+  [[nodiscard]] std::unique_ptr<storage_location>
+  make_sibling(std::string_view label) override {
+    auto sibling{std::make_unique<s3_location>(
+        server_, prefix_ + '-' + std::string{label},
+        buffer_directory_.parent_path() /
+            (buffer_directory_.filename().string() + '-' +
+             std::string{label}))};
+    sibling->clear();
+    return sibling;
+  }
+
+private:
+  s3_server server_;
+  std::string prefix_;
+  std::filesystem::path buffer_directory_;
+  binsrv::basic_storage_backend_ptr backend_{};
+
+  [[nodiscard]] std::string uri() const {
+    return "http://" + percent_encode(server_.access_key) + ':' +
+           percent_encode(server_.secret_key) + '@' + server_.endpoint + '/' +
+           server_.bucket + '/' + prefix_;
+  }
+};
 
 // ---------------------------------------------------------------------------
 // operations
@@ -406,7 +639,8 @@ constexpr std::size_t max_event_size{512U};
              {.min_value = min_event_size, .max_value = max_small_block_size}),
          gs::integers<std::size_t>(
              {.min_value = min_event_size, .max_value = max_block_size})})};
-    storage_settings result{.gtid_mode = tc.draw(gs::booleans()),
+    storage_settings result{.s3 = std::nullopt,
+                            .gtid_mode = tc.draw(gs::booleans()),
                             .checkpoint_size = std::nullopt,
                             .encryption = std::nullopt,
                             .tailing_reader_block_size = 0U,
@@ -702,7 +936,7 @@ struct disk_state {
 
 // checks every binlog file and record against the model
 [[nodiscard]] disk_state
-require_disk_matches_model(const std::filesystem::path &storage_directory,
+require_disk_matches_model(storage_location &location,
                            const binsrv::binlog_record_container &records,
                            const storage_model &model,
                            const storage_settings &settings) {
@@ -718,7 +952,7 @@ require_disk_matches_model(const std::filesystem::path &storage_directory,
                     .transactions_on_disk_per_binlog = {}};
   for (std::size_t index{0U}; index < std::size(binlogs); ++index) {
     const auto &binlog{binlogs[index]};
-    const auto file_content{read_file(storage_directory / binlog.name.str())};
+    const auto file_content{location.read(binlog.name.str())};
     const auto transactions_on_disk{
         match_file_with_model(file_content, binlog, encrypted)};
     if (binlog.closed) {
@@ -889,18 +1123,9 @@ std::ostream &operator<<(std::ostream &output, const damage &value) {
   });
 }
 
-[[nodiscard]] std::vector<std::string>
-storage_file_names(const std::filesystem::path &directory) {
-  std::vector<std::string> result;
-  for (const auto &entry : std::filesystem::directory_iterator{directory}) {
-    result.push_back(entry.path().filename().string());
-  }
-  std::ranges::sort(result);
-  return result;
-}
-
-[[nodiscard]] std::string read_text(const std::filesystem::path &path) {
-  const auto bytes{read_file(path)};
+[[nodiscard]] std::string read_text(storage_location &location,
+                                    std::string_view name) {
+  const auto bytes{location.read(name)};
   std::string result(std::size(bytes), '\0');
   std::ranges::transform(bytes, std::begin(result), [](std::byte value) {
     return static_cast<char>(std::to_integer<unsigned char>(value));
@@ -908,13 +1133,13 @@ storage_file_names(const std::filesystem::path &directory) {
   return result;
 }
 
-void write_text(const std::filesystem::path &path, std::string_view content) {
-  std::ofstream output{path, std::ios::binary | std::ios::trunc};
-  output.write(std::data(content),
-               static_cast<std::streamsize>(std::size(content)));
-  if (!output) {
-    throw std::runtime_error{"cannot write '" + path.string() + "'"};
-  }
+void write_text(storage_location &location, std::string_view name,
+                std::string_view content) {
+  object_bytes bytes(std::size(content));
+  std::ranges::transform(content, std::begin(bytes), [](char value) {
+    return static_cast<std::byte>(static_cast<unsigned char>(value));
+  });
+  location.write(name, bytes);
 }
 
 [[nodiscard]] std::vector<std::string> split_lines(std::string_view text) {
@@ -1068,8 +1293,7 @@ public:
   storage_harness(const storage_settings &settings,
                   checked_properties properties)
       : settings_{settings}, properties_{properties},
-        storage_directory_{root_.path() / "storage"},
-        config_path_{prepare_storage_directory(storage_directory_)} {
+        location_{make_location()}, config_path_{prepare_config()} {
     storage_ = make_storage(config_path_);
     const auto status{storage_->open_binlog(model_.get_current_binlog().name)};
     require(status == binsrv::open_binlog_status::created,
@@ -1097,7 +1321,7 @@ public:
     require(concurrent_result_.error.empty(),
             "concurrent reader: " + concurrent_result_.error);
     const auto state{require_disk_matches_model(
-        storage_directory_, storage_->get_binlog_records(), model_,
+        *location_, storage_->get_binlog_records(), model_,
         settings_)};
     require_same_events(concurrent_result_.received,
                         expected_events(model_, state), "concurrent reader");
@@ -1167,12 +1391,10 @@ public:
   // storage as it is on disk now, and opens the copy for streaming and for
   // queries
   void check_damaged_copy(const damage &value) {
-    const auto copy_directory{root_.path() / "damaged"};
-    std::filesystem::remove_all(copy_directory);
-    std::filesystem::copy(storage_directory_, copy_directory,
-                          std::filesystem::copy_options::recursive);
+    const auto copy{location_->make_sibling("damaged")};
+    location_->copy_to(*copy);
     const auto copy_config{
-        write_config(root_.path(), copy_directory, settings_)};
+        write_config(root_.path(), copy->config_members(), settings_)};
 
     // the binlog records as the undamaged files describe them
     const auto reference_outcome{open_storage(
@@ -1183,7 +1405,7 @@ public:
     const auto &reference{*reference_outcome.records};
     require(!reference.empty(), "the undamaged storage has no binlogs");
 
-    const auto files{storage_file_names(copy_directory)};
+    const auto files{copy->object_names()};
     const std::string index_name{
         binsrv::storage_core::default_binlog_index_name};
     const std::string metadata_name{binsrv::storage_core::metadata_name};
@@ -1202,18 +1424,16 @@ public:
     std::string description{description_stream.str()};
 
     const auto target_name{files[value.target % std::size(files)]};
-    const auto target_path{copy_directory / target_name};
     const bool target_is_data{target_name != index_name &&
                               target_name != metadata_name &&
                               !is_binlog_metadata(target_name)};
     const auto binlog_of_metadata{[](const std::string &name) {
       return name.substr(0U, std::size(name) - std::string_view{".json"}.size());
     }};
-    const auto index_path{copy_directory / index_name};
 
     switch (value.kind) {
     case damage_kind::delete_file:
-      std::filesystem::remove(target_path);
+      copy->remove(target_name);
       description += " deleting '" + target_name + "'";
       expected = expectation::rejected;
       if (is_binlog_metadata(target_name)) {
@@ -1221,12 +1441,14 @@ public:
       }
       break;
     case damage_kind::truncate_file: {
-      const auto size{std::filesystem::file_size(target_path)};
+      auto truncated{copy->read(target_name)};
+      const auto size{std::size(truncated)};
       if (size == 0U) {
         return;
       }
       const auto new_size{value.position % size};
-      std::filesystem::resize_file(target_path, new_size);
+      truncated.resize(new_size);
+      copy->write(target_name, truncated);
       description += " truncating '" + target_name + "' to " +
                      std::to_string(new_size) + " bytes";
       if (target_is_data) {
@@ -1246,13 +1468,13 @@ public:
       break;
     }
     case damage_kind::change_byte: {
-      auto content{read_text(target_path)};
+      auto content{read_text(*copy, target_name)};
       if (content.empty()) {
         return;
       }
       auto &byte{content[value.position % std::size(content)]};
       byte = static_cast<char>(static_cast<unsigned char>(byte) ^ value.mask);
-      write_text(target_path, content);
+      write_text(*copy, target_name, content);
       description += " changing a byte of '" + target_name + "'";
       // the storage does not check binlog data (there is a TODO for it), so
       // a changed byte there leaves the records as they are
@@ -1265,9 +1487,9 @@ public:
       break;
     }
     case damage_kind::append_garbage: {
-      auto content{read_text(target_path)};
+      auto content{read_text(*copy, target_name)};
       content += value.text.empty() ? std::string{"garbage"} : value.text;
-      write_text(target_path, content);
+      write_text(*copy, target_name, content);
       description += " appending to '" + target_name + "'";
       if (target_is_data) {
         // extra data at the end of the last binlog is what an interrupted
@@ -1285,12 +1507,12 @@ public:
       if (target_is_data) {
         return;
       }
-      auto content{read_text(target_path)};
+      auto content{read_text(*copy, target_name)};
       const auto start{value.position % (std::size(content) + 1U)};
       const auto length{std::min(value.other_position % 24U,
                                  std::size(content) - start)};
       content.replace(start, length, value.text);
-      write_text(target_path, content);
+      write_text(*copy, target_name, content);
       description += " replacing '" + target_name + "' bytes " +
                      std::to_string(start) + ".." +
                      std::to_string(start + length) + " with '" + value.text +
@@ -1303,10 +1525,10 @@ public:
     case damage_kind::add_unexpected_file: {
       auto name{value.text};
       if (name.empty() || name.find('/') != std::string::npos ||
-          std::filesystem::exists(copy_directory / name)) {
+          copy->exists(name)) {
         name = "unexpected.bin";
       }
-      write_text(copy_directory / name, "unexpected");
+      write_text(*copy, name, "unexpected");
       description += " adding '" + name + "'";
       expected = expectation::rejected;
       break;
@@ -1316,7 +1538,7 @@ public:
     case damage_kind::index_swap_entries:
     case damage_kind::index_add_entry:
     case damage_kind::index_crlf_line_endings: {
-      auto lines{split_lines(read_text(index_path))};
+      auto lines{split_lines(read_text(*copy, index_name))};
       if (lines.empty()) {
         return;
       }
@@ -1360,15 +1582,15 @@ public:
         description += " using CRLF line endings in the binlog index";
         break;
       }
-      write_text(index_path, join_lines(lines, ending));
+      write_text(*copy, index_name, join_lines(lines, ending));
       break;
     }
     case damage_kind::damage_every_binlog_metadata:
       for (const auto &name : files) {
         if (is_binlog_metadata(name)) {
-          const auto path{copy_directory / name};
-          std::filesystem::resize_file(path,
-                                       std::filesystem::file_size(path) / 2U);
+          auto content{copy->read(name)};
+          content.resize(std::size(content) / 2U);
+          copy->write(name, content);
           damaged_metadata.push_back(binlog_of_metadata(name));
         }
       }
@@ -1428,7 +1650,7 @@ public:
                     reference[index].name.str() + "'");
       }
       // extra data at the end of the last binlog is cut off
-      require(std::filesystem::file_size(copy_directory / last_binlog) ==
+      require(copy->size(last_binlog) ==
                   reference.back().size,
               description + ": the last binlog was not truncated to " +
                   std::to_string(reference.back().size) + " bytes");
@@ -1439,7 +1661,7 @@ private:
   storage_settings settings_;
   checked_properties properties_;
   scratch_directory root_{};
-  std::filesystem::path storage_directory_;
+  std::unique_ptr<storage_location> location_;
   std::filesystem::path config_path_;
   binsrv::storage_ptr storage_{};
   storage_model model_{};
@@ -1465,14 +1687,22 @@ private:
     }
   }
 
-  [[nodiscard]] std::filesystem::path
-  prepare_storage_directory(const std::filesystem::path &directory) {
-    std::filesystem::create_directories(directory);
+  [[nodiscard]] std::unique_ptr<storage_location> make_location() {
+    if (settings_.s3.has_value()) {
+      // the scratch directory name is unique, and so is the prefix
+      return std::make_unique<s3_location>(
+          *settings_.s3, root_.path().filename().string(),
+          root_.path() / "s3-buffer");
+    }
+    return std::make_unique<directory_location>(root_.path() / "storage");
+  }
+
+  [[nodiscard]] std::filesystem::path prepare_config() {
     if (settings_.encryption.has_value()) {
       std::ofstream keyring{root_.path() / keyring_name};
       keyring << keyring_content;
     }
-    return write_config(root_.path(), directory, settings_);
+    return write_config(root_.path(), location_->config_members(), settings_);
   }
 
   [[nodiscard]] std::vector<std::byte>
@@ -1558,16 +1788,14 @@ private:
   // leaves behind: it must be accepted by a new storage, and resuming must
   // start right after what is on disk
   void crash() {
-    const auto crash_directory{root_.path() / "crash"};
-    std::filesystem::remove_all(crash_directory);
-    std::filesystem::copy(storage_directory_, crash_directory,
-                          std::filesystem::copy_options::recursive);
-    const auto crash_config{
-        write_config(root_.path(), crash_directory, settings_)};
+    const auto crash_location{location_->make_sibling("crash")};
+    location_->copy_to(*crash_location);
+    const auto crash_config{write_config(
+        root_.path(), crash_location->config_members(), settings_)};
     {
       auto crashed{make_storage(crash_config)};
       const auto state{require_disk_matches_model(
-          crash_directory, crashed->get_binlog_records(), model_, settings_)};
+          *crash_location, crashed->get_binlog_records(), model_, settings_)};
       reopen_current_binlog(*crashed, "crash");
       require(crashed->get_current_position() == state.file_size,
               "crash: resuming at position " +
@@ -1575,7 +1803,7 @@ private:
                   " instead of right after the data on disk (" +
                   std::to_string(state.file_size) + ")");
     }
-    std::filesystem::remove_all(crash_directory);
+    crash_location->clear();
   }
 
   void check() {
@@ -1588,7 +1816,7 @@ private:
       return;
     }
     const auto state{require_disk_matches_model(
-        storage_directory_, storage_->get_binlog_records(), model_,
+        *location_, storage_->get_binlog_records(), model_,
         settings_)};
     const auto &current{model_.get_current_binlog()};
     const auto unflushed{
@@ -1631,8 +1859,10 @@ private:
   }
 };
 
-void run_storage_property(hegel::TestCase &tc, checked_properties properties) {
-  const auto settings{tc.draw("settings", storage_settings_generator())};
+void run_storage_property(hegel::TestCase &tc, checked_properties properties,
+                          const std::optional<s3_server> &s3 = std::nullopt) {
+  auto settings{tc.draw("settings", storage_settings_generator())};
+  settings.s3 = s3;
   const auto ops{tc.draw("ops", gs::vectors(operations()))};
   std::optional<damage> damage_value;
   if (properties == checked_properties::damaged_files) {
@@ -1646,6 +1876,39 @@ void run_storage_property(hegel::TestCase &tc, checked_properties properties) {
   if (damage_value.has_value()) {
     harness.check_damaged_copy(*damage_value);
   }
+}
+
+// runs a property on the S3 storage backend, or skips it when no S3 server
+// is configured
+void run_s3_storage_property(checked_properties properties,
+                             const std::source_location location =
+                                 std::source_location::current()) {
+  const auto server{s3_server_from_environment()};
+  if (!server.has_value()) {
+    BOOST_TEST_MESSAGE("skipped: PBS_TEST_S3_ENDPOINT, PBS_TEST_S3_ACCESS_KEY, "
+                       "PBS_TEST_S3_SECRET_KEY and PBS_TEST_S3_BUCKET are not "
+                       "set");
+    return;
+  }
+  // every storage check goes through HTTP requests, so a test case takes
+  // seconds instead of milliseconds: run fewer of them (20, or
+  // PBS_TEST_S3_TEST_CASES), and do not fail on the slow generation that
+  // follows
+  static constexpr std::uint64_t default_s3_test_cases{20ULL};
+  std::uint64_t s3_test_cases{default_s3_test_cases};
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
+  if (const char *value{std::getenv("PBS_TEST_S3_TEST_CASES")};
+      value != nullptr) {
+    s3_test_cases = std::stoull(value);
+  }
+  hegel::Settings settings{};
+  settings.test_cases = s3_test_cases;
+  settings.suppress_health_check = {hegel::HealthCheck::TooSlow};
+  run_property(
+      [properties, &server](hegel::TestCase &tc) {
+        run_storage_property(tc, properties, server);
+      },
+      settings, location);
 }
 
 } // anonymous namespace
@@ -1684,4 +1947,28 @@ BOOST_AUTO_TEST_CASE(StorageOpeningOfDamagedFilesFailsCleanly) {
   run_property([](hegel::TestCase &tc) {
     run_storage_property(tc, checked_properties::damaged_files);
   });
+}
+
+BOOST_AUTO_TEST_CASE(StorageMatchesModelOnS3) {
+  run_s3_storage_property(checked_properties::model_agreement);
+}
+
+BOOST_AUTO_TEST_CASE(StorageRespectsCheckpointSizeOnS3) {
+  run_s3_storage_property(checked_properties::checkpoint_size_bound);
+}
+
+BOOST_AUTO_TEST_CASE(StorageReadBackMatchesDiskOnS3) {
+  run_s3_storage_property(checked_properties::read_back);
+}
+
+BOOST_AUTO_TEST_CASE(StoragePurgeKeepsStorageReopenableOnS3) {
+  run_s3_storage_property(checked_properties::purge_reopenable);
+}
+
+BOOST_AUTO_TEST_CASE(StorageConcurrentReadBackMatchesDiskOnS3) {
+  run_s3_storage_property(checked_properties::concurrent_read_back);
+}
+
+BOOST_AUTO_TEST_CASE(StorageOpeningOfDamagedFilesFailsCleanlyOnS3) {
+  run_s3_storage_property(checked_properties::damaged_files);
 }

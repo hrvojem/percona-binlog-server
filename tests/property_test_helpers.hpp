@@ -43,6 +43,20 @@ run_property(const std::function<void(hegel::TestCase &)> &body,
                   location.file_name(), static_cast<int>(location.line())});
 }
 
+// the same, with explicit Hegel settings (fields left at their defaults
+// still come from the settings profile)
+inline void
+run_property(const std::function<void(hegel::TestCase &)> &body,
+             const hegel::Settings &settings,
+             const std::source_location location =
+                 std::source_location::current()) {
+  hegel::test(body,
+              hegel::TestLocation{
+                  boost::unit_test::framework::current_test_case().p_name.get(),
+                  location.file_name(), static_cast<int>(location.line())},
+              settings);
+}
+
 // a property is violated by throwing, so that Hegel can shrink the input
 inline void require(bool condition, const std::string &message) {
   if (!condition) {

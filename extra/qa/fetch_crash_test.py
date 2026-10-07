@@ -45,6 +45,11 @@ a lost response, a stall or a cut-off response body): 'fetch' must exit
 with 0 or 1 in time, the checks above must hold, and once the fault is
 cleared, a complete 'fetch' must still produce exact copies.
 
+With '--fsfault-lib' (the fsfault LD_PRELOAD library, file storage only), a
+step runs 'fetch' while chosen file system calls in the storage directory
+fail (open for writing, write, fsync, rename or truncate, with ENOSPC or
+EIO), with the same checks.
+
 Requirements: Python 3.10+, Hypothesis (found through PYTHONPATH or
 installed), a MySQL 8.0 / 8.4 binary distribution and a 'binlog_server'
 binary. Example:
@@ -326,6 +331,10 @@ class BinlogServer:
         self.log_path = workdir / "binsrv.log"
         self.checkpoint_size = None
         self.checkpoint_interval = None
+        # connection settings (the network fault tests shorten them)
+        self.connect_timeout = 20
+        self.read_timeout = 60
+        self.idle_time = 1
 
     def reset(self):
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -352,10 +361,12 @@ class BinlogServer:
             "connection": {
                 "host": "127.0.0.1", "port": self.port,
                 "user": REPLICATION_USER, "password": REPLICATION_PASSWORD,
-                "connect_timeout": 20, "read_timeout": 60,
+                "connect_timeout": self.connect_timeout,
+                "read_timeout": self.read_timeout,
                 "write_timeout": 60},
             "replication": {
-                "server_id": 4242, "idle_time": 1, "verify_checksum": True,
+                "server_id": 4242, "idle_time": self.idle_time,
+                "verify_checksum": True,
                 "mode": "gtid" if self.gtid_mode else "position"},
             "replication_source": {
                 "port": 0xFFFF, "read_timeout": 60, "write_timeout": 60,
@@ -366,11 +377,13 @@ class BinlogServer:
         }
         self.config_path.write_text(json.dumps(config, indent=2))
 
-    def start_fetch(self) -> subprocess.Popen:
+    def start_fetch(self, extra_environment: "dict | None" = None
+                    ) -> subprocess.Popen:
         self.write_config()
         # outside EC2 the AWS SDK would otherwise spend seconds on instance
         # metadata lookups every time the S3 storage is created
-        environment = dict(os.environ, AWS_EC2_METADATA_DISABLED="true")
+        environment = dict(os.environ, AWS_EC2_METADATA_DISABLED="true",
+                           **(extra_environment or {}))
         return subprocess.Popen(
             [str(self.binary), "fetch", str(self.config_path)],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -407,6 +420,53 @@ SERVER: MySQLServer = None
 BINSRV: BinlogServer = None
 FAULTS: "FaultProxy | None" = None
 FAULT_LOG: "Path | None" = None
+FSFAULT_LIB: "Path | None" = None
+
+# file system faults: the storage files they target, as fsfault match /
+# exclude substrings
+DISK_TARGETS = {
+    "binlog data": ("binlog.0", ".json"),
+    "binlog metadata": (".json", "metadata.json"),
+    "binlog index": ("binlog.index", ""),
+    "storage metadata": ("metadata.json", ""),
+}
+disk_fault_rules = st.fixed_dictionaries({
+    "op": st.sampled_from(["open", "write", "fsync", "rename", "truncate"]),
+    "target": st.sampled_from(sorted(DISK_TARGETS)),
+    "nth": st.one_of(st.integers(1, 3), st.integers(1, 8)),
+    "count": st.sampled_from([1, 2, 1000]),
+    "errno": st.sampled_from(["ENOSPC", "EIO"]),
+})
+
+
+def fsfault_rule(fault: dict) -> str:
+    match, exclude = DISK_TARGETS[fault["target"]]
+    rule = (f"op={fault['op']},match={match},nth={fault['nth']},"
+            f"count={fault['count']},errno={fault['errno']}")
+    return rule + (f",exclude={exclude}" if exclude else "")
+
+
+def fetch_with_disk_fault_once(fault: dict, log: Path) -> tuple:
+    """Runs fetch with one file system fault; returns (exit code, how many
+    failures were injected)."""
+    before = len(log.read_text().splitlines()) if log.exists() else 0
+    process = BINSRV.start_fetch({
+        "LD_PRELOAD": str(FSFAULT_LIB), "FSFAULT_ROOT": str(BINSRV.storage),
+        "FSFAULT_RULES": fsfault_rule(fault), "FSFAULT_LOG": str(log)})
+    try:
+        _, stderr = process.communicate(timeout=FETCH_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise Failure(f"fetch did not finish in {FETCH_TIMEOUT_SECONDS} s "
+                      f"with disk fault {fault}\n{BINSRV.log_tail()}")
+    after = len(log.read_text().splitlines()) if log.exists() else 0
+    if process.returncode not in (0, 1):
+        raise Failure(f"fetch exited with {process.returncode} with disk "
+                      f"fault {fault} ({after - before} failure(s) "
+                      f"injected)\n{stderr.decode(errors='replace')[-2000:]}"
+                      f"\n{BINSRV.log_tail()}")
+    return process.returncode, after - before
 
 fault_rules = st.fixed_dictionaries({
     "action": st.sampled_from(["error500", "error503", "reset_before",
@@ -529,6 +589,20 @@ class FetchCrashMachine(RuleBasedStateMachine):
                           f"{stderr.decode(errors='replace')[-2000:]}\n"
                           f"{BINSRV.log_tail()}")
 
+    @precondition(lambda self: FSFAULT_LIB is not None)
+    @rule(fault=disk_fault_rules, transaction_list=transactions)
+    def fetch_with_disk_fault(self, fault, transaction_list):
+        self.note(f"fetch with disk fault {fault} after workload "
+                  f"{transaction_list}")
+        for statement in workload_sql(transaction_list):
+            SERVER.sql(statement)
+        exit_code, injected = fetch_with_disk_fault_once(
+            fault, BINSRV.workdir / "fsfault.log")
+        if FAULT_LOG is not None:
+            with FAULT_LOG.open("a") as log:
+                log.write(json.dumps({"fault": fault, "applied": injected,
+                                      "exit": exit_code}) + "\n")
+
     @rule(kill_after_bytes=st.integers(0, 400_000),
           transaction_list=transactions)
     def fetch_and_kill(self, kill_after_bytes, transaction_list):
@@ -627,7 +701,7 @@ class FetchCrashMachine(RuleBasedStateMachine):
 
 
 def main():
-    global SERVER, BINSRV, FAULTS, FAULT_LOG
+    global SERVER, BINSRV, FAULTS, FAULT_LOG, FSFAULT_LIB
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--mysql-basedir", type=Path, required=True)
     parser.add_argument("--binsrv", type=Path, required=True)
@@ -648,9 +722,17 @@ def main():
     parser.add_argument("--s3-fault-control",
                         help="control URL of s3_fault_proxy.py, enables the "
                              "fault step")
+    parser.add_argument("--fsfault-lib", type=Path,
+                        help="the fsfault LD_PRELOAD library, enables the "
+                             "disk fault step (file storage only)")
     args = parser.parse_args()
 
     gtid_mode = args.mode == "gtid"
+    if args.fsfault_lib is not None:
+        if args.storage != "file":
+            parser.error("--fsfault-lib needs --storage file")
+        FSFAULT_LIB = args.fsfault_lib.expanduser().resolve()
+        FAULT_LOG = args.workdir / "fault_outcomes.jsonl"
     args.workdir.mkdir(parents=True, exist_ok=True)
     SERVER = MySQLServer(args.mysql_basedir.expanduser(),
                          args.workdir / "mysql", args.port, gtid_mode)

@@ -414,8 +414,10 @@ fault_rules = st.fixed_dictionaries({
     "method": st.sampled_from(["*", "PUT", "GET", "DELETE"]),
     "match": st.sampled_from(["", "binlog.index", ".json", "binlog.0",
                               "metadata.json"]),
-    "nth": st.integers(1, 12),
-    "count": st.integers(1, 3),
+    # a fetch makes only a few requests of each kind, so mostly the first
+    # ones; up to 6 consecutive requests outlasts the SDK's retries
+    "nth": st.one_of(st.integers(1, 3), st.integers(1, 8)),
+    "count": st.one_of(st.integers(1, 2), st.integers(3, 6)),
     "seconds": st.sampled_from([1, 3, 8]),
 })
 

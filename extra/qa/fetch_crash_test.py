@@ -35,6 +35,16 @@ server's binlog file with the same name, ending at a transaction boundary,
 and listed in 'binlog.index' in order. After a 'fetch' that ran to the end,
 the storage must hold exactly the server's binlog files, byte for byte.
 
+With '--storage s3', the storage is a prefix in a bucket of an S3-compatible
+server whose objects are files under '--s3-bucket-dir' (as with the POSIX
+backend of Versity S3 Gateway), which is where the checks read them. With
+'--s3-fault-control' (the control URL of s3_fault_proxy.py, placed between
+binlog_server and the S3 server), a further step runs 'fetch' while the proxy
+injects a fault into chosen S3 requests (an error response, a lost request,
+a lost response, a stall or a cut-off response body): 'fetch' must exit
+with 0 or 1 in time, the checks above must hold, and once the fault is
+cleared, a complete 'fetch' must still produce exact copies.
+
 Requirements: Python 3.10+, Hypothesis (found through PYTHONPATH or
 installed), a MySQL 8.0 / 8.4 binary distribution and a 'binlog_server'
 binary. Example:
@@ -55,6 +65,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 import zlib
 from pathlib import Path
 
@@ -62,7 +74,8 @@ from hypothesis import HealthCheck, Phase, settings
 from hypothesis.database import DirectoryBasedExampleDatabase
 from hypothesis import strategies as st
 from hypothesis.stateful import (RuleBasedStateMachine, initialize,
-                                 invariant, rule, run_state_machine_as_test)
+                                 invariant, precondition, rule,
+                                 run_state_machine_as_test)
 
 REPLICATION_USER = "rpl"
 # an empty password: full caching_sha2_password authentication needs a
@@ -261,28 +274,75 @@ def transaction_boundaries(data: bytes) -> set:
 # binlog_server
 # ---------------------------------------------------------------------------
 
+class S3Storage:
+    """A prefix in a bucket of an S3-compatible server whose objects are
+    files under 'bucket_dir'."""
+
+    def __init__(self, endpoint: str, bucket: str, bucket_dir: Path,
+                 access_key: str, secret_key: str, prefix: str):
+        self.endpoint = endpoint
+        self.bucket = bucket
+        self.bucket_dir = bucket_dir
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.prefix = prefix
+
+    def uri(self) -> str:
+        quote = lambda text: urllib.parse.quote(text, safe="")
+        return (f"http://{quote(self.access_key)}:{quote(self.secret_key)}@"
+                f"{self.endpoint}/{self.bucket}/{self.prefix}")
+
+
+class FaultProxy:
+    """The control interface of s3_fault_proxy.py."""
+
+    def __init__(self, control_url: str):
+        self.control_url = control_url
+
+    def set_rules(self, rules: list) -> None:
+        request = urllib.request.Request(
+            self.control_url, data=json.dumps({"rules": rules}).encode(),
+            method="PUT")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+
+    def stats(self) -> dict:
+        with urllib.request.urlopen(self.control_url, timeout=10) as response:
+            return json.loads(response.read())
+
+
 class BinlogServer:
     def __init__(self, binary: Path, workdir: Path, port: int,
-                 gtid_mode: bool):
+                 gtid_mode: bool, s3: "S3Storage | None" = None):
         self.binary = binary
         self.workdir = workdir
         self.port = port
         self.gtid_mode = gtid_mode
-        self.storage = workdir / "storage"
+        self.s3 = s3
+        # where the storage objects can be read as files
+        self.storage = (s3.bucket_dir / s3.prefix if s3 is not None else
+                        workdir / "storage")
         self.config_path = workdir / "binsrv.json"
         self.log_path = workdir / "binsrv.log"
         self.checkpoint_size = None
         self.checkpoint_interval = None
 
     def reset(self):
+        self.workdir.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(self.storage, ignore_errors=True)
         self.storage.mkdir(parents=True)
+        if self.s3 is not None:
+            shutil.rmtree(self.workdir / "s3-buffer", ignore_errors=True)
         self.log_path.unlink(missing_ok=True)
         self.checkpoint_size = None
         self.checkpoint_interval = None
 
     def write_config(self):
-        storage = {"backend": "file", "uri": f"file://{self.storage}"}
+        if self.s3 is not None:
+            storage = {"backend": "s3", "uri": self.s3.uri(),
+                       "fs_buffer_directory": str(self.workdir / "s3-buffer")}
+        else:
+            storage = {"backend": "file", "uri": f"file://{self.storage}"}
         if self.checkpoint_size is not None:
             storage["checkpoint_size"] = self.checkpoint_size
         if self.checkpoint_interval is not None:
@@ -308,9 +368,13 @@ class BinlogServer:
 
     def start_fetch(self) -> subprocess.Popen:
         self.write_config()
+        # outside EC2 the AWS SDK would otherwise spend seconds on instance
+        # metadata lookups every time the S3 storage is created
+        environment = dict(os.environ, AWS_EC2_METADATA_DISABLED="true")
         return subprocess.Popen(
             [str(self.binary), "fetch", str(self.config_path)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            env=environment)
 
     def stored_data_size(self) -> int:
         total = 0
@@ -341,6 +405,19 @@ class BinlogServer:
 # set up once per run by main()
 SERVER: MySQLServer = None
 BINSRV: BinlogServer = None
+FAULTS: "FaultProxy | None" = None
+FAULT_LOG: "Path | None" = None
+
+fault_rules = st.fixed_dictionaries({
+    "action": st.sampled_from(["error500", "error503", "reset_before",
+                               "reset_after", "stall", "truncate_body"]),
+    "method": st.sampled_from(["*", "PUT", "GET", "DELETE"]),
+    "match": st.sampled_from(["", "binlog.index", ".json", "binlog.0",
+                              "metadata.json"]),
+    "nth": st.integers(1, 12),
+    "count": st.integers(1, 3),
+    "seconds": st.sampled_from([1, 3, 8]),
+})
 
 transactions = st.lists(
     st.fixed_dictionaries({
@@ -417,6 +494,38 @@ class FetchCrashMachine(RuleBasedStateMachine):
                           f"{stderr.decode(errors='replace')[-2000:]}\n"
                           f"{BINSRV.log_tail()}")
         self.check_complete_copy()
+
+    @precondition(lambda self: FAULTS is not None)
+    @rule(fault=fault_rules, transaction_list=transactions)
+    def fetch_with_fault(self, fault, transaction_list):
+        self.note(f"fetch with fault {fault} after workload "
+                  f"{transaction_list}")
+        for statement in workload_sql(transaction_list):
+            SERVER.sql(statement)
+        FAULTS.set_rules([fault])
+        try:
+            process = BINSRV.start_fetch()
+            try:
+                _, stderr = process.communicate(
+                    timeout=FETCH_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                raise Failure(f"fetch did not finish in "
+                              f"{FETCH_TIMEOUT_SECONDS} s with fault "
+                              f"{fault}\n{BINSRV.log_tail()}")
+            applied = FAULTS.stats()["rules"][0]["applied"]
+        finally:
+            FAULTS.set_rules([])
+        if FAULT_LOG is not None:
+            with FAULT_LOG.open("a") as log:
+                log.write(json.dumps({"fault": fault, "applied": applied,
+                                      "exit": process.returncode}) + "\n")
+        if process.returncode not in (0, 1):
+            raise Failure(f"fetch exited with {process.returncode} with "
+                          f"fault {fault} (applied {applied} time(s))\n"
+                          f"{stderr.decode(errors='replace')[-2000:]}\n"
+                          f"{BINSRV.log_tail()}")
 
     @rule(kill_after_bytes=st.integers(0, 400_000),
           transaction_list=transactions)
@@ -516,7 +625,7 @@ class FetchCrashMachine(RuleBasedStateMachine):
 
 
 def main():
-    global SERVER, BINSRV
+    global SERVER, BINSRV, FAULTS, FAULT_LOG
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--mysql-basedir", type=Path, required=True)
     parser.add_argument("--binsrv", type=Path, required=True)
@@ -526,14 +635,37 @@ def main():
     parser.add_argument("--port", type=int, default=23306)
     parser.add_argument("--examples", type=int, default=20)
     parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument("--storage", choices=["file", "s3"], default="file")
+    parser.add_argument("--s3-endpoint", default="127.0.0.1:9000",
+                        help="host:port binlog_server connects to")
+    parser.add_argument("--s3-bucket", default="pbs-mtr")
+    parser.add_argument("--s3-bucket-dir", type=Path,
+                        help="the directory holding the bucket's objects")
+    parser.add_argument("--s3-access-key", default="pbsaccesskey")
+    parser.add_argument("--s3-secret-key", default="pbs/secret+key=1")
+    parser.add_argument("--s3-fault-control",
+                        help="control URL of s3_fault_proxy.py, enables the "
+                             "fault step")
     args = parser.parse_args()
 
     gtid_mode = args.mode == "gtid"
     args.workdir.mkdir(parents=True, exist_ok=True)
     SERVER = MySQLServer(args.mysql_basedir.expanduser(),
                          args.workdir / "mysql", args.port, gtid_mode)
+    s3 = None
+    if args.storage == "s3":
+        if args.s3_bucket_dir is None:
+            parser.error("--storage s3 needs --s3-bucket-dir")
+        s3 = S3Storage(args.s3_endpoint, args.s3_bucket,
+                       args.s3_bucket_dir.expanduser(), args.s3_access_key,
+                       args.s3_secret_key,
+                       f"crash-test-{args.mode}-{os.getpid()}")
+        if args.s3_fault_control:
+            FAULTS = FaultProxy(args.s3_fault_control)
+            FAULTS.set_rules([])
+            FAULT_LOG = args.workdir / "fault_outcomes.jsonl"
     BINSRV = BinlogServer(args.binsrv.expanduser(), args.workdir / "binsrv",
-                          args.port, gtid_mode)
+                          args.port, gtid_mode, s3)
     SERVER.start()
     try:
         test_settings = settings(
@@ -545,7 +677,8 @@ def main():
             phases=[Phase.explicit, Phase.reuse, Phase.generate,
                     Phase.shrink])
         run_state_machine_as_test(FetchCrashMachine, settings=test_settings)
-        print(f"OK: {args.examples} examples in {args.mode} mode")
+        print(f"OK: {args.examples} examples in {args.mode} mode, "
+              f"{args.storage} storage")
         return 0
     finally:
         SERVER.stop()

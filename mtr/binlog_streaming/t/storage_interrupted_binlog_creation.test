@@ -1,0 +1,97 @@
+#
+# Checks that the Binlog Server utility can continue after it was killed while
+# creating a new binlog file in its storage.
+#
+# A new binlog is created in three steps: the binlog file itself (holding the
+# binlog magic), its metadata file, then the updated binlog index. A process
+# killed between the first and the last step leaves a binlog file that the
+# binlog index does not list. The next start must recover from that (e.g. by
+# removing the left-over files, as it does for temporary objects) instead of
+# refusing to open the storage.
+#
+# The test reproduces that state directly: after a complete 'fetch', it adds
+# the binlog file of the next binlog, holding only the binlog magic.
+#
+
+--source ../include/have_binsrv.inc
+
+--source ../include/v80_v84_compatibility_defines.inc
+
+# in case of --repeat=N, we need to start from a fresh binary log to make
+# this test deterministic
+--echo *** Resetting replication at the very beginning of the test.
+--disable_query_log
+eval $stmt_reset_binary_logs_and_gtids;
+--enable_query_log
+
+--echo
+--echo *** Determining the first binary log name.
+--let $first_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+
+# identifying backend storage type ('file' or 's3')
+--source ../include/identify_storage_backend.inc
+
+# creating data directory, configuration file, etc.
+--let $binsrv_connect_timeout = 20
+--let $binsrv_read_timeout = 60
+--let $binsrv_idle_time = 10
+--let $binsrv_verify_checksum = TRUE
+--let $binsrv_replication_mode = `SELECT IF(@@global.gtid_mode = 'ON', 'gtid', 'position')`
+--source ../include/set_up_binsrv_environment.inc
+
+--echo
+--echo *** Creating a simple table and filling it with some data.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(DEFAULT);
+
+--echo
+--echo *** Executing the Binlog Server utility and fetching all events.
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null
+
+--echo
+--echo *** Flushing the first binary log and switching to the second one.
+FLUSH BINARY LOGS;
+--let $second_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+INSERT INTO t1 VALUES(DEFAULT);
+
+--echo
+--echo *** Leaving the second binary log in the storage as an interrupted
+--echo *** creation does: the binlog magic only, not in the binlog index.
+--let $interrupted_binlog = $MYSQL_TMP_DIR/interrupted_binlog
+--perl
+  use strict;
+  use warnings;
+  my $file = $ENV{'MYSQL_TMP_DIR'} . '/interrupted_binlog';
+  open(my $fh, '>:raw', $file) or die "cannot create '$file': $!";
+  print $fh "\xfebin" or die "cannot write to '$file': $!";
+  close($fh) or die "cannot close '$file': $!";
+EOF
+if ($storage_backend == file)
+{
+  --copy_file $interrupted_binlog $binsrv_storage_path/$second_binlog
+}
+if ($storage_backend == s3)
+{
+  --exec $aws_cli s3 cp $interrupted_binlog s3://$aws_s3_bucket$binsrv_storage_path/$second_binlog > /dev/null
+}
+--remove_file $interrupted_binlog
+
+--echo
+--echo *** Executing the Binlog Server utility again. It must open the storage
+--echo *** and fetch the remaining events.
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null
+
+--echo
+--echo *** Comparing the stored copy of the first binary log with the
+--echo *** server's one.
+if ($storage_backend == file)
+{
+  --diff_files $binlog_base_dir$first_binlog $binsrv_storage_path/$first_binlog
+}
+
+--echo
+--echo *** Dropping the table.
+DROP TABLE t1;
+
+# cleaning up
+--source ../include/tear_down_binsrv_environment.inc

@@ -23,7 +23,12 @@ signatures stay valid). Fault rules are set and read through a control path
 on the same port, which S3 never uses (bucket names cannot contain '_'):
 
   PUT /__faults__   body: {"rules": [<rule>, ...]}   replaces the rules
-  GET /__faults__   returns the rules and per-rule statistics
+                    (and with "reset_traffic": true, zeroes the counters)
+  GET /__faults__   returns the rules, per-rule statistics and traffic
+                    counters: requests and request / response body bytes
+                    per method, and the body bytes of PUT requests for
+                    binlog files (object names containing "binlog.0" and
+                    not ending with ".json")
 
 A rule applies to requests whose method matches "method" (or any method for
 "*") and whose path contains "match" (empty matches every path). It skips
@@ -68,6 +73,27 @@ class FaultRules:
         self.lock = threading.Lock()
         self.rules = []
         self.requests = 0
+        self.traffic = {}
+
+    def count(self, method, path, request_bytes, response_bytes):
+        with self.lock:
+            entry = self.traffic.setdefault(
+                method, {"requests": 0, "request_bytes": 0,
+                         "response_bytes": 0})
+            entry["requests"] += 1
+            entry["request_bytes"] += request_bytes
+            entry["response_bytes"] += response_bytes
+            object_name = path.split("?")[0].rsplit("/", 1)[-1]
+            if method == "PUT" and "binlog.0" in object_name and \
+                    not object_name.endswith(".json"):
+                binlog = self.traffic.setdefault(
+                    "binlog_puts", {"requests": 0, "request_bytes": 0})
+                binlog["requests"] += 1
+                binlog["request_bytes"] += request_bytes
+
+    def reset_traffic(self):
+        with self.lock:
+            self.traffic = {}
 
     def replace(self, rules):
         for rule in rules:
@@ -78,7 +104,8 @@ class FaultRules:
 
     def snapshot(self):
         with self.lock:
-            return {"requests": self.requests, "rules": list(self.rules)}
+            return {"requests": self.requests, "rules": list(self.rules),
+                    "traffic": dict(self.traffic)}
 
     def action_for(self, method, path):
         """The rule to apply to this request, if any."""
@@ -142,7 +169,10 @@ def make_handler(backend_host, backend_port, rules):
         def _control(self, body):
             if self.command == "PUT":
                 try:
-                    rules.replace(json.loads(body or b"{}").get("rules", []))
+                    request = json.loads(body or b"{}")
+                    rules.replace(request.get("rules", []))
+                    if request.get("reset_traffic"):
+                        rules.reset_traffic()
                 except (ValueError, AttributeError) as error:
                     self._send(400, str(error).encode(), "text/plain")
                     return
@@ -210,6 +240,7 @@ def make_handler(backend_host, backend_port, rules):
             except OSError as error:
                 self._send(502, str(error).encode(), "text/plain")
                 return
+            rules.count(self.command, self.path, len(body), len(data))
             if action == "reset_after":
                 self._reset()
                 return

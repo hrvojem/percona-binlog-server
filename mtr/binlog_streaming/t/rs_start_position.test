@@ -1,0 +1,144 @@
+#
+# Checks that the Binlog Server replication source ('pull' mode) starts
+# streaming at the binlog file and position a client asks for in
+# COM_BINLOG_DUMP, as a MySQL source does, instead of always streaming from
+# the first stored binlog.
+#
+# The first batch of rows is written before the position (and the file) that
+# the client asks for, the second batch after it: the dump must contain only
+# the second batch.
+#
+
+--source ../include/have_binsrv.inc
+
+--source ../include/v80_v84_compatibility_defines.inc
+
+--source include/count_sessions.inc
+
+# in case of --repeat=N, we need to start from a fresh binary log to make
+# this test deterministic
+--disable_query_log
+eval $stmt_reset_binary_logs_and_gtids;
+--enable_query_log
+
+# identifying backend storage type ('file' or 's3')
+--source ../include/identify_storage_backend.inc
+
+# creating data directory, configuration file, etc.
+--let $binsrv_connect_timeout = 3
+--let $binsrv_read_timeout = 3
+--let $binsrv_idle_time = 1
+--let $binsrv_verify_checksum = TRUE
+--let $binsrv_replication_mode = position
+--source ../include/set_up_binsrv_environment.inc
+
+--echo
+--echo *** Determining the first binary log name.
+--let $first_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+
+--echo
+--echo *** Creating source_db.tbl and inserting the first batch of rows.
+CREATE DATABASE source_db;
+CREATE TABLE source_db.tbl(
+  id INT UNSIGNED NOT NULL,
+  value VARCHAR(32) NOT NULL,
+  PRIMARY KEY(id)
+) ENGINE=InnoDB;
+INSERT INTO source_db.tbl VALUES (1, 'first_batch_one'), (2, 'first_batch_two');
+
+--echo
+--echo *** Remembering the position after the first batch.
+--let $position_after_first_batch = query_get_value($stmt_show_binary_log_status, Position, 1)
+
+--echo
+--echo *** Inserting the second batch of rows in the same binary log.
+INSERT INTO source_db.tbl VALUES (3, 'second_batch_three');
+
+--echo
+--echo *** Flushing the source binary log and inserting the third batch.
+FLUSH BINARY LOGS;
+--let $second_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+INSERT INTO source_db.tbl VALUES (4, 'third_batch_four');
+
+--echo
+--echo *** Fetching the source binary logs.
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null
+
+--echo
+--echo *** Starting Binlog Server Utility in background in pull mode.
+--let $proc_command_line = $BINSRV pull $binsrv_config_file_path > /dev/null
+--source ../include/start_proc_in_background.inc
+
+--echo
+--echo *** Waiting for the replication source listener port ready to accept
+--echo *** connections.
+--let $listening_port = $binsrv_replication_source_port
+--source ../include/wait_for_listening_port.inc
+
+--echo
+--echo *** Dumping from the second binary log, and from the first one at the
+--echo *** position after the first batch.
+--let $dump_from_second_binlog = $MYSQL_TMP_DIR/rs_start_position_file.txt
+--exec $MYSQL_BINLOG --read-from-remote-server --to-last-log --host=127.0.0.1 --port=$binsrv_replication_source_port --user=rpl --password=password --default-auth=caching_sha2_password --base64-output=decode-rows --verbose $second_binlog > $dump_from_second_binlog 2>/dev/null
+--let $dump_from_position = $MYSQL_TMP_DIR/rs_start_position_position.txt
+--exec $MYSQL_BINLOG --read-from-remote-server --to-last-log --host=127.0.0.1 --port=$binsrv_replication_source_port --user=rpl --password=password --default-auth=caching_sha2_password --base64-output=decode-rows --verbose --start-position=$position_after_first_batch $first_binlog > $dump_from_position 2>/dev/null
+
+--echo
+--echo *** Sending SIGTERM signal to the Binlog Server Utility and waiting for
+--echo *** the process to terminate
+--source ../include/terminate_proc.inc
+
+--echo
+--echo *** Counting the rows of each batch in the two dumps.
+--let $counts_file = $MYSQL_TMP_DIR/rs_start_position_counts.inc
+--let RS_DUMP_FROM_FILE = $dump_from_second_binlog
+--let RS_DUMP_FROM_POSITION = $dump_from_position
+--let RS_COUNTS_FILE = $counts_file
+--perl
+  use strict;
+  use warnings;
+  my %counts;
+  for my $dump ('RS_DUMP_FROM_FILE', 'RS_DUMP_FROM_POSITION') {
+    open(my $fh, '<', $ENV{$dump}) or die "cannot open $ENV{$dump}: $!";
+    local $/;
+    my $text = <$fh>;
+    close($fh);
+    for my $batch ('first', 'second', 'third') {
+      my $count = () = $text =~ /'${batch}_batch_/g;
+      $counts{"${dump}_${batch}"} = $count;
+    }
+  }
+  open(my $out, '>', $ENV{'RS_COUNTS_FILE'}) or die "cannot write: $!";
+  for my $key (sort keys %counts) {
+    my $name = lc($key);
+    print $out "--let \$$name = $counts{$key}\n";
+  }
+  close($out);
+EOF
+--source $counts_file
+
+--echo
+--echo *** The dump from the second binary log has only the third batch.
+--assert($rs_dump_from_file_first == 0)
+--assert($rs_dump_from_file_second == 0)
+--assert($rs_dump_from_file_third > 0)
+
+--echo
+--echo *** The dump from the position has the second and the third batch.
+--assert($rs_dump_from_position_first == 0)
+--assert($rs_dump_from_position_second > 0)
+--assert($rs_dump_from_position_third > 0)
+
+--remove_file $counts_file
+--remove_file $dump_from_second_binlog
+--remove_file $dump_from_position
+
+--echo
+--echo *** Dropping the database.
+DROP DATABASE source_db;
+
+# cleaning up
+--source ../include/tear_down_binsrv_environment.inc
+
+--source ../include/kill_binlog_dump_connection.inc
+--source include/wait_until_count_sessions.inc

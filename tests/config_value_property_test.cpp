@@ -31,6 +31,12 @@
 // - the filesystem storage backend accepts exactly "file://<path>" URIs of
 //   existing directories, and object URIs point inside that directory;
 // - storage_config::get_masked_uri() hides credentials and keeps the rest;
+// - the S3 storage backend accepts exactly the valid "http[s]://" endpoint
+//   URIs and "s3://<bucket>.<region>" URIs, and uses the endpoint or region,
+//   bucket, path and credentials they name; credentials written with any
+//   valid percent-encoding authenticate against an S3-compatible server
+//   (when one is given through PBS_TEST_S3_ENDPOINT, PBS_TEST_S3_ACCESS_KEY,
+//   PBS_TEST_S3_SECRET_KEY and PBS_TEST_S3_BUCKET);
 // - a keyring file is accepted exactly when it has the supported version,
 //   unique key IDs, supported ciphers and keys of the right length, and then
 //   holds exactly the keys written to it;
@@ -43,6 +49,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <ctime>
 #include <exception>
 #include <filesystem>
@@ -85,6 +92,7 @@
 #include "binsrv/keyring_record_collection.hpp"
 #include "binsrv/log_severity.hpp"
 #include "binsrv/main_config.hpp"
+#include "binsrv/s3_storage_backend.hpp"
 #include "binsrv/size_unit.hpp"
 #include "binsrv/storage_backend_type.hpp"
 #include "binsrv/storage_config.hpp"
@@ -911,6 +919,225 @@ json_at(const boost::json::object &root, std::string_view section,
   return field_value == nullptr ? null_value : *field_value;
 }
 
+
+// ---------------------------------------------------------------------------
+// S3 storage URIs
+// ---------------------------------------------------------------------------
+
+struct s3_uri_spec {
+  std::string uri;
+  bool valid;
+  // for valid URIs: what the backend must report
+  bool endpoint_form;
+  std::string endpoint; // "<scheme>://<host>[:<port>]" or the region
+  std::string bucket;
+  std::string root_path;
+  bool credentials;
+  std::string description; // why it is invalid, for messages
+};
+
+// path segments without '/' (an encoded '/' is a separator once decoded),
+// "." or ".."; '%', spaces and other characters that need encoding are kept
+[[nodiscard]] gs::Generator<std::string> s3_path_segments() {
+  return gs::one_of({gs::from_regex("[A-Za-z0-9_~-]{1,8}", true),
+                     gs::from_regex("[A-Za-z0-9 %!$&'()*+,;=:@._~-]{1,8}",
+                                    true),
+                     text_of_size(1U, 6U)})
+      .filter([](const std::string &segment) {
+        return segment.find('/') == std::string::npos && segment != "." &&
+               segment != "..";
+      });
+}
+
+// a valid S3 storage URI (endpoint or region form) with at most one defect
+[[nodiscard]] gs::Generator<s3_uri_spec> s3_uri_specs() {
+  return gs::compose([](const hegel::TestCase &tc) {
+    static const std::vector<std::string> defects{
+        "scheme",        "user_only",     "query",
+        "fragment",      "no_bucket",     "region_empty",
+        "bucket_empty",  "region_dotted", "s3_port",
+        "s3_no_host"};
+    std::string defect;
+    if (!tc.draw(gs::booleans())) {
+      defect = tc.draw(gs::sampled_from(defects));
+    }
+    const auto is_defect{[&defect](std::string_view name) {
+      return defect == name;
+    }};
+    // the defects that only apply to one form decide the form
+    const bool s3_only{is_defect("region_empty") || is_defect("bucket_empty") ||
+                       is_defect("region_dotted") || is_defect("s3_port") ||
+                       is_defect("s3_no_host")};
+    const bool endpoint_form{!s3_only && tc.draw(gs::booleans())};
+    const bool endpoint_only{is_defect("no_bucket") || is_defect("scheme")};
+
+    s3_uri_spec spec{.uri = {},
+                     .valid = defect.empty(),
+                     .endpoint_form = endpoint_form || endpoint_only,
+                     .endpoint = {},
+                     .bucket = {},
+                     .root_path = {},
+                     .credentials = false,
+                     .description = defect};
+    boost::urls::url uri;
+
+    // user info: none, both parts (any characters, encoded as needed), or a
+    // user without a password
+    const auto userinfo{
+        tc.draw(gs::integers<int>({.min_value = 0, .max_value = 2}))};
+    if (is_defect("user_only")) {
+      uri.set_user(tc.draw(text_of_size(1U, 8U)));
+    } else if (userinfo != 0) {
+      const auto user{tc.draw(text_of_size(0U, 8U))};
+      const auto password{tc.draw(text_of_size(0U, 12U))};
+      uri.set_user(user);
+      uri.set_password(password);
+      spec.credentials = !user.empty() || !password.empty();
+    }
+
+    const auto segments{tc.draw(gs::vectors(
+        s3_path_segments(), {.min_size = 0U, .max_size = 3U}))};
+    if (spec.endpoint_form) {
+      const auto scheme{is_defect("scheme")
+                            ? tc.draw(gs::sampled_from<std::string>(
+                                  {"ftp", "file", "s4", "httpx"}))
+                            : tc.draw(gs::sampled_from<std::string>(
+                                  {"http", "https"}))};
+      uri.set_scheme(scheme);
+      const auto host{tc.draw(gs::one_of(
+          {gs::from_regex("[a-z0-9-]{1,10}(\\.[a-z0-9-]{1,10}){0,2}", true),
+           gs::sampled_from<std::string>({"127.0.0.1", "10.0.0.7"})}))};
+      uri.set_host(host);
+      spec.endpoint = scheme + "://" + host;
+      if (tc.draw(gs::booleans())) {
+        const auto port{tc.draw(gs::integers<std::uint16_t>())};
+        uri.set_port_number(port);
+        spec.endpoint += ':' + std::to_string(port);
+      }
+      // the first segment is the bucket, the rest is the path
+      if (!is_defect("no_bucket")) {
+        spec.bucket = tc.draw(gs::from_regex("[a-z0-9][a-z0-9.-]{2,12}", true));
+        uri.segments().push_back(spec.bucket);
+      }
+      spec.root_path = "/";
+      if (is_defect("no_bucket")) {
+        // an empty path, or just "/"
+        uri.set_path(tc.draw(gs::booleans()) ? "" : "/");
+      } else {
+        for (const auto &segment : segments) {
+          uri.segments().push_back(segment);
+          if (spec.root_path != "/") {
+            spec.root_path += '/';
+          }
+          spec.root_path += segment;
+        }
+      }
+    } else {
+      uri.set_scheme("s3");
+      spec.bucket = tc.draw(gs::from_regex("[a-z0-9-]{1,12}", true));
+      auto region{tc.draw(gs::sampled_from<std::string>(
+          {"us-east-1", "eu-west-1", "ap-southeast-2", "xx-test-9"}))};
+      std::string host{spec.bucket + '.' + region};
+      if (is_defect("region_empty")) {
+        host = spec.bucket + '.';
+      } else if (is_defect("bucket_empty")) {
+        host = '.' + region;
+      } else if (is_defect("region_dotted")) {
+        host = spec.bucket + '.' + region + ".amazonaws.com";
+      }
+      // a host without a region would make the backend ask AWS for the
+      // bucket's region, so it is never generated
+      if (!is_defect("s3_no_host")) {
+        uri.set_host(host);
+      } else {
+        uri.set_encoded_authority("");
+      }
+      if (is_defect("s3_port")) {
+        uri.set_port_number(9000U);
+      }
+      spec.endpoint = region;
+      for (const auto &segment : segments) {
+        uri.segments().push_back(segment);
+        spec.root_path += '/';
+        spec.root_path += segment;
+      }
+    }
+    if (is_defect("query")) {
+      uri.set_query("versionId=1");
+    }
+    if (is_defect("fragment")) {
+      uri.set_fragment("x");
+    }
+    spec.uri = uri.c_str();
+    return spec;
+  });
+}
+
+[[nodiscard]] binsrv::storage_config
+make_s3_storage_config(std::string uri,
+                       const std::filesystem::path &buffer_directory) {
+  binsrv::storage_config config{};
+  config.get<"backend">() = binsrv::storage_backend_type::s3;
+  config.get<"uri">() = std::move(uri);
+  config.get<"fs_buffer_directory">() = buffer_directory.string();
+  return config;
+}
+
+struct s3_test_server {
+  std::string endpoint;
+  std::string access_key;
+  std::string secret_key;
+  std::string bucket;
+};
+
+[[nodiscard]] std::optional<s3_test_server> s3_test_server_from_environment() {
+  const auto get{[](const char *name) {
+    const char *value{std::getenv(name)}; // NOLINT(concurrency-mt-unsafe)
+    return value == nullptr ? std::string{} : std::string{value};
+  }};
+  s3_test_server result{.endpoint = get("PBS_TEST_S3_ENDPOINT"),
+                        .access_key = get("PBS_TEST_S3_ACCESS_KEY"),
+                        .secret_key = get("PBS_TEST_S3_SECRET_KEY"),
+                        .bucket = get("PBS_TEST_S3_BUCKET")};
+  if (result.endpoint.empty() || result.access_key.empty() ||
+      result.secret_key.empty() || result.bucket.empty()) {
+    return std::nullopt;
+  }
+  return result;
+}
+
+// one of the valid percent-encodings of a user info part: characters that
+// must be encoded always are, others sometimes, with either hex case
+[[nodiscard]] std::string encode_userinfo_part(const hegel::TestCase &tc,
+                                               std::string_view text,
+                                               bool password) {
+  static constexpr std::string_view upper{"0123456789ABCDEF"};
+  static constexpr std::string_view lower{"0123456789abcdef"};
+  std::string result;
+  for (const char character : text) {
+    const auto byte{static_cast<unsigned char>(character)};
+    const bool unreserved{(byte >= 'A' && byte <= 'Z') ||
+                          (byte >= 'a' && byte <= 'z') ||
+                          (byte >= '0' && byte <= '9') || byte == '-' ||
+                          byte == '.' || byte == '_' || byte == '~'};
+    // sub-delimiters may appear as they are, ':' only in the password
+    const bool sub_delimiter{std::string_view{"!$&'()*+,;="}.find(character) !=
+                             std::string_view::npos};
+    const bool may_stay{unreserved || sub_delimiter ||
+                        (password && character == ':')};
+    if (may_stay && tc.draw(gs::integers<int>(
+                        {.min_value = 0, .max_value = 3})) != 0) {
+      result += character;
+    } else {
+      const auto digits{tc.draw(gs::booleans()) ? upper : lower};
+      result += '%';
+      result += digits[byte >> 4U];
+      result += digits[byte & 0x0FU];
+    }
+  }
+  return result;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -1367,4 +1594,117 @@ BOOST_AUTO_TEST_CASE(ConfigDamagedFileFailsCleanly) {
     [[maybe_unused]] const auto error{
         load_cleanly([&] { const binsrv::main_config config{path.string()}; })};
   });
+}
+
+BOOST_AUTO_TEST_CASE(S3StorageUriMatchesModel) {
+  run_property([](hegel::TestCase &tc) {
+    const auto spec{tc.draw("uri", s3_uri_specs())};
+    const scratch_directory scratch;
+    std::optional<binsrv::s3_storage_backend> backend;
+    std::string error;
+    try {
+      backend.emplace(make_s3_storage_config(spec.uri, scratch.path()));
+    } catch (const std::invalid_argument &e) {
+      error = e.what();
+    }
+    require(backend.has_value() == spec.valid,
+            "'" + spec.uri + "' was " +
+                (spec.valid ? "rejected: " + error
+                            : "accepted, expected a rejection for: " +
+                                  spec.description));
+    if (!backend.has_value()) {
+      return;
+    }
+
+    // "AWS S3 (SDK x.y.z) - <what>": compare <what>
+    const auto description{backend->get_description()};
+    const auto what{description.substr(description.find(") - ") + 4U)};
+    const std::string expected{
+        (spec.endpoint_form ? "endpoint: " : "region: ") + spec.endpoint +
+        ", bucket: " + spec.bucket + ", path: " + spec.root_path +
+        ", credentials: " + (spec.credentials ? "***hidden***" : "none")};
+    require(what == expected, "'" + spec.uri + "' is described as '" + what +
+                                  "', expected '" + expected + "'");
+
+    // object URIs point to the object under the root path of the bucket
+    static constexpr std::string_view object_name{"binlog.000001"};
+    const auto object_uri{backend->get_object_uri(object_name)};
+    const auto parsed{boost::urls::parse_absolute_uri(object_uri)};
+    require(parsed.has_value(), "'" + spec.uri + "' gives the object URI '" +
+                                    object_uri + "', which is not a URI");
+    std::string key{spec.root_path};
+    if (!key.empty() && key.back() != '/') {
+      key += '/';
+    }
+    key += object_name;
+    std::string expected_path{spec.endpoint_form ? "/" + spec.bucket + key
+                                                 : key};
+    std::string actual_path{parsed->path()};
+    if (!expected_path.starts_with('/')) {
+      expected_path.insert(0U, 1U, '/');
+    }
+    if (!actual_path.starts_with('/')) {
+      actual_path.insert(0U, 1U, '/');
+    }
+    require(actual_path == expected_path,
+            "'" + spec.uri + "' gives the object URI '" + object_uri +
+                "', whose path is '" + actual_path + "' instead of '" +
+                expected_path + "'");
+    if (!spec.endpoint_form) {
+      require(parsed->host() == spec.bucket,
+              "'" + spec.uri + "' gives the object URI '" + object_uri +
+                  "' for another bucket");
+    }
+  });
+}
+
+BOOST_AUTO_TEST_CASE(S3StorageCredentialsAreDecoded) {
+  const auto server{s3_test_server_from_environment()};
+  if (!server.has_value()) {
+    BOOST_TEST_MESSAGE("skipped: PBS_TEST_S3_ENDPOINT, PBS_TEST_S3_ACCESS_KEY, "
+                       "PBS_TEST_S3_SECRET_KEY and PBS_TEST_S3_BUCKET are not "
+                       "set");
+    return;
+  }
+  hegel::Settings settings{};
+  // one HTTP request per test case
+  settings.test_cases = 50U;
+  settings.suppress_health_check = {hegel::HealthCheck::TooSlow};
+  run_property(
+      [&server](hegel::TestCase &tc) {
+        const scratch_directory scratch;
+        // the real credentials in some valid encoding, or with one
+        // character of the secret changed
+        const bool wrong_secret{tc.draw("wrong_secret", gs::booleans())};
+        auto secret{server->secret_key};
+        if (wrong_secret) {
+          auto &character{secret[tc.draw(
+              "position",
+              gs::integers<std::size_t>(
+                  {.min_value = 0U, .max_value = std::size(secret) - 1U}))]};
+          character = character == 'x' ? 'y' : 'x';
+        }
+        const auto uri{"http://" +
+                       encode_userinfo_part(tc, server->access_key, false) +
+                       ':' + encode_userinfo_part(tc, secret, true) + '@' +
+                       server->endpoint + '/' + server->bucket +
+                       "/credentials-test"};
+        tc.note("uri: " + uri);
+        binsrv::s3_storage_backend backend{
+            make_s3_storage_config(uri, scratch.path())};
+        bool listed{true};
+        std::string error;
+        try {
+          [[maybe_unused]] const auto objects{backend.list_objects()};
+        } catch (const std::exception &e) {
+          listed = false;
+          error = e.what();
+        }
+        if (wrong_secret) {
+          require(!listed, "'" + uri + "' with a wrong secret was accepted");
+        } else {
+          require(listed, "'" + uri + "' was not accepted: " + error);
+        }
+      },
+      settings);
 }

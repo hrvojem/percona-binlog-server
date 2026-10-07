@@ -19,13 +19,18 @@ INSERT INTO t1 VALUES(DEFAULT);
 *** Flushing the first binary log and switching to the second one.
 FLUSH BINARY LOGS;
 
+*** Flushing the second binary log (no transactions in it) and
+*** switching to the third one.
+FLUSH BINARY LOGS;
+
 *** Filling the table with more data.
 INSERT INTO t1 VALUES(DEFAULT);
 
 *** Executing the Binlog Server utility again to resume streaming.
 
-*** Comparing the stored copy of the first binary log with the
-*** server's one (closed, so it no longer has the "in use" flag).
+*** Comparing the stored copies of the first and the second binary logs
+*** with the server's ones (closed, so they no longer have the "in use"
+*** flag).
 
 *** Dropping the table.
 DROP TABLE t1;

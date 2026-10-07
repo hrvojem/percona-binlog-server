@@ -5,9 +5,12 @@
 # transaction was written to the previous binlog in the meantime.
 #
 # When resuming in GTID mode the server starts sending from the binlog that
-# holds the first missing GTID, which is the new binlog, so the ROTATE event
-# that closes the previous binlog on the server is never received. The stored
-# copy of the previous binlog must still end with it.
+# holds the first missing GTID, which is the newest binlog, so the ROTATE event
+# that closes the previous binlog on the server is never received, and a
+# binlog without transactions between the two (two rotations in a row) is
+# never received at all. The stored copies must still match the server's
+# binlogs: the first one ending with its ROTATE event, and the second one
+# present.
 #
 
 --source ../include/have_binsrv.inc
@@ -48,6 +51,12 @@ INSERT INTO t1 VALUES(DEFAULT);
 --echo
 --echo *** Flushing the first binary log and switching to the second one.
 FLUSH BINARY LOGS;
+--let $second_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+
+--echo
+--echo *** Flushing the second binary log (no transactions in it) and
+--echo *** switching to the third one.
+FLUSH BINARY LOGS;
 
 --echo
 --echo *** Filling the table with more data.
@@ -58,17 +67,21 @@ INSERT INTO t1 VALUES(DEFAULT);
 --exec $BINSRV fetch $binsrv_config_file_path > /dev/null
 
 --echo
---echo *** Comparing the stored copy of the first binary log with the
---echo *** server's one (closed, so it no longer has the "in use" flag).
+--echo *** Comparing the stored copies of the first and the second binary logs
+--echo *** with the server's ones (closed, so they no longer have the "in use"
+--echo *** flag).
 if ($storage_backend == file)
 {
   --diff_files $binlog_base_dir$first_binlog $binsrv_storage_path/$first_binlog
+  --diff_files $binlog_base_dir$second_binlog $binsrv_storage_path/$second_binlog
 }
 if ($storage_backend == s3)
 {
-  --let $stored_binlog_copy = $MYSQL_TMP_DIR/stored_first_binlog
+  --let $stored_binlog_copy = $MYSQL_TMP_DIR/stored_binlog
   --exec $aws_cli s3 cp s3://$aws_s3_bucket$binsrv_storage_path/$first_binlog $stored_binlog_copy > /dev/null
   --diff_files $binlog_base_dir$first_binlog $stored_binlog_copy
+  --exec $aws_cli s3 cp s3://$aws_s3_bucket$binsrv_storage_path/$second_binlog $stored_binlog_copy > /dev/null
+  --diff_files $binlog_base_dir$second_binlog $stored_binlog_copy
   --remove_file $stored_binlog_copy
 }
 

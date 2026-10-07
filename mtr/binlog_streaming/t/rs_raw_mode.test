@@ -1,0 +1,86 @@
+#
+# Checks that 'mysqlbinlog --read-from-remote-server --raw' can copy binary
+# logs from the Binlog Server replication source ('pull' mode), as it can from
+# a MySQL source. In raw mode mysqlbinlog names its output files after the
+# artificial ROTATE event a source sends at the start of every binary log, so
+# the replication source must send it.
+#
+# The closed first binary log written by mysqlbinlog must be identical to the
+# server's.
+#
+
+--source ../include/have_binsrv.inc
+
+--source ../include/v80_v84_compatibility_defines.inc
+
+--source include/count_sessions.inc
+
+# in case of --repeat=N, we need to start from a fresh binary log to make
+# this test deterministic
+--disable_query_log
+eval $stmt_reset_binary_logs_and_gtids;
+--enable_query_log
+
+# identifying backend storage type ('file' or 's3')
+--source ../include/identify_storage_backend.inc
+
+# creating data directory, configuration file, etc.
+--let $binsrv_connect_timeout = 3
+--let $binsrv_read_timeout = 3
+--let $binsrv_idle_time = 1
+--let $binsrv_verify_checksum = TRUE
+--let $binsrv_replication_mode = position
+--source ../include/set_up_binsrv_environment.inc
+
+--echo
+--echo *** Determining the first binary log name.
+--let $first_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+
+--echo
+--echo *** Creating a table, filling it, rotating, and adding more rows.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(DEFAULT);
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES(DEFAULT);
+
+--echo
+--echo *** Fetching the source binary logs.
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null
+
+--echo
+--echo *** Starting Binlog Server Utility in background in pull mode.
+--let $proc_command_line = $BINSRV pull $binsrv_config_file_path > /dev/null
+--source ../include/start_proc_in_background.inc
+
+--echo
+--echo *** Waiting for the replication source listener port ready to accept
+--echo *** connections.
+--let $listening_port = $binsrv_replication_source_port
+--source ../include/wait_for_listening_port.inc
+
+--echo
+--echo *** Copying the binary logs with mysqlbinlog in raw mode.
+--let $raw_directory = $MYSQL_TMP_DIR/rs_raw_mode
+--mkdir $raw_directory
+--exec $MYSQL_BINLOG --read-from-remote-server --raw --to-last-log --host=127.0.0.1 --port=$binsrv_replication_source_port --user=rpl --password=password --default-auth=caching_sha2_password --result-file=$raw_directory/ $first_binlog 2>/dev/null
+
+--echo
+--echo *** Sending SIGTERM signal to the Binlog Server Utility and waiting for
+--echo *** the process to terminate
+--source ../include/terminate_proc.inc
+
+--echo
+--echo *** Comparing the copied first binary log with the server's one.
+--diff_files $binlog_base_dir$first_binlog $raw_directory/$first_binlog
+
+--force-rmdir $raw_directory
+
+--echo
+--echo *** Dropping the table.
+DROP TABLE t1;
+
+# cleaning up
+--source ../include/tear_down_binsrv_environment.inc
+
+--source ../include/kill_binlog_dump_connection.inc
+--source include/wait_until_count_sessions.inc

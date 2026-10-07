@@ -119,8 +119,9 @@ class Failure(AssertionError):
 
 class MySQLServer:
     def __init__(self, basedir: Path, workdir: Path, port: int,
-                 gtid_mode: bool):
+                 gtid_mode: bool, server_id: int = 1):
         self.basedir = basedir
+        self.server_id = server_id
         self.datadir = workdir / "data"
         self.socket = workdir / "mysqld.sock"
         self.error_log = workdir / "mysqld.err"
@@ -143,7 +144,7 @@ class MySQLServer:
         gtid = "ON" if self.gtid_mode else "OFF"
         self.process = subprocess.Popen(self._mysqld_args() + [
             f"--port={self.port}", f"--socket={self.socket}",
-            "--mysqlx=OFF", "--server-id=1",
+            "--mysqlx=OFF", f"--server-id={self.server_id}",
             f"--log-bin={BINLOG_BASE_NAME}", "--binlog-format=ROW",
             f"--gtid-mode={gtid}", f"--enforce-gtid-consistency={gtid}",
             f"--max-binlog-size={MAX_BINLOG_SIZE}",

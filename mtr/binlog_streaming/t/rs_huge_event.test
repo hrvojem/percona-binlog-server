@@ -96,11 +96,11 @@ DROP DATABASE source_db;
 --exec $MYSQL < $large_event_dump
 
 --echo
---echo *** Comparing the restored and backup rows by (id, length, MD5).
---echo *** Using MD5 rather than diff_tables.inc so we do not have to pull
+--echo *** Comparing the restored and backup rows by (id, length, SHA-256).
+--echo *** Using SHA-256 rather than diff_tables.inc so we do not have to pull
 --echo *** the 20 MB blob through the sort buffer.
---let $src_sig = `SELECT CONCAT(id, ':', LENGTH(data), ':', MD5(data)) FROM source_db.tbl WHERE id = 1`
---let $bkp_sig = `SELECT CONCAT(id, ':', LENGTH(data), ':', MD5(data)) FROM backup_db.tbl WHERE id = 1`
+--let $src_sig = `SELECT CONCAT(id, ':', LENGTH(data), ':', SHA2(data, 256)) FROM source_db.tbl WHERE id = 1`
+--let $bkp_sig = `SELECT CONCAT(id, ':', LENGTH(data), ':', SHA2(data, 256)) FROM backup_db.tbl WHERE id = 1`
 if ($src_sig != $bkp_sig) {
   --echo source signature: $src_sig
   --echo backup signature: $bkp_sig

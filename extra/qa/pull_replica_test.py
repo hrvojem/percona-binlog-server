@@ -104,7 +104,7 @@ def run_case(args, gtid_mode: bool) -> dict:
         replica.sql(
             f"CHANGE REPLICATION SOURCE TO SOURCE_HOST='127.0.0.1', "
             f"SOURCE_PORT={pull_port}, SOURCE_USER='{PULL_USER}', "
-            f"SOURCE_PASSWORD='{PULL_PASSWORD}', GET_SOURCE_PUBLIC_KEY=1, "
+            f"SOURCE_PASSWORD='{PULL_PASSWORD}', GET_SOURCE_PUBLIC_KEY=1, SOURCE_SSL=0, "
             f"SOURCE_CONNECT_RETRY=2, {start}; START REPLICA;")
 
         expected = checksum(source)

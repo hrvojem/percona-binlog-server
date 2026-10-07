@@ -16,9 +16,9 @@
 --source ../include/have_binsrv.inc
 
 --source ../include/v80_v84_compatibility_defines.inc
-if ($lts_series != v84)
+if ($lts_series == v80)
 {
-  --skip Tagged GTIDs require MySQL Server 8.4
+  --skip Tagged GTIDs require MySQL Server 8.4 or later
 }
 
 # in case of --repeat=N, we need to start from a fresh binary log to make

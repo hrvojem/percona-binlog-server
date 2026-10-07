@@ -295,6 +295,27 @@ if(WITH_PROPERTY_TESTS)
     CXX_EXTENSIONS NO
   )
 
+  # the event generators (operations/event_generation_helpers.cpp) are part of
+  # the executable's sources, so they are compiled into the test directly
+  add_executable(event_generation_property_test
+    event_generation_property_test.cpp
+    "${PROJECT_SOURCE_DIR}/src/operations/event_generation_helpers.cpp"
+  )
+  target_include_directories(event_generation_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(event_generation_property_test
+    PRIVATE
+      binlog_server_compiler_flags
+      binsrv::lib_gtids
+      binsrv::lib_events
+      Boost::unit_test_framework
+      ZLIB::ZLIB
+      hegel
+  )
+  set_target_properties(event_generation_property_test PROPERTIES
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+  )
+
   add_executable(reader_context_property_test reader_context_property_test.cpp)
   target_include_directories(reader_context_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
   target_link_libraries(reader_context_property_test
@@ -332,6 +353,7 @@ if(WITH_PROPERTY_TESTS)
   add_test(NAME cipher_context_property_test COMMAND cipher_context_property_test ${test_run_options})
   add_test(NAME minimysql_property_test COMMAND minimysql_property_test ${test_run_options})
   add_test(NAME rewriter_property_test COMMAND rewriter_property_test ${test_run_options})
+  add_test(NAME event_generation_property_test COMMAND event_generation_property_test ${test_run_options})
   add_test(NAME reader_context_property_test COMMAND reader_context_property_test ${test_run_options})
   add_test(NAME config_value_property_test COMMAND config_value_property_test ${test_run_options})
 endif()

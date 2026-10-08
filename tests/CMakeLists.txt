@@ -209,6 +209,9 @@ if(WITH_PROPERTY_TESTS)
   add_executable(storage_property_test
     storage_property_test.cpp
     "${PROJECT_SOURCE_DIR}/src/operations/sender_context.cpp"
+    # sender_context now builds the artificial preamble through the event
+    # generators, so it needs them linked in too
+    "${PROJECT_SOURCE_DIR}/src/operations/event_generation_helpers.cpp"
   )
   target_include_directories(storage_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
   target_link_libraries(storage_property_test

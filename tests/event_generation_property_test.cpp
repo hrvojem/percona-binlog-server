@@ -71,6 +71,8 @@
 #include "binsrv/events/event.hpp"
 #include "binsrv/events/event_view.hpp"
 #include "binsrv/events/footer_view.hpp"
+#include "binsrv/events/format_description_body_impl.hpp"
+#include "binsrv/events/format_description_post_header_impl.hpp"
 #include "binsrv/events/previous_gtids_log_body_impl.hpp"
 #include "binsrv/events/protocol_traits_fwd.hpp"
 #include "binsrv/events/reader_context.hpp"
@@ -188,11 +190,12 @@ BOOST_AUTO_TEST_CASE(generate_rotate_event_round_trips) {
     const bool current_timestamp{tc.draw(gs::booleans())};
     const bool artificial{tc.draw(gs::booleans())};
     const auto binlog_name{draw_binlog_name(tc)};
+    const auto position{tc.draw(gs::integers<std::uint64_t>())};
 
     events::event_storage buffer;
     const auto view{operations::generate_rotate_event(
         buffer, *context, offset, current_timestamp, server_id, artificial,
-        binlog_name)};
+        binlog_name, position)};
 
     check_common(view, *context, code_type::rotate, server_id);
 
@@ -205,8 +208,8 @@ BOOST_AUTO_TEST_CASE(generate_rotate_event_round_trips) {
 
     const events::generic_post_header<code_type::rotate> post_header{
         view.get_post_header_raw()};
-    require(post_header.get_position_raw() == events::magic_binlog_offset,
-            "rotate post header does not hold the magic offset");
+    require(post_header.get_position_raw() == position,
+            "rotate post header does not round-trip to the requested position");
 
     const events::generic_body<code_type::rotate> body{view.get_body_raw()};
     require(body.get_parsed_binlog() == binlog_name,
@@ -222,12 +225,20 @@ BOOST_AUTO_TEST_CASE(generate_format_description_event_announces_checksums) {
     const auto offset{tc.draw(gs::integers<std::uint32_t>(
         {.min_value = 0U, .max_value = 0xFFFFFFF0U}))};
     const auto server_id{tc.draw(gs::integers<std::uint32_t>())};
+    const bool artificial{tc.draw(gs::booleans())};
 
     events::event_storage buffer;
+    // enable_checksum_algorithm is true so the body announces crc32, as the
+    // rewrite mode requires
     const auto view{operations::generate_format_description_event(
-        buffer, *context, offset, server_id)};
+        buffer, *context, offset, server_id, /*enable_checksum_algorithm=*/true,
+        artificial)};
 
     check_common(view, *context, code_type::format_description, server_id);
+    // note: for FORMAT_DESCRIPTION the 'artificial' parameter is only an
+    // internal marker (it governs next_event_position) and is cleared before
+    // serialization, so it is exercised with both values but not asserted on
+    // the serialized common header here
 
     // the generated FORMAT_DESCRIPTION must announce crc32 in its body, so
     // that downstream readers expect a checksum on the following events: this

@@ -1,0 +1,17 @@
+# Hegel settings profiles for the nightly property-test run. run_nightly.sh
+# selects one per build through HEGEL_DEFAULT_PROFILE. Each build has its own
+# failure database, so a failure found one night is replayed first the next.
+
+[profiles.nightly_debug]
+test_cases = 2000
+database = "@NIGHTLY_DIR@/hegel-db/debug_gcc14"
+
+[profiles.nightly_asan]
+test_cases = 500
+database = "@NIGHTLY_DIR@/hegel-db/asan_gcc14"
+suppress_health_check = ["too_slow"]
+
+[profiles.nightly_tsan]
+test_cases = 300
+database = "@NIGHTLY_DIR@/hegel-db/tsan_gcc14"
+suppress_health_check = ["too_slow"]

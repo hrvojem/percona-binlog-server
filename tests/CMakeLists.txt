@@ -352,6 +352,22 @@ if(WITH_PROPERTY_TESTS)
     CXX_EXTENSIONS NO
   )
 
+  # select_purge_victim_count lives in lib_binsrv (storage_core), so the test
+  # only needs to link it
+  add_executable(purge_selection_property_test purge_selection_property_test.cpp)
+  target_include_directories(purge_selection_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(purge_selection_property_test
+    PRIVATE
+      binlog_server_compiler_flags
+      binsrv::lib_binsrv
+      Boost::unit_test_framework
+      hegel
+  )
+  set_target_properties(purge_selection_property_test PROPERTIES
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+  )
+
   add_executable(config_value_property_test config_value_property_test.cpp)
   target_include_directories(config_value_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
   target_link_libraries(config_value_property_test
@@ -376,5 +392,6 @@ if(WITH_PROPERTY_TESTS)
   add_test(NAME event_generation_property_test COMMAND event_generation_property_test ${test_run_options})
   add_test(NAME reader_context_property_test COMMAND reader_context_property_test ${test_run_options})
   add_test(NAME search_helpers_property_test COMMAND search_helpers_property_test ${test_run_options})
+  add_test(NAME purge_selection_property_test COMMAND purge_selection_property_test ${test_run_options})
   add_test(NAME config_value_property_test COMMAND config_value_property_test ${test_run_options})
 endif()

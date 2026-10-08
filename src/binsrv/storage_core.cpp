@@ -329,24 +329,22 @@ void storage_core::close_binlog() {
   backend_->close_stream();
 }
 
-[[nodiscard]] std::pair<binlog_record_container, std::string>
-storage_core::purge_binlogs(const events::composite_binlog_name &target) {
-  ensure_purging_mode();
-
-  const std::unique_lock lock{mutex_};
-  if (is_empty_unsafe()) {
+[[nodiscard]] std::size_t
+select_purge_victim_count(const binlog_record_container &records,
+                          const events::composite_binlog_name &target) {
+  if (records.empty()) {
     util::exception_location().raise<std::runtime_error>(
         "cannot purge: binlog storage is empty");
   }
-  const auto &front_base_name{binlog_records_.front().name.get_base_name()};
+  const auto &front_base_name{records.front().name.get_base_name()};
   if (target.get_base_name() != front_base_name) {
     util::exception_location().raise<std::runtime_error>(
         "cannot purge: target binlog name has a different base name than "
         "the binlog records in the storage");
   }
-  const auto target_it{std::ranges::find(std::as_const(binlog_records_), target,
-                                         &binlog_record::name)};
-  if (target_it == std::cend(binlog_records_)) {
+  const auto target_it{
+      std::ranges::find(std::as_const(records), target, &binlog_record::name)};
+  if (target_it == std::cend(records)) {
     util::exception_location().raise<std::runtime_error>(
         "cannot purge: target binlog name is not present in the storage");
   }
@@ -355,19 +353,28 @@ storage_core::purge_binlogs(const events::composite_binlog_name &target) {
   // mode, executed GTID set in GTID mode) and force the next 'fetch' /
   // 'pull' to re-stream from the very beginning of the source's
   // retained binlog history.
-  if (target_it == std::prev(std::cend(binlog_records_))) {
+  if (target_it == std::prev(std::cend(records))) {
     util::exception_location().raise<std::runtime_error>(
         "cannot purge: target is the current tail binlog file; at least "
         "one binlog file must remain in the storage to preserve the "
         "resume position");
   }
+  // the prefix [begin, target_it + 1) is the set of records that purging up to
+  // 'target' drops
+  return static_cast<std::size_t>(
+      std::distance(std::cbegin(records), target_it) + 1);
+}
 
-  // step 1: extract the prefix [begin, target_it + 1) - this
-  // becomes the set of records we are going to drop on disk; the
-  // returned vector preserves the original order so the caller can
-  // use it directly to produce a response
-  const auto victim_count{static_cast<std::size_t>(
-      std::distance(std::cbegin(binlog_records_), target_it) + 1)};
+[[nodiscard]] std::pair<binlog_record_container, std::string>
+storage_core::purge_binlogs(const events::composite_binlog_name &target) {
+  ensure_purging_mode();
+
+  const std::unique_lock lock{mutex_};
+
+  // step 1: select and extract the victim prefix; the returned vector
+  // preserves the original order so the caller can use it directly to produce
+  // a response
+  const auto victim_count{select_purge_victim_count(binlog_records_, target)};
   binlog_record_container removed_records;
   removed_records.reserve(victim_count);
   std::move(std::begin(binlog_records_),

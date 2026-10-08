@@ -19,6 +19,7 @@
 #include "binsrv/storage_core_fwd.hpp" // IWYU pragma: export
 
 #include <chrono>
+#include <cstddef>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -85,6 +86,19 @@ struct binlog_record {
   // optional encryption parameters
   optional_binlog_encryption_record encryption{};
 };
+
+// The victim selection of a 'purge_binlogs' call, factored out of
+// storage_core::purge_binlogs so that it can be tested directly (see
+// tests/purge_selection_property_test.cpp). Returns the number of leading
+// binlog records (the prefix ending with 'target', inclusive) that purging up
+// to 'target' would drop, and raises std::runtime_error with the operation's
+// user-facing messages when the storage is empty, when 'target' names a
+// different base name than the records, when it is not present, or when it is
+// the current tail (at least one record must remain to preserve the resume
+// position).
+[[nodiscard]] std::size_t
+select_purge_victim_count(const binlog_record_container &records,
+                          const events::composite_binlog_name &target);
 
 class [[nodiscard]] storage_core {
 public:

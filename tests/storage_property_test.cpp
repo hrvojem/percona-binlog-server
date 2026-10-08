@@ -123,8 +123,10 @@
 #include "binsrv/storage_core.hpp"
 
 #include "binsrv/events/code_type.hpp"
+#include "binsrv/events/common_header_flag_type.hpp"
 #include "binsrv/events/common_header_view.hpp"
 #include "binsrv/events/composite_binlog_name.hpp"
+#include "binsrv/events/event_fwd.hpp"
 #include "binsrv/events/protocol_traits_fwd.hpp"
 
 #include "binsrv/gtids/common_types.hpp"
@@ -132,12 +134,14 @@
 #include "binsrv/gtids/gtid_set.hpp"
 #include "binsrv/gtids/uuid.hpp"
 
+#include "operations/event_generation_helpers.hpp"
 #include "operations/sender_context.hpp"
 
 #include "util/byte_span.hpp"
 #include "util/byte_span_fwd.hpp"
 #include "util/byte_span_inserters.hpp"
 #include "util/ctime_timestamp.hpp"
+#include "util/semantic_version.hpp"
 #include "util/ctime_timestamp_range.hpp"
 
 namespace {
@@ -150,6 +154,12 @@ using property_testing::run_property;
 constexpr std::string_view binlog_base_name{"binlog"};
 constexpr std::string_view transaction_uuid{
     "11111111-aaaa-1111-aaaa-111111111111"};
+
+// the read-back properties start each binlog with a real FORMAT_DESCRIPTION,
+// as a server does, because the reworked sender_context streams the binlog by
+// fetching its FDE first
+const util::semantic_version fde_server_version{8U, 4U, 8U};
+constexpr std::uint32_t fde_server_id{42U};
 
 // ---------------------------------------------------------------------------
 // temporary directories and configuration
@@ -1009,6 +1019,23 @@ using event_list = std::vector<std::vector<std::byte>>;
   return result;
 }
 
+// the stored events a reader must return are interleaved with the artificial
+// ROTATE events the sender_context generates (a leading one, and one at every
+// binlog boundary); those are not on disk, so drop them before comparing
+void strip_artificial_rotates(event_list &events) {
+  using header = binsrv::events::common_header_view_base;
+  std::erase_if(events, [](const std::vector<std::byte> &bytes) {
+    if (std::size(bytes) < header::size_in_bytes) {
+      return false;
+    }
+    const binsrv::events::common_header_view view{
+        util::const_byte_span{bytes}.subspan(0U, header::size_in_bytes)};
+    return view.get_type_code() == binsrv::events::code_type::rotate &&
+           view.get_flags().has_element(
+               binsrv::events::common_header_flag_type::artificial);
+  });
+}
+
 // reads events until the reader reports that there is no more data
 void read_until_end(operations::sender_context &reader, event_list &received,
                     std::size_t max_events, std::string_view label) {
@@ -1298,6 +1325,7 @@ public:
     const auto status{storage_->open_binlog(model_.get_current_binlog().name)};
     require(status == binsrv::open_binlog_status::created,
             "the first binlog was not reported as created");
+    write_first_binlog_event();
     restart_tailing_reader();
     if (properties_ == checked_properties::concurrent_read_back) {
       concurrent_reader_ = std::make_unique<operations::sender_context>(
@@ -1325,6 +1353,7 @@ public:
     const auto state{require_disk_matches_model(
         *location_, storage_->get_binlog_records(), model_,
         settings_)};
+    strip_artificial_rotates(concurrent_result_.received);
     require_same_events(concurrent_result_.received,
                         expected_events(model_, state), "concurrent reader");
   }
@@ -1360,6 +1389,7 @@ public:
       require(storage_->open_binlog(model_.get_current_binlog().name) ==
                   binsrv::open_binlog_status::created,
               "the next binlog was not reported as created");
+      write_first_binlog_event();
       break;
     case operation_kind::restart:
       // a running server never replaces its storage object while replicas
@@ -1738,10 +1768,10 @@ private:
     return result;
   }
 
-  void write_event(const operation &op) {
-    auto bytes{next_event_bytes(op.event_size, op.timestamp)};
-    const util::ctime_timestamp timestamp{
-        static_cast<std::time_t>(op.timestamp)};
+  // writes one event to both the storage and the model with the GTID /
+  // sequence number the collector would give it
+  void store_event(std::vector<std::byte> bytes,
+                   const util::ctime_timestamp &timestamp, bool at_boundary) {
     const auto gno{model_.get_current_gno()};
     // as in the collector, the sequence number comes with the first event
     // of a transaction (the GTID event) and the GTID applies to all of them
@@ -1751,11 +1781,32 @@ private:
         settings_.gtid_mode
             ? binsrv::gtids::gtid{binsrv::gtids::uuid{transaction_uuid}, gno}
             : binsrv::gtids::gtid{}};
-    storage_->write_event(util::const_byte_span{bytes},
-                          op.at_transaction_boundary, transaction_gtid,
-                          timestamp, sequence_number);
-    model_.write_event(std::move(bytes), timestamp,
-                       op.at_transaction_boundary);
+    storage_->write_event(util::const_byte_span{bytes}, at_boundary,
+                          transaction_gtid, timestamp, sequence_number);
+    model_.write_event(std::move(bytes), timestamp, at_boundary);
+  }
+
+  void write_event(const operation &op) {
+    store_event(next_event_bytes(op.event_size, op.timestamp),
+                util::ctime_timestamp{static_cast<std::time_t>(op.timestamp)},
+                op.at_transaction_boundary);
+  }
+
+  // the first event of every binlog is a real FORMAT_DESCRIPTION, as a server
+  // sends it; the reworked sender_context fetches it to start streaming, so
+  // the read-back properties need it on disk (the others keep their synthetic
+  // events only)
+  void write_first_binlog_event() {
+    if (!reads_back(properties_)) {
+      return;
+    }
+    binsrv::events::event_storage buffer;
+    operations::generate_format_description_event_ex(
+        buffer, fde_server_version, binsrv::events::magic_binlog_offset,
+        fde_server_id, /*enable_checksum_algorithm=*/true,
+        /*artificial=*/false);
+    store_event({std::cbegin(buffer), std::cend(buffer)},
+                util::ctime_timestamp{std::time_t{1}}, /*at_boundary=*/true);
   }
 
   void reopen_current_binlog(binsrv::storage &target, std::string_view label) {
@@ -1839,9 +1890,15 @@ private:
 
     if (properties_ == checked_properties::read_back) {
       const auto expected{expected_events(model_, state)};
-      read_until_end(*tailing_reader_, tailing_received_, std::size(expected),
-                     "tailing reader");
-      require_same_events(tailing_received_, expected, "tailing reader");
+      // the stream also carries one artificial ROTATE per binlog plus the
+      // leading one, which are stripped before the comparison
+      const auto slack{std::size(model_.get_binlogs()) + 1U};
+
+      read_until_end(*tailing_reader_, tailing_received_,
+                     std::size(expected) + slack, "tailing reader");
+      auto tailing{tailing_received_};
+      strip_artificial_rotates(tailing);
+      require_same_events(tailing, expected, "tailing reader");
 
       operations::sender_context fresh_reader{
           std::make_shared<binsrv::null_logger>(), storage_,
@@ -1849,8 +1906,9 @@ private:
           binsrv::events::magic_binlog_offset,
           /*session_source_binlog_checksum=*/false};
       event_list fresh_received;
-      read_until_end(fresh_reader, fresh_received, std::size(expected),
-                     "fresh reader");
+      read_until_end(fresh_reader, fresh_received,
+                     std::size(expected) + slack, "fresh reader");
+      strip_artificial_rotates(fresh_received);
       require_same_events(fresh_received, expected, "fresh reader");
       return;
     }
@@ -1931,19 +1989,10 @@ BOOST_AUTO_TEST_CASE(StorageRespectsCheckpointSize) {
   });
 }
 
-// TODO(read-back): temporarily skipped after the PBS-42 sender_context rework.
-// The reworked operations::sender_context now requires a real
-// FORMAT_DESCRIPTION event at the start of each binlog to stream, and emits an
-// artificial ROTATE + transformed FDE preamble before the stored events. This
-// test writes synthetic events (a valid common header, no real FDE), so the
-// read-back and concurrent-read-back properties need adapting to the new
-// streaming contract - write a real FDE per binlog and reconcile the preamble
-// in the comparison - before they can run again. The read_back /
-// concurrent_read_back branches in the harness are kept (and still compile) so
-// restoring them is a localized change.
 BOOST_AUTO_TEST_CASE(StorageReadBackMatchesDisk) {
-  BOOST_TEST_MESSAGE("skipped: read-back pending adaptation to the reworked "
-                     "sender_context (see TODO(read-back))");
+  run_property([](hegel::TestCase &tc) {
+    run_storage_property(tc, checked_properties::read_back);
+  });
 }
 
 BOOST_AUTO_TEST_CASE(StoragePurgeKeepsStorageReopenable) {
@@ -1953,9 +2002,9 @@ BOOST_AUTO_TEST_CASE(StoragePurgeKeepsStorageReopenable) {
 }
 
 BOOST_AUTO_TEST_CASE(StorageConcurrentReadBackMatchesDisk) {
-  // TODO(read-back): see StorageReadBackMatchesDisk.
-  BOOST_TEST_MESSAGE("skipped: read-back pending adaptation to the reworked "
-                     "sender_context (see TODO(read-back))");
+  run_property([](hegel::TestCase &tc) {
+    run_storage_property(tc, checked_properties::concurrent_read_back);
+  });
 }
 
 BOOST_AUTO_TEST_CASE(StorageOpeningOfDamagedFilesFailsCleanly) {
@@ -1973,9 +2022,7 @@ BOOST_AUTO_TEST_CASE(StorageRespectsCheckpointSizeOnS3) {
 }
 
 BOOST_AUTO_TEST_CASE(StorageReadBackMatchesDiskOnS3) {
-  // TODO(read-back): see StorageReadBackMatchesDisk.
-  BOOST_TEST_MESSAGE("skipped: read-back pending adaptation to the reworked "
-                     "sender_context (see TODO(read-back))");
+  run_s3_storage_property(checked_properties::read_back);
 }
 
 BOOST_AUTO_TEST_CASE(StoragePurgeKeepsStorageReopenableOnS3) {
@@ -1983,9 +2030,7 @@ BOOST_AUTO_TEST_CASE(StoragePurgeKeepsStorageReopenableOnS3) {
 }
 
 BOOST_AUTO_TEST_CASE(StorageConcurrentReadBackMatchesDiskOnS3) {
-  // TODO(read-back): see StorageReadBackMatchesDisk.
-  BOOST_TEST_MESSAGE("skipped: read-back pending adaptation to the reworked "
-                     "sender_context (see TODO(read-back))");
+  run_s3_storage_property(checked_properties::concurrent_read_back);
 }
 
 BOOST_AUTO_TEST_CASE(StorageOpeningOfDamagedFilesFailsCleanlyOnS3) {

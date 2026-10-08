@@ -165,7 +165,16 @@ variables are set, and skip those variants otherwise:
 `storage_property_test` then reruns every property with a `…OnS3` variant
 against the S3 backend, and `config_value_property_test` additionally
 authenticates generated credentials against the server. Starting a local
-S3-compatible server is described in `extra/qa/README.md`.
+S3-compatible server is described in `extra/qa/README.md`. The storage `…OnS3`
+variants cap themselves at a small number of cases (overridable with
+`PBS_TEST_S3_TEST_CASES`) because each round-trip hits the network, so they do
+not scale with the profile's `test_cases`.
+
+The nightly run sets these four variables automatically: `run_nightly.sh`
+brings up the local S3 server and exports them (and the endpoint/bucket shown
+above) before the property phase, so the S3 variants run every night. If the
+server cannot be reached it leaves them unset and the variants skip rather than
+fail.
 
 ## The design, in one place
 
@@ -211,8 +220,11 @@ start there when changing or extending one.
   `debug`, `asan` and `tsan` configurations, runs every property test case
   under the matching `nightly_*` profile (hundreds to thousands of cases each),
   compares failures against `known_failures.txt`, and feeds the results into
-  the nightly report. See [`../extra/qa/README.md`](../extra/qa/README.md) for
-  that layer.
+  the nightly report. The nightly profiles also set
+  `report_multiple_failures = true`, so a case surfaces every distinct failure
+  in one run rather than stopping at the first, and the run enables the S3
+  backend variants (see above). See
+  [`../extra/qa/README.md`](../extra/qa/README.md) for that layer.
 
 ## Adding a property test
 

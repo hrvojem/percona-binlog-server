@@ -355,6 +355,26 @@ if(WITH_PROPERTY_TESTS)
     CXX_EXTENSIONS NO
   )
 
+  # sender_context and the event generators it uses are part of the
+  # executable's operations sources, so they are compiled into the test
+  add_executable(sender_context_property_test
+    sender_context_property_test.cpp
+    "${PROJECT_SOURCE_DIR}/src/operations/sender_context.cpp"
+    "${PROJECT_SOURCE_DIR}/src/operations/event_generation_helpers.cpp"
+  )
+  target_include_directories(sender_context_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(sender_context_property_test
+    PRIVATE
+      binlog_server_compiler_flags
+      binsrv::lib_binsrv
+      Boost::unit_test_framework
+      hegel
+  )
+  set_target_properties(sender_context_property_test PROPERTIES
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+  )
+
   # select_purge_victim_count lives in lib_binsrv (storage_core), so the test
   # only needs to link it
   add_executable(purge_selection_property_test purge_selection_property_test.cpp)
@@ -395,6 +415,7 @@ if(WITH_PROPERTY_TESTS)
   add_test(NAME event_generation_property_test COMMAND event_generation_property_test ${test_run_options})
   add_test(NAME reader_context_property_test COMMAND reader_context_property_test ${test_run_options})
   add_test(NAME search_helpers_property_test COMMAND search_helpers_property_test ${test_run_options})
+  add_test(NAME sender_context_property_test COMMAND sender_context_property_test ${test_run_options})
   add_test(NAME purge_selection_property_test COMMAND purge_selection_property_test ${test_run_options})
   add_test(NAME config_value_property_test COMMAND config_value_property_test ${test_run_options})
 endif()

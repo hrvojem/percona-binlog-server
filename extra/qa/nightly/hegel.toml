@@ -1,17 +1,24 @@
 # Hegel settings profiles for the nightly property-test run. run_nightly.sh
 # selects one per build through HEGEL_DEFAULT_PROFILE. Each build has its own
 # failure database, so a failure found one night is replayed first the next.
+#
+# report_multiple_failures keeps each case generating after the first failing
+# example so one night surfaces every distinct bug in a property, not just the
+# first one.
 
 [profiles.nightly_debug]
 test_cases = 2000
 database = "@NIGHTLY_DIR@/hegel-db/debug_gcc14"
+report_multiple_failures = true
 
 [profiles.nightly_asan]
 test_cases = 500
 database = "@NIGHTLY_DIR@/hegel-db/asan_gcc14"
 suppress_health_check = ["too_slow"]
+report_multiple_failures = true
 
 [profiles.nightly_tsan]
 test_cases = 300
 database = "@NIGHTLY_DIR@/hegel-db/tsan_gcc14"
 suppress_health_check = ["too_slow"]
+report_multiple_failures = true

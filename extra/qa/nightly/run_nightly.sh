@@ -5,7 +5,9 @@
 # workstation) in the existing debug_gcc14, asan_gcc14 and tsan_gcc14 build
 # directories (see build_project.sh), runs the unit tests, then runs every
 # Hegel property test case separately with many more cases than the default
-# 100 (profiles in hegel.toml). Failures are compared with
+# 100 (profiles in hegel.toml). The local S3-compatible server is brought up
+# first so the storage and config property tests exercise the S3 backend
+# (PBS_TEST_S3_*) instead of skipping it. Failures are compared with
 # known_failures.txt.
 #
 # Results: ~/ws/nightly/runs/<date>/summary.txt (also ~/ws/nightly/latest),
@@ -58,6 +60,24 @@ changed=$(git -C "$SRC" status --short -- src tests CMakeLists.txt 2>/dev/null |
   echo "tree: $SRC at $revision ($changed paths differ from that commit)"
   echo
 } > "$summary"
+
+# Bring up the local S3-compatible server (idempotent) so the storage and
+# config property tests run their S3 backend variants. The values match
+# start_s3.sh / setup_test_environment.sh; these are local-only test
+# credentials. If the server cannot be reached, leave PBS_TEST_S3_* unset so
+# those variants skip rather than fail against a dead endpoint.
+if [ -x "$WS/s3/start_s3.sh" ]; then
+  "$WS/s3/start_s3.sh" > "$out/s3-start.log" 2>&1 || true
+fi
+if curl -s -o /dev/null --max-time 5 http://127.0.0.1:9000/; then
+  export PBS_TEST_S3_ENDPOINT=127.0.0.1:9000
+  export PBS_TEST_S3_ACCESS_KEY=pbsaccesskey
+  export PBS_TEST_S3_SECRET_KEY='pbs/secret+key=1'
+  export PBS_TEST_S3_BUCKET=pbs-mtr
+  log "S3 backend property variants enabled (127.0.0.1:9000, bucket pbs-mtr)"
+else
+  log "S3 server not reachable; S3 property variants will be skipped"
+fi
 
 new=0; known_failed=0; passed=0; unexpected_pass=0; broken=0
 results=()

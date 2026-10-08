@@ -288,4 +288,6 @@ what the nightly runs many cases of. Among them:
 `reader_context_property_test`, `config_value_property_test` and
 `event_generation_property_test` (the artificial ROTATE / FORMAT_DESCRIPTION /
 PREVIOUS_GTIDS generators). Build them with `-DWITH_PROPERTY_TESTS=ON` and run
-them with `ctest`.
+them with `ctest`. Their design, settings profiles (`hegel.toml`), how to
+replay a failure, and a per-test rundown are documented in
+[`../../tests/PROPERTY_TESTS.md`](../../tests/PROPERTY_TESTS.md).

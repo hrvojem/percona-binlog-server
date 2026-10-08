@@ -530,6 +530,9 @@ set(operations_source_files
   src/operations/search_by_timestamp_operation.hpp
   src/operations/search_by_timestamp_operation.cpp
 
+  src/operations/search_helpers.hpp
+  src/operations/search_helpers.cpp
+
   src/operations/sender_context_fwd.hpp
   src/operations/sender_context.hpp
   src/operations/sender_context.cpp

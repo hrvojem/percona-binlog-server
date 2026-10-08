@@ -31,6 +31,7 @@
 #include "operations/basic_operation.hpp"
 #include "operations/mode_type.hpp"
 #include "operations/model_helpers.hpp"
+#include "operations/search_helpers.hpp"
 
 #include "util/command_line_helpers_fwd.hpp"
 #include "util/ctime_timestamp.hpp"
@@ -58,21 +59,14 @@ generic_operation<mode_type::search_by_timestamp>::execute() const {
         std::make_shared<binsrv::null_logger>(), config,
         binsrv::storage_construction_mode_type::querying_only};
 
-    binsrv::models::search_response response;
     const auto &binlog_records{storage.get_binlog_records()};
-    if (binlog_records.empty()) {
-      throw std::runtime_error("Binlog storage is empty");
-    }
-    for (const auto &record : binlog_records) {
-      // break when we find a binlog file with min timestamp greater
-      // than the provided one
-      if (record.timestamps.get_min_timestamp() > timestamp) {
-        break;
-      }
-      append_record_to_search_response(response, storage, record);
-    }
-    if (response.root().get<"result">().empty()) {
-      throw std::runtime_error("Timestamp is too old");
+    const auto selected_records{
+        select_records_by_timestamp(binlog_records, timestamp)};
+
+    binsrv::models::search_response response;
+    for (const auto record_index : selected_records) {
+      append_record_to_search_response(response, storage,
+                                       binlog_records[record_index]);
     }
     result = response.str();
     operation_successful = true;

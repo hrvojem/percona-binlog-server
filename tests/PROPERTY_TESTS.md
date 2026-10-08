@@ -208,6 +208,7 @@ fail.
 | `cipher_context_property_test` | `opensslpp::cipher_context` (AES-CTR) | Encrypting from any offset matches an independent CTR reference; encrypting in arbitrary pieces matches encrypting in one call; decrypting from arbitrary offsets recovers the data. |
 | `minimysql_property_test` | `minimysql::connection_context` | The `pull`-mode source listener completes `caching_sha2_password` only with the right credentials, parses client commands faithfully, rejects corrupted packets (run under ASan), and delivers binlog events that a MySQL client reassembles exactly, including multi-packet payloads. |
 | `config_value_property_test` | user/server value parsers | Size/time units, binlog names, timestamps, semantic versions, filesystem and S3 storage URIs, keyring files and config files accept exactly the valid inputs (against an independent model) and round-trip; damaged keyring/config files are rejected with a regular exception. |
+| `search_helpers_property_test` | `operations/search_helpers.cpp` (the `search_by_gtid_set` / `search_by_timestamp` record selection) | GTID search succeeds exactly when the target is covered by the union of the records' GTID sets, selecting a minimal increasing subsequence that each intersects the target; timestamp search returns the leading run up to the first record past the timestamp; empty-storage, non-GTID-mode and too-old inputs are rejected. |
 
 Each test file opens with a comment block describing its properties in detail;
 start there when changing or extending one.

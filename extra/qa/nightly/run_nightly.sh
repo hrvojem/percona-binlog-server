@@ -5,10 +5,10 @@
 # workstation) in the existing debug_gcc14, asan_gcc14 and tsan_gcc14 build
 # directories (see build_project.sh), runs the unit tests, then runs every
 # Hegel property test case separately with many more cases than the default
-# 100 (profiles in hegel.toml). The local S3-compatible server is brought up
-# first so the storage and config property tests exercise the S3 backend
-# (PBS_TEST_S3_*) instead of skipping it. Failures are compared with
-# known_failures.txt.
+# 100 (profiles in hegel.toml), several cases at a time (JOBS / TSAN_JOBS).
+# The local S3-compatible server is brought up first so the storage and config
+# property tests exercise the S3 backend (PBS_TEST_S3_*) instead of skipping
+# it. Failures are compared with known_failures.txt.
 #
 # Results: ~/ws/nightly/runs/<date>/summary.txt (also ~/ws/nightly/latest),
 # one log per test case next to it, results.jsonl (one JSON line per test
@@ -27,6 +27,11 @@ SRC=$WS/percona-binlog-server
 NIGHTLY=$WS/nightly
 KEEP_DAYS=30
 CASE_TIMEOUT=3600
+# property test cases run several at a time; each one is a separate process
+# with its own Hegel database subtree, so they do not interfere. ThreadSanitizer
+# cases are memory-heavy, so they use a smaller pool.
+JOBS=${JOBS:-4}
+TSAN_JOBS=${TSAN_JOBS:-2}
 
 exec 9> "$NIGHTLY/.lock"
 flock -n 9 || { echo "another nightly run is in progress"; exit 0; }
@@ -46,6 +51,51 @@ record() {
   python3 -c 'import json,sys; print(json.dumps(dict(zip(["config","program","test_case","status","ticket","reason","seconds"], sys.argv[1:7]+[int(sys.argv[7])]))))' "$@" >> "$results_file"
 }
 log() { echo "[$(date -u "+%F %T")] $*" | tee -a "$out/nightly.log"; }
+
+# runs one property test case (meant to be backgrounded) and writes its
+# outcome to "$status_dir/<test case>" as tab-separated fields the main loop
+# aggregates afterwards: status, program, test case, ticket, reason, seconds,
+# and the human-readable summary line. Reads $config / $work / $profile /
+# $run_prefix / $status_dir / known[] from the enclosing config iteration.
+run_case() {
+  local program=$1 binary=$2 test_case=$3
+  local case_log=$out/$config-$test_case.log
+  local case_started
+  case_started=$(date +%s)
+  (cd "$work" && HEGEL_DEFAULT_PROFILE=$profile \
+    timeout "$CASE_TIMEOUT" "${run_prefix[@]}" "$binary" \
+    --run_test="$test_case" > "$case_log" 2>&1)
+  local rc=$?
+  local case_seconds=$(( $(date +%s) - case_started ))
+  local tsan_reports
+  tsan_reports=$(grep -c "WARNING: ThreadSanitizer" "$case_log")
+  local ticket=${known[$test_case]:-}
+  local status reason="" line=""
+  if [ $rc -eq 0 ] && [ "$tsan_reports" -eq 0 ]; then
+    rm -f "$case_log"
+    if [ -n "$ticket" ]; then
+      status=known-passed
+      line="KNOWN PASSED  $config  $test_case  ($ticket; fixed, or not hit tonight?)"
+    else
+      status=passed
+    fi
+  else
+    reason=$(grep -m1 -oE "Exception: .{0,150}" "$case_log")
+    [ $rc -eq 124 ] && reason="timed out after ${CASE_TIMEOUT}s"
+    [ "$tsan_reports" -gt 0 ] && reason="$tsan_reports ThreadSanitizer reports"
+    grep -q "ERROR: AddressSanitizer" "$case_log" &&
+      reason=$(grep -m1 -oE "ERROR: AddressSanitizer: .{0,120}" "$case_log")
+    if [ -n "$ticket" ]; then
+      status=known
+      line="known         $config  $test_case  ($ticket)"
+    else
+      status=new
+      line="NEW FAILURE   $config  $test_case  $reason  ($(basename "$case_log"))"
+    fi
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$status" "$program" "$test_case" \
+    "$ticket" "$reason" "$case_seconds" "$line" > "$status_dir/$test_case"
+}
 
 declare -A known
 while read -r name ticket; do
@@ -131,6 +181,14 @@ for config in debug_gcc14 asan_gcc14 tsan_gcc14; do
   # hegel.toml is found in the working directory or an ancestor
   work=$out/work-$config
   mkdir -p "$work"
+  status_dir=$out/status-$config
+  rm -rf "$status_dir"
+  mkdir -p "$status_dir"
+  jobs=$JOBS
+  [ "$config" = tsan_gcc14 ] && jobs=$TSAN_JOBS
+
+  # collect every (program, binary, test case) task for this config
+  case_tasks=()
   for binary in "${property_tests[@]}"; do
     program=$(basename "$binary")
     mapfile -t test_cases < <("${run_prefix[@]}" "$binary" --list_content 2>&1 |
@@ -143,42 +201,47 @@ for config in debug_gcc14 asan_gcc14 tsan_gcc14; do
       continue
     fi
     for test_case in "${test_cases[@]}"; do
-      case_log=$out/$config-$test_case.log
-      log "$config $program/$test_case"
-      case_started=$(date +%s)
-      (cd "$work" && HEGEL_DEFAULT_PROFILE=$profile \
-        timeout "$CASE_TIMEOUT" "${run_prefix[@]}" "$binary" \
-        --run_test="$test_case" > "$case_log" 2>&1)
-      rc=$?
-      case_seconds=$(( $(date +%s) - case_started ))
-      tsan_reports=$(grep -c "WARNING: ThreadSanitizer" "$case_log")
-      if [ $rc -eq 0 ] && [ "$tsan_reports" -eq 0 ]; then
-        if [ -n "${known[$test_case]:-}" ]; then
-          results+=("KNOWN PASSED  $config  $test_case  (${known[$test_case]}; fixed, or not hit tonight?)")
-          unexpected_pass=$((unexpected_pass + 1))
-          record "$config" "$program" "$test_case" "known-passed" "${known[$test_case]}" "" $case_seconds
-        else
-          record "$config" "$program" "$test_case" "passed" "" "" $case_seconds
-        fi
-        passed=$((passed + 1))
-        rm -f "$case_log"
-        continue
-      fi
-      reason=$(grep -m1 -oE "Exception: .{0,150}" "$case_log")
-      [ $rc -eq 124 ] && reason="timed out after ${CASE_TIMEOUT}s"
-      [ "$tsan_reports" -gt 0 ] && reason="$tsan_reports ThreadSanitizer reports"
-      grep -q "ERROR: AddressSanitizer" "$case_log" &&
-        reason=$(grep -m1 -oE "ERROR: AddressSanitizer: .{0,120}" "$case_log")
-      if [ -n "${known[$test_case]:-}" ]; then
-        results+=("known         $config  $test_case  (${known[$test_case]})")
-        known_failed=$((known_failed + 1))
-        record "$config" "$program" "$test_case" "known" "${known[$test_case]}" "$reason" $case_seconds
-      else
-        results+=("NEW FAILURE   $config  $test_case  $reason  ($(basename "$case_log"))")
-        new=$((new + 1))
-        record "$config" "$program" "$test_case" "new" "" "$reason" $case_seconds
-      fi
+      case_tasks+=("$program|$binary|$test_case")
     done
+  done
+
+  # run the cases, up to 'jobs' at a time (each writes its own status file)
+  running=0
+  for task in "${case_tasks[@]}"; do
+    IFS='|' read -r program binary test_case <<< "$task"
+    log "$config $program/$test_case"
+    run_case "$program" "$binary" "$test_case" &
+    running=$((running + 1))
+    if [ "$running" -ge "$jobs" ]; then
+      wait -n
+      running=$((running - 1))
+    fi
+  done
+  wait
+
+  # aggregate the per-case outcomes for this config
+  for status_file in "$status_dir"/*; do
+    [ -e "$status_file" ] || continue
+    IFS=$'\t' read -r status program test_case ticket reason case_seconds line \
+      < "$status_file"
+    record "$config" "$program" "$test_case" "$status" "$ticket" "$reason" \
+      "$case_seconds"
+    case $status in
+      passed) passed=$((passed + 1)) ;;
+      known-passed)
+        unexpected_pass=$((unexpected_pass + 1))
+        passed=$((passed + 1))
+        results+=("$line")
+        ;;
+      known)
+        known_failed=$((known_failed + 1))
+        results+=("$line")
+        ;;
+      new)
+        new=$((new + 1))
+        results+=("$line")
+        ;;
+    esac
   done
 done
 

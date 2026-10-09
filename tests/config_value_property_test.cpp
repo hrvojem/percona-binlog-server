@@ -1597,6 +1597,11 @@ BOOST_AUTO_TEST_CASE(ConfigDamagedFileFailsCleanly) {
 }
 
 BOOST_AUTO_TEST_CASE(S3StorageUriMatchesModel) {
+  // every case constructs a real s3_storage_backend (which spins up the AWS
+  // SDK and its event-loop threads), so this bounded URI-parsing property is
+  // capped well below the profile's case count to keep the nightly fast
+  hegel::Settings settings{};
+  settings.test_cases = 200U;
   run_property([](hegel::TestCase &tc) {
     const auto spec{tc.draw("uri", s3_uri_specs())};
     const scratch_directory scratch;
@@ -1655,7 +1660,7 @@ BOOST_AUTO_TEST_CASE(S3StorageUriMatchesModel) {
               "'" + spec.uri + "' gives the object URI '" + object_uri +
                   "' for another bucket");
     }
-  });
+  }, settings);
 }
 
 BOOST_AUTO_TEST_CASE(S3StorageCredentialsAreDecoded) {

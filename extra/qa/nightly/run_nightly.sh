@@ -47,8 +47,10 @@ started=$(date +%s)
 started_utc=$(date -u "+%F %T")
 # one JSON line per result: config, program, test case, status, ticket,
 # reason, seconds
+# prints one JSON result line to stdout (callers redirect it to the results
+# file or a per-case file)
 record() {
-  python3 -c 'import json,sys; print(json.dumps(dict(zip(["config","program","test_case","status","ticket","reason","seconds"], sys.argv[1:7]+[int(sys.argv[7])]))))' "$@" >> "$results_file"
+  python3 -c 'import json,sys; print(json.dumps(dict(zip(["config","program","test_case","status","ticket","reason","seconds"], sys.argv[1:7]+[int(sys.argv[7])]))))' "$@"
 }
 log() { echo "[$(date -u "+%F %T")] $*" | tee -a "$out/nightly.log"; }
 
@@ -93,8 +95,11 @@ run_case() {
       line="NEW FAILURE   $config  $test_case  $reason  ($(basename "$case_log"))"
     fi
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$status" "$program" "$test_case" \
-    "$ticket" "$reason" "$case_seconds" "$line" > "$status_dir/$test_case"
+  # separate files, so empty fields (ticket / reason / line) survive
+  printf '%s' "$status" > "$status_dir/$test_case.status"
+  printf '%s' "$line" > "$status_dir/$test_case.line"
+  record "$config" "$program" "$test_case" "$status" "$ticket" "$reason" \
+    "$case_seconds" > "$status_dir/$test_case.json"
 }
 
 declare -A known
@@ -155,7 +160,8 @@ for config in debug_gcc14 asan_gcc14 tsan_gcc14; do
       > "$out/build-$config.log" 2>&1; then
     log "BUILD FAILED: $config"
     results+=("BUILD FAILED  $config  (build-$config.log)")
-    record "$config" "" "build" "build-failed" "" "see build-$config.log" 0
+    record "$config" "" "build" "build-failed" "" "see build-$config.log" 0 \
+      >> "$results_file"
     broken=$((broken + 1))
     continue
   fi
@@ -166,11 +172,13 @@ for config in debug_gcc14 asan_gcc14 tsan_gcc14; do
     if (cd "$build_dir" && ctest -E "_property_test$" --output-on-failure \
         --timeout 600 > "$out/unit-$config.log" 2>&1); then
       passed=$((passed + 1))
-      record "$config" "ctest" "unit tests" "passed" "" "" $(( $(date +%s) - unit_started ))
+      record "$config" "ctest" "unit tests" "passed" "" "" \
+        $(( $(date +%s) - unit_started )) >> "$results_file"
     else
       results+=("NEW FAILURE   $config  unit tests  (unit-$config.log)")
       new=$((new + 1))
-      record "$config" "ctest" "unit tests" "new" "" "see unit-$config.log" $(( $(date +%s) - unit_started ))
+      record "$config" "ctest" "unit tests" "new" "" "see unit-$config.log" \
+        $(( $(date +%s) - unit_started )) >> "$results_file"
     fi
     mapfile -t property_tests < <(find "$build_dir/tests" -maxdepth 1 \
       -name "*_property_test" -type f -perm -u+x | sort)
@@ -196,7 +204,8 @@ for config in debug_gcc14 asan_gcc14 tsan_gcc14; do
     if [ ${#test_cases[@]} -eq 0 ]; then
       log "NO TEST CASES: $config $program"
       results+=("NO TEST CASES $config  $program  (the program lists no test cases)")
-      record "$config" "$program" "" "no-test-cases" "" "the program lists no test cases" 0
+      record "$config" "$program" "" "no-test-cases" "" \
+        "the program lists no test cases" 0 >> "$results_file"
       broken=$((broken + 1))
       continue
     fi
@@ -205,9 +214,23 @@ for config in debug_gcc14 asan_gcc14 tsan_gcc14; do
     done
   done
 
-  # run the cases, up to 'jobs' at a time (each writes its own status file)
-  running=0
+  # split out the cases that touch the S3 backend: the AWS SDK is unreliable
+  # (heap-use-after-free, races) when several of its clients hit the same
+  # server at once, so those run one at a time while the rest run in parallel
+  parallel_tasks=()
+  serial_tasks=()
   for task in "${case_tasks[@]}"; do
+    IFS='|' read -r program binary test_case <<< "$task"
+    if [[ "$test_case" == *OnS3 || "$test_case" == S3Storage* ]]; then
+      serial_tasks+=("$task")
+    else
+      parallel_tasks+=("$task")
+    fi
+  done
+
+  # non-S3 cases, up to 'jobs' at a time (each writes its own status files)
+  running=0
+  for task in "${parallel_tasks[@]}"; do
     IFS='|' read -r program binary test_case <<< "$task"
     log "$config $program/$test_case"
     run_case "$program" "$binary" "$test_case" &
@@ -219,27 +242,33 @@ for config in debug_gcc14 asan_gcc14 tsan_gcc14; do
   done
   wait
 
+  # S3 cases, one at a time
+  for task in "${serial_tasks[@]}"; do
+    IFS='|' read -r program binary test_case <<< "$task"
+    log "$config $program/$test_case (serial S3)"
+    run_case "$program" "$binary" "$test_case"
+  done
+
   # aggregate the per-case outcomes for this config
-  for status_file in "$status_dir"/*; do
+  for status_file in "$status_dir"/*.status; do
     [ -e "$status_file" ] || continue
-    IFS=$'\t' read -r status program test_case ticket reason case_seconds line \
-      < "$status_file"
-    record "$config" "$program" "$test_case" "$status" "$ticket" "$reason" \
-      "$case_seconds"
+    base=${status_file%.status}
+    status=$(cat "$status_file")
+    cat "$base.json" >> "$results_file"
     case $status in
       passed) passed=$((passed + 1)) ;;
       known-passed)
         unexpected_pass=$((unexpected_pass + 1))
         passed=$((passed + 1))
-        results+=("$line")
+        results+=("$(cat "$base.line")")
         ;;
       known)
         known_failed=$((known_failed + 1))
-        results+=("$line")
+        results+=("$(cat "$base.line")")
         ;;
       new)
         new=$((new + 1))
-        results+=("$line")
+        results+=("$(cat "$base.line")")
         ;;
     esac
   done

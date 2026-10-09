@@ -43,6 +43,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -105,9 +106,17 @@ using byte_vector = std::vector<std::byte>;
 class temp_dir {
 public:
   temp_dir() {
+    // a per-process random token keeps the directory unique even when several
+    // test-case processes run concurrently (as in the nightly) under the same
+    // temporary root
+    static const std::string process_token{[] {
+      std::random_device device;
+      return std::to_string(device()) + "_" + std::to_string(device());
+    }()};
     static std::atomic<std::uint64_t> counter{0ULL};
     path_ = std::filesystem::temp_directory_path() /
-            ("sender_ctx_" + std::to_string(counter.fetch_add(1ULL)));
+            ("sender_ctx_" + process_token + "_" +
+             std::to_string(counter.fetch_add(1ULL)));
     std::filesystem::create_directories(path_);
   }
   temp_dir(const temp_dir &) = delete;

@@ -1,0 +1,18 @@
+# ThreadSanitizer suppressions for the nightly tsan_gcc14 run.
+#
+# The AWS C++ SDK (aws-sdk-cpp / aws-crt-cpp / aws-c-s3 / aws-c-common) runs
+# its own event-loop threads and synchronises them with custom atomics and
+# cross-thread reference counting that ThreadSanitizer does not understand. As
+# a result it reports false data races when an S3 meta-request completes and is
+# cleaned up on one SDK thread while another SDK thread is still finishing it
+# (seen from StorageConcurrentReadBackMatchesDiskOnS3, which reads an S3
+# storage from two threads). These are third-party SDK internals, not
+# percona-binlog-server code; races in our own code are still reported, because
+# the patterns below match only the SDK's own functions.
+race:aws_s3_meta_request
+race:aws_mutex_
+race:aws_mem_
+race:aws_ref_count
+race:aws_atomic
+race:Aws::Free
+race:Aws::Malloc

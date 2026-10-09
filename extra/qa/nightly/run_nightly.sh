@@ -94,7 +94,9 @@ for config in debug_gcc14 asan_gcc14 tsan_gcc14; do
       profile=nightly_tsan
       targets=(--target storage_property_test)
       run_prefix=(setarch "$(uname -m)" -R)
-      export TSAN_OPTIONS="halt_on_error=0"
+      # suppress ThreadSanitizer's false races inside the AWS SDK's own
+      # threads (see tsan.supp); our code is still checked
+      export TSAN_OPTIONS="halt_on_error=0 suppressions=$NIGHTLY/tsan.supp"
       ;;
   esac
 

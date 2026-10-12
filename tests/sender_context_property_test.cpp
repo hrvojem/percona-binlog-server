@@ -35,6 +35,7 @@
 // parsed header / position / checksum, the data events byte for byte against
 // what was stored).
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -48,6 +49,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #define BOOST_TEST_MODULE SenderContextPropertyTests
@@ -64,6 +66,8 @@
 #include "operations/event_generation_helpers.hpp"
 #include "operations/sender_context.hpp"
 
+#include "binsrv/basic_logger.hpp"
+#include "binsrv/log_severity.hpp"
 #include "binsrv/main_config.hpp"
 #include "binsrv/null_logger.hpp"
 #include "binsrv/storage.hpp"
@@ -99,6 +103,7 @@ using property_testing::run_property;
 const util::semantic_version server_version{8U, 4U, 8U};
 constexpr std::uint32_t server_id{42U};
 const events::composite_binlog_name the_binlog{"binlog", 1U};
+const events::composite_binlog_name the_next_binlog{"binlog", 2U};
 
 using byte_vector = std::vector<std::byte>;
 
@@ -243,20 +248,83 @@ struct seeded_storage {
   return result;
 }
 
-// reads the whole stream a sender_context produces (get_event returns true and
-// an empty span at EOF, false on error)
-[[nodiscard]] std::vector<byte_vector>
-drain(operations::sender_context &reader, std::size_t limit) {
-  std::vector<byte_vector> result;
+// appends 'bytes' to the open binlog and flushes them; the storage does not
+// parse what it stores, so writing only a prefix of an event is how a
+// partially written (or truncated) last event becomes visible to readers
+void append_flushed(binsrv::storage &storage, util::const_byte_span bytes) {
+  storage.write_event(bytes, /*at_transaction_boundary=*/true,
+                      binsrv::gtids::gtid{},
+                      util::ctime_timestamp{std::time_t{1}}, 0ULL);
+  storage.flush_event_buffer();
+}
+
+struct stream_outcome {
+  std::vector<byte_vector> events;
+  // get_event() returned false (as opposed to reaching EOF)
+  bool failed;
+};
+
+// reads a sender_context's stream up to EOF or the first error (get_event
+// returns true and an empty span at EOF, false on error)
+[[nodiscard]] stream_outcome stream_until_end(operations::sender_context &reader,
+                                              std::size_t limit) {
+  stream_outcome result{.events = {}, .failed = false};
   util::const_byte_span event;
   for (std::size_t guard{0U}; guard != limit + 1U; ++guard) {
-    require(reader.get_event(event), "sender_context::get_event() failed");
+    if (!reader.get_event(event)) {
+      result.failed = true;
+      return result;
+    }
     if (std::empty(event)) {
       return result;
     }
-    result.emplace_back(std::cbegin(event), std::cend(event));
+    result.events.emplace_back(std::cbegin(event), std::cend(event));
   }
   throw std::runtime_error{"sender_context produced more events than expected"};
+}
+
+// reads the whole stream a sender_context produces, up to EOF
+[[nodiscard]] std::vector<byte_vector>
+drain(operations::sender_context &reader, std::size_t limit) {
+  auto outcome{stream_until_end(reader, limit)};
+  require(!outcome.failed, "sender_context::get_event() failed");
+  return std::move(outcome.events);
+}
+
+// keeps every message, so that a test can see what sender_context reports
+// about its storage fetches
+class recording_logger final : public binsrv::basic_logger {
+public:
+  recording_logger() noexcept : basic_logger{binsrv::log_severity::info} {}
+
+  [[nodiscard]] const std::vector<std::string> &get_messages() const noexcept {
+    return messages_;
+  }
+
+private:
+  std::vector<std::string> messages_;
+
+  void do_log(std::string_view message) override {
+    messages_.emplace_back(message);
+  }
+};
+
+// the total number of bytes sender_context fetched as event blocks, from its
+// "fetched event block of size N" log messages (the storage offers no other
+// way to observe its reads; a missing message makes the total come up short,
+// so a reworded log line fails the property rather than passing it vacuously)
+[[nodiscard]] std::uint64_t
+total_fetched_block_bytes(const recording_logger &logger) {
+  static constexpr std::string_view marker{
+      "sender : fetched event block of size "};
+  std::uint64_t result{0ULL};
+  for (const auto &message : logger.get_messages()) {
+    const auto position{message.find(marker)};
+    if (position != std::string::npos) {
+      result += std::stoull(message.substr(position + std::size(marker)));
+    }
+  }
+  return result;
 }
 
 [[nodiscard]] events::common_header_view header_of(const byte_vector &bytes) {
@@ -288,6 +356,14 @@ drain(operations::sender_context &reader, std::size_t limit) {
   return gs::vectors(gs::integers<std::size_t>(
       {.min_value = events::common_header_view_base::size_in_bytes,
        .max_value = 200U}));
+}
+
+// the size of a single event that can be split into a non-empty prefix and a
+// non-empty rest
+[[nodiscard]] gs::Generator<std::size_t> splittable_event_sizes() {
+  return gs::integers<std::size_t>(
+      {.min_value = events::common_header_view_base::size_in_bytes,
+       .max_value = 200U});
 }
 
 [[nodiscard]] gs::Generator<std::size_t> block_sizes() {
@@ -397,6 +473,187 @@ BOOST_AUTO_TEST_CASE(FromPositionStreamsArtificialPreambleAndRemainingEvents) {
       require(emitted[index + 2U] == seeded.events[resume_index + index],
               "stored event " + std::to_string(resume_index + index) +
                   " was not streamed byte for byte from the position");
+    }
+  });
+}
+
+// every stored byte from the starting position on is fetched from storage
+// exactly once (PBS-65): the trailing partial event of a block is carried
+// over in memory and topped up, never read again
+BOOST_AUTO_TEST_CASE(EveryStoredByteIsFetchedOnce) {
+  run_property([](hegel::TestCase &tc) {
+    const temp_dir directory;
+    const auto sizes{tc.draw("sizes", event_size_lists())};
+    const auto block_size{tc.draw("block", block_sizes())};
+
+    const auto seeded{seed(directory.path(), sizes)};
+    // 0 streams from the beginning, any other index resumes at that event
+    const auto start_index{tc.draw(
+        "start",
+        gs::integers<std::size_t>({.min_value = 0U,
+                                   .max_value = std::size(seeded.events) - 1U}))};
+    const bool from_beginning{start_index == 0U};
+    const auto start_position{seeded.offsets[start_index]};
+    const std::string binlog_name{from_beginning ? std::string{}
+                                                 : the_binlog.str()};
+
+    const auto logger{std::make_shared<recording_logger>()};
+    operations::sender_context reader{logger,
+                                      seeded.storage,
+                                      block_size,
+                                      binlog_name,
+                                      start_position,
+                                      /*session_source_binlog_checksum=*/true};
+
+    // artificial ROTATE (+ artificial FDE when resuming) + the stored events
+    const auto remaining{std::size(seeded.events) - start_index};
+    const auto preamble{from_beginning ? 1U : 2U};
+    const auto emitted{drain(reader, remaining + preamble)};
+    require(std::size(emitted) == remaining + preamble,
+            "expected the preamble followed by every remaining stored event");
+
+    const auto file_size{seeded.offsets.back() +
+                         std::size(seeded.events.back())};
+    const auto fetched{total_fetched_block_bytes(*logger)};
+    require(fetched == file_size - start_position,
+            "fetched " + std::to_string(fetched) +
+                " byte(s) as event blocks to stream the " +
+                std::to_string(file_size - start_position) +
+                " byte(s) stored from position " +
+                std::to_string(start_position));
+  });
+}
+
+// a partially written last event is not streamed: the reader reports EOF
+// (also after further, still incomplete, pieces arrive) and, once the rest of
+// the event lands, carries on with it and what follows byte for byte
+BOOST_AUTO_TEST_CASE(PartialEventAtEofIsStreamedOnceCompleted) {
+  run_property([](hegel::TestCase &tc) {
+    const temp_dir directory;
+    const auto sizes{tc.draw("sizes", event_size_lists())};
+    const auto block_size{tc.draw("block", block_sizes())};
+    const auto pending_size{tc.draw("pending_size", splittable_event_sizes())};
+    // where the pending event is split into the pieces written one by one
+    auto cuts{tc.draw(
+        "cuts", gs::vectors(gs::integers<std::size_t>(
+                                {.min_value = 1U, .max_value = pending_size - 1U}),
+                            {.min_size = 1U, .max_size = 3U}))};
+    std::ranges::sort(cuts);
+    cuts.erase(std::ranges::unique(cuts).begin(), std::end(cuts));
+    const auto later_sizes{tc.draw("later_sizes", event_size_lists())};
+
+    const auto seeded{seed(directory.path(), sizes)};
+    const auto pending{make_event(pending_size, 1'000'000U)};
+    const util::const_byte_span pending_span{pending};
+
+    append_flushed(*seeded.storage, pending_span.first(cuts.front()));
+    operations::sender_context reader{
+        std::make_shared<binsrv::null_logger>(),
+        seeded.storage,
+        block_size,
+        std::string_view{},
+        events::magic_binlog_offset,
+        /*session_source_binlog_checksum=*/true};
+
+    const auto before{drain(reader, std::size(seeded.events) + 1U)};
+    require(std::size(before) == std::size(seeded.events) + 1U,
+            "with the last event incomplete, expected the artificial ROTATE "
+            "and the complete stored events only");
+    for (std::size_t index{0U}; index != std::size(seeded.events); ++index) {
+      require(before[index + 1U] == seeded.events[index],
+              "stored event " + std::to_string(index) +
+                  " was not streamed byte for byte");
+    }
+
+    // the remaining pieces but the last one: still no complete event
+    for (std::size_t index{1U}; index != std::size(cuts); ++index) {
+      append_flushed(*seeded.storage,
+                     pending_span.subspan(cuts[index - 1U],
+                                          cuts[index] - cuts[index - 1U]));
+      require(drain(reader, 0U).empty(),
+              "an event was streamed before its last " +
+                  std::to_string(pending_size - cuts[index]) +
+                  " byte(s) were written");
+    }
+
+    // the last piece completes the event, then more events follow
+    append_flushed(*seeded.storage, pending_span.subspan(cuts.back()));
+    std::vector<byte_vector> expected{pending};
+    std::uint32_t id{2'000'000U};
+    for (const auto size : later_sizes) {
+      expected.push_back(make_event(size, id++));
+      append_flushed(*seeded.storage, util::const_byte_span{expected.back()});
+    }
+
+    const auto after{drain(reader, std::size(expected))};
+    require(std::size(after) == std::size(expected),
+            "expected " + std::to_string(std::size(expected)) +
+                " event(s) after the pending event was completed, got " +
+                std::to_string(std::size(after)));
+    for (std::size_t index{0U}; index != std::size(expected); ++index) {
+      require(after[index] == expected[index],
+              "event " + std::to_string(index) +
+                  " after the pending one was completed was not streamed "
+                  "byte for byte");
+    }
+  });
+}
+
+// a binlog that ends in a partial event, followed by the next binlog, is
+// corrupt: the reader streams the complete events, then fails rather than
+// dropping the partial bytes and carrying on with the next file
+BOOST_AUTO_TEST_CASE(PartialEventBeforeRotationFails) {
+  run_property([](hegel::TestCase &tc) {
+    const temp_dir directory;
+    const auto sizes{tc.draw("sizes", event_size_lists())};
+    const auto block_size{tc.draw("block", block_sizes())};
+    const auto truncated_size{
+        tc.draw("truncated_size", splittable_event_sizes())};
+    const auto kept{tc.draw(
+        "kept", gs::integers<std::size_t>(
+                    {.min_value = 1U, .max_value = truncated_size - 1U}))};
+    const auto next_sizes{tc.draw("next_sizes", event_size_lists())};
+
+    const auto seeded{seed(directory.path(), sizes)};
+    const auto truncated{make_event(truncated_size, 1'000'000U)};
+    append_flushed(*seeded.storage, util::const_byte_span{truncated}.first(kept));
+    seeded.storage->close_binlog();
+
+    require(seeded.storage->open_binlog(the_next_binlog) ==
+                binsrv::open_binlog_status::created,
+            "the next binlog was not created");
+    append_flushed(*seeded.storage, util::const_byte_span{make_fde()});
+    std::uint32_t id{2'000'000U};
+    for (const auto size : next_sizes) {
+      append_flushed(*seeded.storage,
+                     util::const_byte_span{make_event(size, id++)});
+    }
+
+    operations::sender_context reader{
+        std::make_shared<binsrv::null_logger>(),
+        seeded.storage,
+        block_size,
+        std::string_view{},
+        events::magic_binlog_offset,
+        /*session_source_binlog_checksum=*/true};
+
+    // the limit leaves room for every event of both files, so a reader that
+    // skips the partial bytes ends at EOF instead of tripping the guard
+    const auto outcome{stream_until_end(
+        reader, std::size(seeded.events) + std::size(next_sizes) + 4U)};
+    require(outcome.failed,
+            "the partial event at the end of the first binlog was dropped and "
+            "streaming went on (" +
+                std::to_string(std::size(outcome.events)) +
+                " event(s) emitted)");
+    require(std::size(outcome.events) == std::size(seeded.events) + 1U,
+            "expected the artificial ROTATE and the complete events of the "
+            "first binlog before the failure, got " +
+                std::to_string(std::size(outcome.events)) + " event(s)");
+    for (std::size_t index{0U}; index != std::size(seeded.events); ++index) {
+      require(outcome.events[index + 1U] == seeded.events[index],
+              "stored event " + std::to_string(index) +
+                  " was not streamed byte for byte");
     }
   });
 }

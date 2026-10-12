@@ -44,6 +44,9 @@
 
 #include <boost/asio/buffer.hpp>
 
+// needed for 'digest_storage'
+#include <boost/container/static_vector.hpp> // IWYU pragma: keep
+
 #define BOOST_TEST_MODULE MinimysqlPropertyTests
 // this include is needed as it provides the 'main()' function
 // NOLINTNEXTLINE(misc-include-cleaner)
@@ -77,7 +80,9 @@
 #include "minimysql/network_io_operations_fwd.hpp"
 
 #include "opensslpp/digest_context.hpp"
+#include "opensslpp/digest_context_fwd.hpp"
 
+#include "util/byte_span.hpp"
 #include "util/byte_span_fwd.hpp"
 
 namespace {
@@ -115,18 +120,19 @@ text_of_size(std::size_t min_size, std::size_t max_size,
 [[nodiscard]] std::string client_scramble(std::string_view password,
                                           std::string_view challenge) {
   const std::string digest{"SHA256"};
-  const auto hashed{opensslpp::digest_context::calculate(digest, password)};
+  const auto hashed{opensslpp::digest_context::calculate(
+      digest, util::as_const_byte_span(password))};
   const auto double_hashed{
       opensslpp::digest_context::calculate(digest, hashed)};
   opensslpp::digest_context salted{digest};
   salted.update(double_hashed);
-  salted.update(challenge);
-  const auto salted_hash{salted.finalize()};
+  salted.update(util::as_const_byte_span(challenge));
+  opensslpp::digest_storage salted_hash(salted.get_digest_size_in_bytes());
+  salted.finalize(salted_hash);
   std::string result(std::size(hashed), '\0');
   for (std::size_t index{0U}; index < std::size(hashed); ++index) {
     result[index] = static_cast<char>(
-        static_cast<std::uint8_t>(hashed[index]) ^
-        static_cast<std::uint8_t>(salted_hash[index]));
+        std::to_integer<std::uint8_t>(hashed[index] ^ salted_hash[index]));
   }
   return result;
 }
@@ -202,7 +208,8 @@ std::ostream &operator<<(std::ostream &output, const credentials &value) {
   const auto server_greeting{context.generate_encoded_server_greeting()};
   const auto capabilities{context.get_server_capabilities()};
   const auto challenge{decode_challenge(server_greeting, capabilities)};
-  require(challenge == context.get_server_auth_method_data(),
+  require(challenge ==
+              util::as_string_view(context.get_server_auth_method_data()),
           "the challenge the client receives differs from the one the server "
           "verifies against");
 

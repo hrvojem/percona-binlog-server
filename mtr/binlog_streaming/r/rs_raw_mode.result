@@ -18,7 +18,6 @@ INSERT INTO t1 VALUES(DEFAULT);
 *** Fetching the source binary logs.
 
 *** Starting Binlog Server Utility in background in pull mode.
-include/read_file_to_var.inc
 
 *** Waiting for the replication source listener port ready to accept
 *** connections.

@@ -217,13 +217,13 @@ struct seeded_storage {
   std::vector<std::uint64_t> offsets;
 };
 
-// writes a single binlog: a real FDE followed by synthetic events of the given
-// sizes, flushed to disk
-[[nodiscard]] seeded_storage seed(const std::filesystem::path &directory,
-                                  const std::vector<std::size_t> &event_sizes) {
-  seeded_storage result{
-      .storage = make_storage(write_config(directory)), .events = {},
-      .offsets = {}};
+// opens a single binlog in 'storage' and writes a real FDE followed by synthetic
+// events of the given sizes, flushed to disk
+[[nodiscard]] seeded_storage
+write_binlog(binsrv::storage_ptr storage,
+             const std::vector<std::size_t> &event_sizes) {
+  seeded_storage result{.storage = std::move(storage), .events = {},
+                        .offsets = {}};
   require(result.storage->open_binlog(the_binlog) ==
               binsrv::open_binlog_status::created,
           "the binlog was not created");
@@ -245,6 +245,25 @@ struct seeded_storage {
     store(make_event(size, id++));
   }
   result.storage->flush_event_buffer();
+  return result;
+}
+
+// a storage with a single binlog (see 'write_binlog()')
+[[nodiscard]] seeded_storage seed(const std::filesystem::path &directory,
+                                  const std::vector<std::size_t> &event_sizes) {
+  return write_binlog(make_storage(write_config(directory)), event_sizes);
+}
+
+// the offset of each event 'write_binlog()' will store for 'event_sizes', FDE
+// first, so a test can pick a position before anything is written
+[[nodiscard]] std::vector<std::uint64_t>
+planned_offsets(const std::vector<std::size_t> &event_sizes) {
+  std::vector<std::uint64_t> result{events::magic_binlog_offset};
+  result.push_back(result.back() + std::size(make_fde()));
+  for (const auto size : event_sizes) {
+    result.push_back(result.back() + size);
+  }
+  result.pop_back(); // the end of the last event is not an event offset
   return result;
 }
 
@@ -654,6 +673,126 @@ BOOST_AUTO_TEST_CASE(PartialEventBeforeRotationFails) {
       require(outcome.events[index + 1U] == seeded.events[index],
               "stored event " + std::to_string(index) +
                   " was not streamed byte for byte");
+    }
+  });
+}
+
+// a replica that connects before PBS has pulled anything (PBS-91) sees EOF,
+// not an error, for as long as the storage stays empty, whether it names the
+// binlog or not; once the binlog is written it is streamed from the beginning
+BOOST_AUTO_TEST_CASE(EmptyStorageIsPolledUntilTheBinlogArrives) {
+  run_property([](hegel::TestCase &tc) {
+    const temp_dir directory;
+    const bool name_specified{tc.draw("name_specified", gs::booleans())};
+    const auto polls{
+        tc.draw("polls", gs::integers<std::size_t>(
+                             {.min_value = 1U, .max_value = 5U}))};
+    const auto sizes{tc.draw("sizes", event_size_lists())};
+    const auto block_size{tc.draw("block", block_sizes())};
+
+    const auto storage{make_storage(write_config(directory.path()))};
+    const std::string binlog_name{name_specified ? the_binlog.str()
+                                                 : std::string{}};
+    operations::sender_context reader{
+        std::make_shared<binsrv::null_logger>(),
+        storage,
+        block_size,
+        binlog_name,
+        events::magic_binlog_offset,
+        /*session_source_binlog_checksum=*/true};
+
+    for (std::size_t poll{0U}; poll != polls; ++poll) {
+      const auto outcome{stream_until_end(reader, 0U)};
+      require(!outcome.failed,
+              "poll " + std::to_string(poll + 1U) +
+                  " of an empty storage failed instead of reporting EOF");
+      require(outcome.events.empty(),
+              "an event was streamed from an empty storage");
+    }
+
+    const auto seeded{write_binlog(storage, sizes)};
+
+    const auto emitted{drain(reader, std::size(seeded.events) + 1U)};
+    require(std::size(emitted) == std::size(seeded.events) + 1U,
+            "expected an artificial ROTATE followed by every stored event, "
+            "got " +
+                std::to_string(std::size(emitted)) + " event(s)");
+    require(header_of(emitted.front()).get_type_code() == code_type::rotate,
+            "the first emitted event must be a ROTATE");
+    require(rotate_position(emitted.front()) == events::magic_binlog_offset,
+            "a from-beginning ROTATE must point at the magic offset");
+    for (std::size_t index{0U}; index != std::size(seeded.events); ++index) {
+      require(emitted[index + 1U] == seeded.events[index],
+              "stored event " + std::to_string(index) +
+                  " was not streamed byte for byte");
+    }
+  });
+}
+
+// the same for a replica resuming from a position in the binlog it names:
+// EOF while the storage is empty, then the artificial ROTATE and FDE and the
+// events from that position once the binlog is written (the PBS-91 commit
+// treats an empty storage as "not yet", so that a blocking client can poll
+// until the requested binlog becomes available)
+BOOST_AUTO_TEST_CASE(EmptyStorageIsPolledUntilTheBinlogArrivesFromPosition) {
+  run_property([](hegel::TestCase &tc) {
+    const temp_dir directory;
+    const auto polls{
+        tc.draw("polls", gs::integers<std::size_t>(
+                             {.min_value = 1U, .max_value = 5U}))};
+    // at least one synthetic event, so there is a non-beginning boundary
+    auto sizes{tc.draw("sizes", event_size_lists())};
+    if (sizes.empty()) {
+      sizes.push_back(events::common_header_view_base::size_in_bytes);
+    }
+    const auto block_size{tc.draw("block", block_sizes())};
+    const auto offsets{planned_offsets(sizes)};
+    // index 0 is the FDE, which is the from-beginning case
+    const auto resume_index{tc.draw(
+        "resume",
+        gs::integers<std::size_t>({.min_value = 1U,
+                                   .max_value = std::size(offsets) - 1U}))};
+    const auto resume_position{offsets[resume_index]};
+
+    const auto storage{make_storage(write_config(directory.path()))};
+    operations::sender_context reader{
+        std::make_shared<binsrv::null_logger>(),
+        storage,
+        block_size,
+        the_binlog.str(),
+        resume_position,
+        /*session_source_binlog_checksum=*/true};
+
+    for (std::size_t poll{0U}; poll != polls; ++poll) {
+      const auto outcome{stream_until_end(reader, 0U)};
+      require(!outcome.failed,
+              "poll " + std::to_string(poll + 1U) +
+                  " of an empty storage, resuming at position " +
+                  std::to_string(resume_position) +
+                  ", failed instead of reporting EOF");
+      require(outcome.events.empty(),
+              "an event was streamed from an empty storage");
+    }
+
+    const auto seeded{write_binlog(storage, sizes)};
+    require(seeded.offsets == offsets,
+            "the binlog was not laid out as planned");
+
+    const auto remaining{std::size(seeded.events) - resume_index};
+    const auto emitted{drain(reader, remaining + 2U)};
+    require(std::size(emitted) == remaining + 2U,
+            "expected an artificial ROTATE and FDE then the remaining "
+            "events, got " +
+                std::to_string(std::size(emitted)) + " event(s)");
+    require(rotate_position(emitted[0U]) == resume_position,
+            "a from-position ROTATE must carry the requested position");
+    require(header_of(emitted[1U]).get_type_code() ==
+                code_type::format_description,
+            "the event after the ROTATE must be a FORMAT_DESCRIPTION");
+    for (std::size_t index{0U}; index != remaining; ++index) {
+      require(emitted[index + 2U] == seeded.events[resume_index + index],
+              "stored event " + std::to_string(resume_index + index) +
+                  " was not streamed byte for byte from the position");
     }
   });
 }

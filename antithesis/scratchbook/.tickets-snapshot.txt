@@ -1,0 +1,1452 @@
+
+Binlog Server Bug Tickets
+
+    Percona Binlog Server · QA findings
+
+    Binlog Server Bug Tickets
+
+    Twenty-six draft tickets from a QA pass over percona-binlog-server, found by code review, new Hegel property-based tests, a randomized crash test against a real server, new MTR tests, the first test runs on S3 storage, file system and network fault injection, and clients of the replication source. Twenty-three are open; three have been fixed upstream. Each ticket has buttons to copy its summary and description into Jira.
+
+      Code: upstream main @ ee82afa (ticket 26: fd8a2d5)
+
+      Drafted: 2026-09-29
+
+      Status updated: 2026-10-13
+
+      Tickets: drafts, not filed (ticket 26: PBS-96)
+
+    Overview
+
+        #TicketPriorityStatusReached through
+
+          1FORMAT_DESCRIPTION event with an unparsable server version terminates the utilityHighOpenAny fetch / pull from a server sending a non-standard version string
+
+          2Storage checkpointing settings are ignoredHighFixed upstreamEvery fetch / pull with checkpoint_size or checkpoint_interval set
+
+          3gtid_set does not validate GNO boundsMediumOpensearch_by_gtid_set, PREVIOUS_GTIDS_LOG events
+
+          4Boost.ICL interval sets give wrong results with Apple clangMediumOpenmacOS builds with Apple clang and system libc++
+
+          5Oversized GTID tag reported as bad_allocLowOpenGTID_TAGGED_LOG and PREVIOUS_GTIDS_LOG events
+
+          6Closing a binlog mid-transaction leaves stale timestampsLowOpenLatent: not reached by the current collector call order
+
+          7indexed_event_block loops forever on an event size below 19 bytesMediumOpenCOM_BINLOG_DUMP (pull mode) reading a corrupted binlog file from storage
+
+          8CTR offset counter does not carry into the upper half of the IVLowOpenEncrypted storage, when a file's random IV is close to the 64-bit counter limit
+
+          9Purging while fetch / pull runs leaves a storage that cannot be openedHighOpenRunning purge_binlogs while fetch / pull is running, followed by a binlog rotation (filesystem and S3 storage)
+
+          10Binlog events of 16 MB or more cannot be sent to replicasHighOpenAny replica dumping a binlog through pull mode that contains an event of 16,777,211 bytes or more
+
+          11search_by_timestamp accepts out-of-range times and searches a different point in timeMediumOpensearch_by_timestamp with a mistyped time
+
+          12file:// storage URI with %00 in the path opens a different directoryLowOpenA storage.uri containing an encoded NUL character
+
+          13A storage with an empty binlog index crashes the utility with a segmentation faultMediumOpensearch_by_timestamp, search_by_gtid_set and fetch / pull on a damaged storage
+
+          14Resuming in GTID mode after a binlog rotation loses the closing ROTATE event and skips binlogs without transactionsMediumOpenfetch / pull in GTID mode, when the source rotates its binlog while the Binlog Server is caught up or disconnected
+
+          15A crash while a new binlog is being created leaves a storage that cannot be openedHighOpenfetch / pull killed or crashing at a binlog rotation, or failing to store binlog.index (full disk, S3 errors)
+
+          16Every start with S3 storage outside EC2 waits about 6 seconds for the EC2 metadata serviceLowOpenEvery operation mode with an S3 storage backend, on hosts outside AWS EC2
+
+          17With checkpointing, the S3 backend uploads each binlog again in full at every checkpointHighOpenfetch / pull with S3 storage and checkpoint_size or checkpoint_interval set
+
+          18After a failed storage write, the same binlog data is written twice; if the metadata write failed, the duplicate is permanentHighOpenA failed metadata or data write (full disk, I/O error, S3 outage or throttling), at the end of fetch / pull
+
+          19Binlog data is never synced to disk while its metadata is; after a power loss the storage cannot be openedHighOpenFilesystem storage, power loss or kernel crash while fetch / pull writes
+
+          20MySQL replicas cannot replicate from the replication source of pull modeHighOpenAny MySQL 8.0 / 8.4 replica (position or GTID auto-position) pointed at pull
+
+          21The replication source ignores the requested binlog and position and always streams from the first binlogHighFixed upstreamAny client of pull that starts after the first stored binlog, e.g. mysqlbinlog for point-in-time recovery
+
+          22mysqlbinlog --raw cannot copy binlogs from the replication sourceMediumFixed upstreamBinlog backups with mysqlbinlog --read-from-remote-server --raw from pull
+
+          23fetch and pull cannot authenticate without SSL as a caching_sha2_password userMediumOpenconnection.ssl.mode = disabled with any password user on MySQL 8.x, the only way on 9.x
+
+          24Two fetch instances on one storage corrupt it; there is no cross-process lockHighOpenTwo fetch processes on one storage, e.g. a cron fetch overrunning into the next run
+
+          25A storage does not record its source, so a reset source wedges it and a different source silently corrupts itHighOpenRESET BINARY LOGS on the source, or pointing fetch at a different server (a failover), against an existing storage
+
+          26A client resuming from a position is disconnected when it connects before PBS has pulled anything (PBS-96)MediumOpenCOM_BINLOG_DUMP to pull at a position other than 4, while the storage is still empty (PBS just started)
+
+        Ticket 1 · Bug · binsrv/events
+
+        FORMAT_DESCRIPTION event with an unparsable server version terminates the utility
+
+        StatusOpen
+PriorityHigh
+Componentbinsrv/events
+
+      Copy summaryCopy description
+
+      Summary
+
+      generic_post_header_impl<code_type::format_description>::get_encoded_server_version() is declared noexcept, but it parses the server version string received from the network with util::semantic_version, which throws std::invalid_argument on anything that isn't major.minor.patch (an optional -suffix is stripped first). An exception escaping a noexcept function calls std::terminate, so the whole process aborts.
+
+      Where it happens
+
+        The FORMAT_DESCRIPTION post header parser calls it while parsing (format_description_post_header_impl.cpp:130).
+
+        reader_context calls it when processing the event (reader_context.cpp:646), reached from collector_context.cpp:442 for every received event.
+
+        calculate_encoded_size() (also noexcept), encode_to() and operator<< call it too.
+
+      Reproduction
+
+      Parse a FORMAT_DESCRIPTION event whose server version field is one of:
+
+        8.0.36_custom: terminates (server_version "patch" component is not a numeric value)
+
+        8.0.300: terminates (the patch value overflows uint8)
+
+        8.0.36.1: terminates (server_version has more than 3 components)
+
+        8.0.36-28 (Percona Server style): parsed, because the suffix is stripped
+
+      User impact
+
+        fetch and pull abort mid-stream with SIGABRT: no graceful shutdown, no final flush of buffered events.
+
+        Combined with ticket 2, everything received for the current binlog since the last rotation is lost.
+
+        Can be triggered by any source whose version string is not strictly numeric, or by a malicious or broken peer.
+
+      Expected behaviour
+
+      An unparsable server version is rejected with std::invalid_argument, and the utility exits with its normal error handling (exit code 1).
+
+      Suggested fix
+
+      Parse and validate the version once in the constructor that reads the event (throwing std::invalid_argument there) and store the encoded value, so the accessors really cannot throw. At minimum, remove noexcept from get_encoded_server_version() and calculate_encoded_size().
+
+      Tests
+
+        MTR: binlog_streaming.fde_invalid_server_version patches the server version in a closed binlog on the source server and expects fetch to exit with 1. Today the utility aborts (exit 134).
+
+        Property tests (tests/event_property_test.cpp): EventParsingOfCorruptedEventsFailsCleanly, EventPrintingOfCorruptedEventsFailsCleanly.
+
+      Verified by a standalone program built from the project sources (Homebrew LLVM 21, Boost 1.90). Confirmed on Linux (Ubuntu 24.04, GCC 14): the event property test aborts with this exception under ASAN, and the MTR test fde_invalid_server_version fails on MySQL 8.0.45 and 8.4.8 with terminate called … server_version "patch" component is not a numeric value and exit code 134. Still open on upstream main @ ee82afa.
+
+        Ticket 2 · Bug · regression · binsrv/storage
+
+        Storage checkpointing settings are ignored
+
+        StatusFixed upstream in 3804c25 (PS-69, #198)
+PriorityHigh
+Componentbinsrv/storage
+Introduced in7f8cb69 (#189)
+
+      Copy summaryCopy description
+
+      Summary
+
+      storage.checkpoint_size and storage.checkpoint_interval have no effect. binsrv::storage never copies them from the configuration into checkpoint_size_bytes_ and checkpoint_interval_seconds_, which keep their default value of zero. So size_checkpointing_enabled() and interval_checkpointing_enabled() (storage.hpp:148-155) always return false, and the flush check in storage::write_event() (storage.cpp:170-185) never fires.
+
+      Cause
+
+      Commit 7f8cb69 ("Rework storage layer abstractions to support simultaneous reads and writes (part 2)", #189) moved the constructor logic into storage_core::storage_core but dropped this block. The checkpoint fields stayed in storage:
+
+const auto &checkpoint_size_opt{storage_config.get<"checkpoint_size">()};
+if (checkpoint_size_opt.has_value()) {
+  checkpoint_size_bytes_ = checkpoint_size_opt->get_value();
+}
+const auto &checkpoint_interval_opt{storage_config.get<"checkpoint_interval">()};
+if (checkpoint_interval_opt.has_value()) {
+  checkpoint_interval_seconds_ =
+      std::chrono::seconds{checkpoint_interval_opt->get_value()};
+}
+
+      User impact
+
+        Data reaches the storage backend only when a binlog file is closed (rotation) or the utility shuts down.
+
+        S3 storage keeps each whole binlog file in memory until rotation.
+
+        After a crash or kill -9, the whole current binlog is lost, not just the data since the last checkpoint.
+
+        In pull mode, replicas connected through COM_BINLOG_DUMP cannot see the current binlog until it rotates.
+
+        The startup log still prints the configured values (logger_helpers.cpp:190-193), so the problem is invisible.
+
+      Why tests did not catch it
+
+      mtr/binlog_streaming/t/checkpointing.test sets the options, runs fetch and checks only the final result, which is the same with or without checkpoints.
+
+      Expected behaviour
+
+      With checkpoint_size = S, committed data not yet on the backend never exceeds about S plus one transaction. With checkpoint_interval = T, buffered complete transactions are flushed on the first event after T has passed.
+
+      Suggested fix
+
+        Restore the block above in storage::storage (storage.cpp:47), reading config.root().get<"storage">().
+
+        Extend checkpointing.test to check that the current binlog grows on the backend before rotation.
+
+      Resolution
+
+      Fixed upstream in 3804c25 ("PS-69 fix: Storage checkpointing settings are ignored (#198)"), which restores the block above in the storage constructor.
+
+      Tests
+
+        tests/storage_property_test.cpp: StorageRespectsCheckpointSize requires that complete transactions not yet on disk stay below checkpoint_size. It failed on every run before the fix (shrinking to a single 64-byte transaction with checkpoint_size 64) and passes after it.
+
+        extra/qa/repro_broken_checkpointing.py runs pull against a source and compares the source position with the on-disk file size (not run against a server).
+
+        checkpointing.test still checks only the final result; extending it to check for flushes before rotation is still worth doing.
+
+      Verified by the storage property test, failing before the fix and passing after it, on macOS (Homebrew LLVM 21) and on Linux (GCC 14, debug and ASAN builds).
+
+        Ticket 3 · Bug · binsrv/gtids
+
+        gtid_set does not validate GNO bounds (parser overflow, interval bounds, binary decoder)
+
+        StatusOpen
+PriorityMedium
+Componentbinsrv/gtids
+
+      Copy summaryCopy description
+
+      Summary
+
+      binsrv::gtids::gtid_set accepts GNOs outside the valid range [1, 9223372036854775807] (INT64_MAX, as in MySQL Server) in several places, and can end up holding values it cannot print and parse back.
+
+      Issues
+
+        GNO overflow in the text parser. parse_gno() has no overflow check (see its // TODO: add overflow checks), so values wrap: uuid:100000000000000000000 becomes GNO 7766279631452241920, and uuid:18446744073709551617 (2^64 + 1) becomes GNO 1.
+
+        add_interval() doesn't check the upper bound. Only the lower bound is validated. add_interval(u, tag, 1, 9223372036854775808) is accepted. With UINT64_MAX, upper + 1 wraps to 0 and leaves an empty entry, so is_empty() returns false for a set with no GTIDs.
+
+        subtract_interval() with an upper bound of UINT64_MAX removes nothing, because of the same wraparound. It's public API, though nothing in production calls it.
+
+        The binary decoder accepts sets it can't represent as text. process_intervals() only checks upper <= lower. A TSID with zero ranges (the entry is created before ranges are read), a nil UUID, or a range starting at GNO 0 is accepted, and the resulting str() fails to parse back (cannot parse GTID set).
+
+      User impact
+
+        search_by_gtid_set gives wrong answers instead of a parse error. Searching for <server_uuid>:18446744073709551617 succeeds and returns the binlog containing GNO 1.
+
+        GTID sets are persisted in storage metadata as text (boost::lexical_cast through operator<< and operator>>). A set that cannot be parsed back from its own text could make the storage unreadable on the next start.
+
+      Expected behaviour
+
+        Text parsing rejects any GNO outside [1, max_gno], including values that overflow 64 bits, with std::invalid_argument.
+
+        add_interval() validates both bounds.
+
+        subtract_interval() handles UINT64_MAX without wrapping around, either by rejecting it or by clamping it to max_gno.
+
+        The binary decoder rejects zero-range TSIDs, nil UUIDs and ranges outside [1, max_gno + 1).
+
+      Tests
+
+        Property tests (tests/gtid_set_property_test.cpp, -DWITH_PROPERTY_TESTS=ON): GtidSetParseRejectsOutOfRangeGno, GtidSetAddIntervalRejectsOutOfRangeUpperBound, GtidSetSubtractIntervalBeyondMaxGnoRemovesTail, GtidSetDecodedFromBinaryIsPrintable.
+
+        MTR: binlog_streaming.search_by_gtid_set_gno_range covers issues 1 and 2 through the command line.
+
+      Verified by property tests and standalone programs (Homebrew LLVM 21, Boost 1.90) and by reading the code. Confirmed on Linux (Ubuntu 24.04, GCC 14, debug and ASAN builds) with the same four failing properties. The MTR test search_by_gtid_set_gno_range fails on MySQL 8.0.45 and 8.4.8 at case 4: <server_uuid>:18446744073709551617 is accepted and the command exits 0. Still open on upstream main @ ee82afa.
+
+        Ticket 4 · Bug · build platform
+
+        Boost.ICL interval sets give wrong results with Apple clang and system libc++
+
+        StatusOpen
+PriorityMedium
+Componentbuild, binsrv/gtids
+
+      Copy summaryCopy description
+
+      Summary
+
+      Built with Apple clang 21 (clang-2100.3.34.2) and Apple's system libc++, boost::icl::interval_set<std::uint64_t> (Boost 1.90, default std::set backend) merges and subtracts ranges incorrectly. gtid_set is built on it, so GTID sets are wrong in these builds.
+
+      Reproduction (Boost.ICL only)
+
+#include <cstdint>
+#include <iostream>
+#include <boost/icl/interval_set.hpp>
+int main() {
+  using icl_set = boost::icl::interval_set<std::uint64_t>;
+  using iv = icl_set::interval_type;
+  icl_set s;
+  s += iv::right_open(3, 4); s += iv::right_open(1, 2); s += iv::right_open(1, 4);
+  std::cout << boost::icl::interval_count(s) << " (expected 1)\n";
+}
+
+        Apple clang with system libc++ prints 2, with -std=c++17, c++20 and c++23, at -O0 and -O1.
+
+        Subtracting [1, 4) from {[1, 2), [3, 4)} leaves [3, 4).
+
+        Homebrew LLVM 21 with its own libc++ prints 1 (correct).
+
+        Apple clang with -DICL_USE_BOOST_MOVE_IMPLEMENTATION prints 1 (correct).
+
+      Effect on gtid_set
+
+        Adding 3, then 1, then the range 1-3 gives uuid:1:1-3, which is not equal to its own parsed text.
+
+        {1, 3} minus the range 1-3 leaves {3}.
+
+      Notes
+
+      Apple clang isn't in the README's supported toolchains (clang 15–20, gcc 12–14), but CMakeLists.txt sets up macOS builds and defaults to libc++ on Darwin. Linux with GCC 14 and libstdc++ is not affected: the model-based properties pass there in debug and ASAN builds. The clang20 presets (libc++) have not been checked.
+
+      Suggested fix
+
+      Define ICL_USE_BOOST_MOVE_IMPLEMENTATION for all targets using Boost.ICL, so ICL uses its boost::container backend on every toolchain. Optionally report upstream.
+
+      Tests
+
+      The model-based properties in tests/gtid_set_property_test.cpp catch this in about 4 of 5 fresh runs at the default 100 cases: GtidSetOperationsMatchModel, GtidSetUnionMatchesModel, GtidSetDifferenceMatchesModel, GtidSetLexicalCastRoundTrip.
+
+      Verified on macOS with Apple clang 21 and system libc++. Correct with Homebrew LLVM 21 and with Linux GCC 14.
+
+        Ticket 5 · Bug · binsrv/events, binsrv/gtids
+
+        Oversized GTID tag in event data is reported as bad_alloc
+
+        StatusOpen
+PriorityLow
+Componentbinsrv/events, binsrv/gtids
+
+      Copy summaryCopy description
+
+      Summary
+
+      Two parsers use a tag length read from the wire to resize fixed 32-byte storage (tag_storage, a boost::container::static_vector<std::byte, 32>) without checking it. For lengths above 32, resize() throws boost::container::bad_alloc instead of the parsers' usual "invalid data" error:
+
+        the GTID_TAGGED_LOG body parser (gtid_tagged_log_body_impl.cpp, field_id_type::tag in process_field_data());
+
+        the GTID set binary decoder (gtid_set.cpp, tag_parser), used for tagged PREVIOUS_GTIDS_LOG bodies.
+
+      Where it happens
+
+        Case 1: any fetch or pull receiving the event, because reader_context parses the body (reader_context.cpp:978).
+
+        Case 2: when events are logged at debug level or lower, because the collector builds and prints every event (collector_context.cpp:458), which decodes the GTID set.
+
+      Current and expected behaviour
+
+        Current: fetch exits with 1 and logs std::exception caught: boost::container::bad_alloc thrown, which points at an out-of-memory condition rather than corrupted input. boost::container::bad_alloc does not derive from std::bad_alloc.
+
+        Expected: check the length against tag_max_length (32) before resizing and raise std::invalid_argument with a clear message, like the other length checks in these parsers.
+
+      Tests
+
+        Property tests (tests/event_property_test.cpp): EventParsingOfCorruptedEventsFailsCleanly, EventPrintingOfCorruptedEventsFailsCleanly.
+
+        MTR (8.4 only): binlog_streaming.gtid_tagged_log_oversized_tag and binlog_streaming.previous_gtids_log_oversized_tag patch the tag length in a closed binlog on the source server and assert that the utility log contains no bad_alloc.
+
+      Verified by property tests, and by patching a binlog file generated with the project's own encoder and parsing it with the project's parser. Both MTR tests fail as expected on MySQL 8.4.8 (fetch exits with 1, but the utility log contains bad_alloc) and are skipped on 8.0.45. Still open on upstream main @ ee82afa.
+
+        Ticket 6 · Bug · binsrv/storage
+
+        Closing a binlog in the middle of a transaction leaves stale timestamps in storage
+
+        StatusOpen
+PriorityLow
+Componentbinsrv/storage
+
+      Copy summaryCopy description
+
+      Summary
+
+      storage::close_binlog() (storage.cpp:188) drops the events of an incomplete transaction (event_buffer_.clear()) but not their timestamps: incomplete_transaction_timestamps_ keeps them. storage::open_binlog() asserts that this range is empty (storage.cpp:122).
+
+      Behaviour
+
+        Debug builds: close_binlog() followed by open_binlog() with an incomplete transaction still buffered aborts on the assertion.
+
+        Release builds (NDEBUG): the stale timestamps are carried into the next binlog. They are added to the first complete transaction written there and end up in that binlog's metadata.
+
+      Reproduction (release build)
+
+        Open binlog.000001 and write one event with timestamp 1000 that is not at a transaction boundary.
+
+        close_binlog(), then open binlog.000002.
+
+        Write one complete transaction with timestamp 5000, then close_binlog().
+
+      The record of binlog.000002 has timestamps min=1000 max=5000; expected min=5000 max=5000.
+
+      Impact
+
+      Latent today. The collector only closes a binlog at a transaction boundary (ROTATE / STOP events) or after calling discard_incomplete_transaction_events() on a disconnect (collector_context.cpp:195). If a future caller closes a binlog mid-transaction, binlog timestamp ranges would be wrong, and search_by_timestamp uses them to pick binlog files.
+
+      Suggested fix
+
+      Make close_binlog() leave no incomplete-transaction state behind: clear incomplete_transaction_timestamps_ (and reset incomplete_transaction_last_sequence_number_ to ready_to_flush_last_sequence_number_), as discard_incomplete_transaction_events() does. Alternatively, document and enforce that callers must discard first.
+
+      Tests
+
+      tests/storage_property_test.cpp (StorageMatchesModel) found it by rotating a binlog while a transaction was incomplete. The test currently discards before rotating, like the collector; after the fix, that discard can be removed so the property covers this case.
+
+      Verified with a standalone program linking the project's storage code, with storage.cpp built with NDEBUG (Homebrew LLVM 21). close_binlog() is unchanged on upstream main @ ee82afa.
+
+        Ticket 7 · Bug · binsrv/storage (replication source)
+
+        indexed_event_block loops forever on an event size field below the common header size
+
+        StatusOpen
+PriorityMedium
+Componentbinsrv (indexed_event_block), COM_BINLOG_DUMP
+
+      Copy summaryCopy description
+
+      Summary
+
+      The binsrv::indexed_event_block constructor splits a block of bytes read from a binlog file into events, using the event_size field of each common header. It does not check that the size is at least the common header size (19 bytes); it only asserts it (indexed_event_block.cpp:43) and then advances by that size.
+
+      Behaviour
+
+        Debug builds: the assertion aborts the process.
+
+        Release builds (NDEBUG, which the release_* presets define): the loop never ends and keeps adding index records until memory runs out. With a size of 0 the offset never advances. With a size between 1 and 18 the loop lands in the middle of an event, where it typically reads a size of 0 and stops advancing.
+
+      Reproduction (release build)
+
+      A 38-byte buffer holding two events with type code 2 (query), the second one with event_size 19:
+
+        first event event_size 19: both events indexed, actual size 38 (correct);
+
+        first event event_size 5: still running after 10 s;
+
+        first event event_size 0: still running after 10 s.
+
+      Impact
+
+      In pull mode, operations::sender_context uses indexed_event_block for every block it reads from storage to serve COM_BINLOG_DUMP. A single corrupted or garbage event_size field in a binlog file (for example after disk corruption or a damaged object in S3) hangs that replica's session, consuming CPU and memory without limit, instead of reporting a corrupt binlog.
+
+      Expected behaviour
+
+      An event size smaller than the common header size is treated as invalid data: the constructor raises std::invalid_argument (or stops indexing and lets the caller report corruption), like the other checks on data read from storage.
+
+      Suggested fix
+
+      Replace the assertion at indexed_event_block.cpp:43 with a check that rejects event_size < events::common_header_view_base::size_in_bytes.
+
+      Tests
+
+        Property test tests/indexed_event_block_property_test.cpp (IndexedEventBlockIndexesOnlyCompleteEvents): for buffers built from event-like chunks (valid and invalid type codes, matching and mismatching size fields, trailing bytes), the indexer must either reject the input cleanly or index only complete events that match the bytes. It hits the assertion in every run.
+
+        The read path as a whole is covered by StorageReadBackMatchesDisk in tests/storage_property_test.cpp, which passes.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14): the property test with the debug_gcc14 preset, and the release behaviour with a standalone program built with -DNDEBUG.
+
+        Ticket 8 · Bug · opensslpp (binlog encryption)
+
+        cipher_context::create_with_offset() does not carry the CTR counter into the upper half of the IV
+
+        StatusOpen
+PriorityLow
+Componentopensslpp, binsrv/storage (encryption)
+
+      Copy summaryCopy description
+
+      Summary
+
+      opensslpp::cipher_context::create_with_offset() starts an AES-CTR key stream in the middle of a binlog file. It treats only the last 8 bytes of the 16-byte IV as the counter and adds offset / 16 to them as a 64-bit value, with no carry into the first 8 bytes (cipher_context.cpp, counter += offset / block_size). OpenSSL's CTR mode increments the whole 128-bit IV, so when the last 8 bytes overflow, the two produce different key streams.
+
+      Reproduction
+
+      OpenSSL's own CTR mode carries. Key 000102030405060708090a0b0c0d0e0f, IV 0000000000000000ffffffffffffffff, 32 zero bytes encrypted with openssl enc -aes-128-ctr:
+
+        second block: 13189a6ae4ab07ae70a3aabd30be99de;
+
+        AES-ECB of counter 00000000000000010000000000000000 (with carry): 13189a6ae4ab07ae70a3aabd30be99de, a match;
+
+        AES-ECB of counter 00000000000000000000000000000000 (no carry, what create_with_offset() computes): c6a13b37878f5b826f4f8162a1c8d879.
+
+      The property test finds it in every run, shrinking to cases such as IV 0000000000000000ffffffffffff3bc9 at offset 1099511627544.
+
+      Impact
+
+      Storage encrypts with create_with_offset() for writes and reads at non-zero offsets, but a single write or read is processed by OpenSSL, which carries within it. If a binlog file's counter crosses the 64-bit limit inside one write, the data after the crossing is encrypted with the carried counter, while a later read starting after the crossing uses the non-carried one and returns garbage. External tools that decrypt the file sequentially would disagree in the same way.
+
+      The IV is random for every file, so this needs the last 8 bytes of the IV to be within the file's length (in 16-byte blocks) of 264: about a 1 in 238 chance for a 1 GB file. Rare, but silent data corruption when it happens.
+
+      Suggested fix
+
+      Add offset / block_size to the IV as a 128-bit big-endian number, carrying from the last 8 bytes into the first 8.
+
+      Tests
+
+        tests/cipher_context_property_test.cpp: CipherContextOffsetMatchesCounterReference compares create_with_offset() with an independent reference (AES-ECB of a 128-bit counter) for generated IVs and offsets. It fails in every run today.
+
+        The same file checks that encrypting in pieces equals encrypting in one call, and that decrypting from offsets round-trips (both pass), and tests/storage_property_test.cpp now also runs on encrypted storage.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14, OpenSSL 3.0.13) with the property test, and with the openssl command-line tool for OpenSSL's own carry behaviour.
+
+        Ticket 9 · Bug · binsrv/storage
+
+        Running purge_binlogs while fetch / pull is running leaves a storage that cannot be opened
+
+        StatusOpen
+PriorityHigh
+Componentbinsrv/storage (filesystem and S3 backends), purge_binlogs
+
+      Copy summaryCopy description
+
+      Summary
+
+      A streaming storage (fetch / pull) loads binlog.index only once, when it is created (storage_core.cpp:214), and keeps the list of binlogs in memory. purge_binlogs runs as a separate process: it rewrites binlog.index without the purged binlogs and deletes their data and metadata files. Nothing tells the running process about it. When the running process next creates a binlog (on rotation), it rewrites binlog.index from its stale in-memory list (storage_core.cpp:692), adding the purged binlogs back.
+
+      The logic is in storage_core, shared by both storage backends, and the bug reproduces the same way on the filesystem and on S3.
+
+      Reproduction
+
+        A streaming storage holds binlog.000001 and binlog.000002.
+
+        Another storage instance in purging mode (as purge_binlogs config.json binlog.000001 does) purges binlog.000001: the index now lists only binlog.000002 and the files are deleted.
+
+        The streaming storage rotates to binlog.000003 and rewrites binlog.index with binlog.000001, binlog.000002 and binlog.000003.
+
+        Opening the storage again fails with binlog index contains a reference to a non-existing object.
+
+      Impact
+
+        After an operator purges binlogs during normal operation, the next binlog rotation on the source makes the storage unopenable: binlog_server cannot be restarted (in any mode) until binlog.index is repaired by hand.
+
+        The running process does not notice. In pull mode its binlog list still includes the deleted binlogs, so replicas reading from the beginning are directed to files that no longer exist.
+
+        The README documents purge_binlogs as a normal operation and only forbids purging the binlog currently being written, so operators have no reason to stop fetch / pull first.
+
+      Expected behaviour
+
+      Purging while fetch / pull is running either works (the running process stops listing the purged binlogs and never writes them back to the index), or is refused with a clear error.
+
+      Suggested fix
+
+        Re-read binlog.index (or merge with it) in the streaming process before rewriting it, and drop purged binlogs from its in-memory list; or
+
+        coordinate the two processes (for example a lock object in the storage that purge_binlogs must take, or a notification to the running process); or, at minimum,
+
+        make purge_binlogs refuse to run while another process is streaming into the storage, and document that in the README.
+
+      Tests
+
+      tests/storage_property_test.cpp: StoragePurgeKeepsStorageReopenable purges generated prefixes of the binlogs through a second storage instance in purging mode, and after every operation requires a copy of the storage directory to open and hold exactly the remaining binlogs. It fails in every run today, shrinking to rotate, purge(1), rotate.
+
+      The same property on the S3 backend (StoragePurgeKeepsStorageReopenableOnS3, run against an S3-compatible server) fails with the same error, binlog index contains a reference to a non-existing object, after 11 test cases. At the default 20 cases for S3 it can pass by chance: the filesystem run needed 67 cases.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14) with the property test. The two storage instances in the test share nothing but the files on disk, the same as separate pull and purge_binlogs processes. Confirmed on the S3 backend against Versity S3 Gateway 1.8.0 with StoragePurgeKeepsStorageReopenableOnS3 at 100 test cases. Open on upstream main @ ee82afa.
+
+        Ticket 10 · Bug · minimysql (replication source)
+
+        Binlog events of 16 MB or more cannot be sent to replicas in pull mode
+
+        StatusOpen
+PriorityHigh
+Componentminimysql (connection_context, network_io_operations)
+
+      Copy summaryCopy description
+
+      Summary
+
+      The MySQL protocol limits a packet payload to 0xFFFFFF (16,777,215) bytes: larger payloads are split into several packets, and a payload whose length is an exact multiple of 0xFFFFFF is followed by an empty packet. The replication source listener does neither:
+
+        minimysql::connection_context::generate_encoded_binlog_event() always writes one packet with a 3-byte length of event size + 1 (the extra byte is the OK marker), so the length wraps around past 0xFFFFFF and no closing empty packet is sent;
+
+        minimysql::async_write_mysql_frame() rejects any buffer of 16 MiB or more (frame payload size too large to send), so the session ends before such an event is sent.
+
+      What the encoder produces
+
+        event of 16,777,213 bytes: one packet, correct;
+
+        event of 16,777,214 bytes: one packet of 0xFFFFFF bytes and no closing empty packet, so a client waits for a packet that never comes;
+
+        event of 16,777,215 bytes: the header length is 0;
+
+        event of 16,777,216 bytes: the header length is 1;
+
+        event of 20,000,000 bytes: the header length is 3,222,785, and the rest of the event is read as further packets.
+
+      Impact
+
+      In pull mode, once a replica reaches a binlog event of about 16 MB or more (16,777,211 bytes, where the frame including its header reaches 16 MiB), the write is rejected and the session ends (confirmed end to end, see below). The replica reconnects, asks for the same position and fails again, so replication stops permanently at that event. MySQL allows events up to 1 GB (max_allowed_packet); a single row with a large LONGBLOB, LONGTEXT or JSON value produces such an event. The existing MTR test rs_large_event uses a 1.5 MB event, below the limit.
+
+      Expected behaviour
+
+      Events of any size up to the MySQL limit are sent as the MySQL server sends them: split into packets of at most 0xFFFFFF bytes with consecutive sequence numbers, followed by an empty packet when the payload length is an exact multiple of 0xFFFFFF.
+
+      Suggested fix
+
+        Split the payload in generate_encoded_binlog_event() (or in a shared helper used for all server packets) into packets of at most 0xFFFFFF bytes, adding the closing empty packet when needed.
+
+        Let async_write_mysql_frame() send such multi-packet buffers instead of rejecting buffers of 16 MiB or more (limit by the configured maximum event size instead).
+
+      Tests
+
+        tests/minimysql_property_test.cpp: MinimysqlBinlogEventFramesRoundTrip encodes events of generated sizes (small, around 0xFFFFFF, and up to two packets) and reassembles them as a MySQL client does. It fails in every run today, shrinking to an event of 16,777,214 bytes.
+
+        MTR: binlog_streaming.rs_huge_event, a copy of upstream's rs_large_event with a 20 MB LONGBLOB value instead of 1.5 MB, dumps the binlog through pull with mysqlbinlog --read-from-remote-server, replays the dump and compares the row. It fails today and should pass after the fix.
+
+      End-to-end result
+
+      With rs_huge_event on MySQL 8.0.45 and 8.4.8 (upstream's 1.5 MB rs_large_event passes on both as a control), mysqlbinlog stops at the large row event with:
+
+ERROR: Got error reading packet from server: Lost connection to MySQL server during query
+WARNING: The range of printed events ends with a row event or a table map event that does not have the STMT_END_F flag set. ...
+
+      The dump ends after about 4.4 KB, before the 20 MB row, and the Binlog Server utility logs for that session:
+
+[error] net    : system error caught in session 127.0.0.1:35838: system:90
+  frame payload size too large to send: Message too long [system:90]
+
+      Verified on Linux (Ubuntu 24.04, GCC 14) with the property test, a standalone program printing the encoded headers, and end to end with the MTR test rs_huge_event on MySQL 8.0.45 and 8.4.8. Open on upstream main @ ee82afa.
+
+        Ticket 11 · Bug · util (ctime_timestamp), search_by_timestamp
+
+        search_by_timestamp accepts out-of-range times and searches a different point in time
+
+        StatusOpen
+PriorityMedium
+Componentutil (ctime_timestamp), search_by_timestamp
+
+      Copy summaryCopy description
+
+      Summary
+
+      util::ctime_timestamp parses its text with boost::posix_time::from_iso_extended_string(). Boost validates the date part, but reads the time part as a duration and adds it to the date, so hours above 23, minutes or seconds above 59 and negative hours are accepted and roll over into other days. search_by_timestamp uses this parser for its argument (search_by_timestamp_operation.cpp, ctime_timestamp::try_parse()), and the documented error for a malformed argument is Invalid timestamp format.
+
+      Examples
+
+        2026-10-06T24:00:00, 2026-10-06T23:60:00, 2026-10-06T23:59:60: all accepted as 2026-10-07T00:00:00;
+
+        2026-10-06T25:00:00: accepted as 2026-10-07T01:00:00;
+
+        2026-10-06T99:99:99: accepted as 2026-10-10T04:40:39;
+
+        2026-10-06T1000:00:00: accepted as 2026-11-16T16:00:00;
+
+        2026-10-06T-1:00:00: accepted as 2026-10-05T23:00:00;
+
+        2026-02-29T00:00:00: rejected (the date part is checked correctly).
+
+      User impact
+
+      search_by_timestamp selects the binlogs needed for point-in-time recovery. A mistyped time is not reported: the search silently runs for a different point in time, possibly days away, and returns a different list of binlogs. Recovery can then apply transactions past the intended point, or miss binlogs it needs.
+
+      Expected behaviour
+
+      Only YYYY-MM-DDTHH:MM:SS[.fraction] with hours 00–23 and minutes and seconds 00–59 is accepted. Anything else fails with Invalid timestamp format, as other malformed timestamps already do.
+
+      Suggested fix
+
+      Validate the text before (or instead of) from_iso_extended_string(), for example by parsing the six fields explicitly and checking their ranges, then build the ptime from them. A strict format check in the ctime_timestamp string constructor makes the MTR test below pass and keeps the existing search_by_timestamp test passing.
+
+      Tests
+
+        tests/config_value_property_test.cpp: TimestampParsingMatchesModel compares parsing of generated timestamps (valid ones, and ones with fields just outside their ranges) with an independent calendar model. It fails in every run today, shrinking to 1400-01-01T00:00:60. TimestampRoundTrip and TimestampParsingOfArbitraryTextIsSane pass.
+
+        MTR: binlog_streaming.search_by_timestamp_invalid_time runs search_by_timestamp on an empty storage with a valid timestamp (expects Binlog storage is empty) and with five out-of-range times (each expects Invalid timestamp format).
+
+      Verified on Linux (Ubuntu 24.04, GCC 14) with the property test and a standalone program printing what each example is parsed as. The MTR test fails on MySQL 8.0.45 and 8.4.8 at the first out-of-range time (2026-10-06T24:00:00 is reported as Binlog storage is empty), and passes on both with a temporary strict format check in ctime_timestamp, as does the existing search_by_timestamp test. Open on upstream main @ ee82afa.
+
+        Ticket 12 · Bug · binsrv/storage (filesystem backend)
+
+        file:// storage URI with %00 in the path opens a different directory
+
+        StatusOpen
+PriorityLow
+Componentbinsrv (filesystem_storage_backend)
+
+      Copy summaryCopy description
+
+      Summary
+
+      filesystem_storage_backend takes its root directory from the percent-decoded path of storage.uri (root_path_ = uri.path(), filesystem_storage_backend.cpp:91). A %00 in the URI becomes a NUL character inside the path. The checks that follow (std::filesystem::exists(), is_directory()) and every later file operation pass the path to the operating system as a C string, which ends at the NUL, so they work on the directory before it.
+
+      Reproduction
+
+      With /tmp/pbs-nul-probe/data existing and storage.uri set to file:///tmp/pbs-nul-probe/data%00/elsewhere:
+
+        the backend is created; its description is local filesystem - /tmp/pbs-nul-probe/data\0/elsewhere;
+
+        list_objects() lists the contents of /tmp/pbs-nul-probe/data;
+
+        put_object() fails with cannot open underlying tmp object file for writing.
+
+      Impact
+
+      Only reachable with a malformed configuration file. The storage then reads a directory other than the one configured, and writes fail with an error that does not point at the URI.
+
+      Expected behaviour
+
+      A storage URI whose decoded path contains a NUL character is rejected when the backend is created, with an invalid storage backend URI-style error.
+
+      Suggested fix
+
+      After decoding, reject a path containing '\0' in filesystem_storage_backend (and check the same for the S3 backend's path and bucket).
+
+      Tests
+
+      tests/config_value_property_test.cpp: FilesystemStorageUriMatchesModel builds file:// URIs for generated directory names, with or without host, port, user info, query, fragment and an embedded NUL, and checks that the backend accepts exactly the plain ones and that object URIs point inside the directory. Only the NUL case fails, in every run.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14) with the property test and a standalone program creating the backend and calling list_objects() and put_object(). Open on upstream main @ ee82afa.
+
+        Ticket 13 · Bug · binsrv/storage
+
+        A storage with an empty binlog index crashes the utility with a segmentation fault
+
+        StatusOpen
+PriorityMedium
+Componentbinsrv/storage (storage_core)
+
+      Copy summaryCopy description
+
+      Summary
+
+      When a storage is opened, storage_core::load_and_validate_binlog_metadata_set() ends by reading binlog_records_.front() (storage_core.cpp:992, and the assertion at storage_core.cpp:219 in the constructor) without checking that the list of binlogs is empty. If binlog.index is present but lists no binlogs, the list is empty and front() dereferences a null pointer.
+
+      Where it happens
+
+        Querying modes (search_by_timestamp, search_by_gtid_set): with an empty binlog.index, whatever else the storage holds. The querying mode skips the index checks on purpose, so that a damaged storage can still be inspected.
+
+        Streaming modes (fetch, pull): when the storage holds nothing but metadata.json and an empty binlog.index. If binlog files are present, the index check rejects the storage first.
+
+        When every binlog's metadata is unreadable, the querying mode skips all of them and reaches the same front() on an emptied vector. That is undefined behaviour too, although it does not crash with libstdc++ today.
+
+      Reproduction
+
+      A file storage holding only metadata.json ({"version":1,"mode":"position"}) and an empty binlog.index:
+
+        binlog_server search_by_timestamp config.json 2026-10-06T00:00:00: Segmentation fault, exit code 139;
+
+        binlog_server search_by_gtid_set config.json 11111111-aaaa-1111-aaaa-111111111111:1: exit code 139;
+
+        binlog_server fetch config.json: exit code 139;
+
+        with binlog.index removed instead: {"status":"error","message":"Binlog storage is empty"}, exit code 1 (correct).
+
+      Impact
+
+      put_object() writes through a temporary file, fsync and rename, so the utility itself never leaves an empty index behind. It happens only after outside damage: disk errors, a bad copy or restore of the storage, or editing by hand. In that situation the utility crashes instead of reporting the damage, including in the querying mode that is meant to work on broken storages.
+
+      Expected behaviour
+
+      An empty binlog list after loading is handled like an empty storage, or reported as a damaged storage, with a regular error and exit code 1.
+
+      Suggested fix
+
+      Return from load_and_validate_binlog_metadata_set() before setting purged_gtids_ when binlog_records_ is empty, and make the assertion in the constructor check binlog_records_.empty() first. With this change the MTR test below passes on MySQL 8.0.45 and 8.4.8, and the property test passes 3 runs of 2000 cases.
+
+      Tests
+
+        tests/storage_property_test.cpp: StorageOpeningOfDamagedFilesFailsCleanly damages one file of a generated storage (deleted, truncated, extended, a byte changed, a JSON value replaced, an unexpected file added, binlog index entries dropped, duplicated, swapped or added), or the metadata of every binlog. It then opens the storage for queries and for streaming, and requires that opening never crashes and fails only with a regular exception. It crashed 2 of 3 runs at the default 100 cases, on binlog.index truncated to 0 bytes.
+
+        MTR: binlog_streaming.storage_empty_binlog_index fetches some data, empties binlog.index, and expects search_by_timestamp, search_by_gtid_set and fetch to fail with exit code 1.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14) with the property test, with the binlog_server binary on the hand-made storage above, and with the MTR test. The MTR test fails on MySQL 8.0.45 and 8.4.8 at search_by_timestamp (Command "exec" failed with wrong error: 139) and passes on both with the suggested fix applied temporarily. Open on upstream main @ ee82afa.
+
+        Ticket 14 · Bug · collector (GTID replication mode)
+
+        Resuming in GTID mode after a binlog rotation loses the closing ROTATE event and skips binlogs without transactions
+
+        StatusOpen
+PriorityMedium
+Componentoperations (collector_context), binsrv/storage
+
+      Copy summaryCopy description
+
+      Summary
+
+      In GTID replication mode, the Binlog Server resumes streaming by sending its GTID set, and the source starts sending from the binlog that holds the first missing GTID. If the source rotated its binlog after the last transaction the Binlog Server received (FLUSH BINARY LOGS, a server restart, or reaching max_binlog_size), with no new transaction in the old binlog, the source starts from the new binlog. The ROTATE event that closes the old binlog on the source is never received. The storage then closes its copy of the old binlog without that event and opens the new one, so the stored copy ends before that event (44 bytes for a binlog named binlog.NNNNNN).
+
+      If the source rotated more than once in that time, the binlogs in between hold no transactions and are never sent at all: the storage has no copy of them, and its binlog index jumps from the old binlog to the newest one.
+
+      Position-based mode is not affected: it resumes at the stored binlog name and position, so the ROTATE event is received. Rewrite mode generates its own ROTATE events (collector_context.cpp:379). Plain GTID mode has nothing that fills the gap.
+
+      Reproduction
+
+        GTID mode: write a transaction on the source and run binlog_server fetch until it has caught up.
+
+        On the source: FLUSH BINARY LOGS, then write another transaction.
+
+        Run binlog_server fetch again.
+
+        The stored binlog.000001 is 422 bytes; the source's closed binlog.000001 is 466 bytes: the same bytes followed by the ROTATE event.
+
+      With a second FLUSH BINARY LOGS before the insert in step 2, the source has binlog.000001 to binlog.000003, and the storage holds only binlog.000001 (without its ROTATE event) and binlog.000003.
+
+      Impact
+
+        Stored binlogs are not exact copies of the source's binlogs, and binlogs without transactions can be missing from the storage. This happens in normal operation: whenever a periodic fetch or a reconnecting pull was caught up when the source rotated, which log rotation, backups and server restarts all do.
+
+        In pull mode the replication source sends stored events as they are (sender_context does not create ROTATE events), so clients reading through pull do not receive the ROTATE that tells them the binlog file changed. Tools that rely on it, such as replicas tracking the source file name and mysqlbinlog --read-from-remote-server --raw naming its output files, are expected to be affected. This has not been confirmed end to end yet: mysqlbinlog --raw can read from pull since ticket 22 was fixed upstream, but this case has not been run against it; MySQL replicas still cannot connect to it (ticket 20).
+
+      Expected behaviour
+
+      The storage holds every binlog of the source since streaming started, each closed one ending with the ROTATE event that closes it on the source, as in position-based mode.
+
+      Suggested fix
+
+      When the first artificial ROTATE after a reconnect names a binlog other than the current stored one, close the current stored binlog with a ROTATE event naming the new binlog before opening it, as rewrite mode already does with generate_rotate_event(). The generated event should match the source's: timestamp, server ID, flags, the next-event position in the old binlog, and position 4 in its post header. Binlogs skipped in between can be created with their preamble and a ROTATE event, or the resume can request them by name and position. Whichever is chosen, the result should be byte-identical to the source's files.
+
+      Tests
+
+        MTR: binlog_streaming.gtid_resume_after_rotation (GTID mode) fetches, runs FLUSH BINARY LOGS twice and inserts a row, fetches again, and compares the stored first and second binlogs with the source's using diff_files. It fails on MySQL 8.0.45 and 8.4.8 today.
+
+        Randomized crash test extra/qa/fetch_crash_test.py: a Hypothesis stateful test that runs workloads on a real MySQL server and runs binlog_server fetch to the end, or kills it during a workload. It found both parts in GTID mode, shrunk to fetch to the end, FLUSH BINARY LOGS, fetch to the end and to a sequence with two FLUSH BINARY LOGS (binlog index binlog.000001, binlog.000003 while the source has binlog.000001 to binlog.000004). In position mode it passes 20 test cases of up to 10 steps.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14, debug build) with the randomized crash test against MySQL 8.4.8, and with the MTR test on MySQL 8.0.45 and 8.4.8 (diff_files: the stored and server binlogs differ). Open on upstream main @ ee82afa.
+
+        Ticket 15 · Bug · binsrv/storage (crash consistency)
+
+        A crash while a new binlog is being created leaves a storage that cannot be opened
+
+        StatusOpen
+PriorityHigh
+Componentbinsrv/storage (storage_core)
+
+      Copy summaryCopy description
+
+      Summary
+
+      storage_core::open_new_binlog_file_internal() creates a new binlog in three steps: it writes the binlog magic to the new binlog file, saves the binlog's metadata file, then rewrites binlog.index (storage_core.cpp:671-694). If the process is killed or crashes after the first step and before the last one, the storage holds a binlog file (and possibly its metadata file) that binlog.index does not list. On the next start, validate_binlog_index() rejects the storage with storage contains an object that is not referenced in the binlog index, in every mode.
+
+      Temporary objects left by an interrupted put_object() are already removed on start (remove_temporary_objects()), but the files of an interrupted binlog creation are not.
+
+      A failed write reaches the same state without any crash: on S3 storage, when the binlog.index upload keeps failing (six consecutive 500 or 503 responses, or lost requests, more than the SDK's retries), fetch exits with 1 after creating binlog.000003 and its metadata, and the binlog index still lists only binlog.000001 and binlog.000002. Every later start fails with the same error.
+
+      On the filesystem backend a full disk does the same: a single ENOSPC (or EIO) while opening, writing, syncing or renaming binlog.index during a rotation leaves binlog.000003 and binlog.000003.json on disk with the index listing only binlog.000001 and binlog.000002.
+
+      Reproduction
+
+        Run binlog_server fetch to the end (the storage holds binlog.000001).
+
+        Leave binlog.000002 in the storage holding only the binlog magic (\xfebin), as a process killed right after creating it does.
+
+        Run binlog_server fetch again: it exits with 1 and logs std::exception caught: storage contains an object that is not referenced in the binlog index.
+
+      Impact
+
+        A kill -9, an OOM kill, a host crash or a power loss at the moment the source rotates its binlog leaves a storage that no mode can open. fetch, pull, the searches and purge_binlogs all fail until the leftover files are removed by hand.
+
+        On S3 storage, an outage or throttling period during a rotation is enough; on the filesystem backend, a full disk. No crash is needed.
+
+        The window is short, but it happens at every rotation, which with the default max_binlog_size is every 1 GB of binlog data, and also on every server restart and FLUSH BINARY LOGS.
+
+      Expected behaviour
+
+      A storage left by a process killed at any moment can be opened again, and streaming continues where the binlog index says it stopped.
+
+      Suggested fix
+
+        On start, treat a binlog file (with or without its metadata file) that is not in the binlog index and is the next binlog after the last indexed one as the leftover of an interrupted creation: remove it, as is done for temporary objects, and log a warning; or
+
+        update the binlog index first and accept an indexed last binlog whose file or metadata does not exist yet, creating them on open.
+
+      Tests
+
+        Randomized crash test extra/qa/fetch_crash_test.py found it by killing fetch as soon as the storage had grown by 1 byte, which falls right after a new binlog's magic is written. The next fetch failed with the error above.
+
+        MTR: binlog_streaming.storage_interrupted_binlog_creation fetches, rotates and inserts on the source, places the next binlog file with only the magic in the storage, and expects the next fetch to succeed and the first binlog to match the source's. It fails on MySQL 8.0.45 and 8.4.8 today: fetch exits with 1.
+
+        The storage property test's crash step copies the storage only between operations, so it never sees this window.
+
+        extra/qa/s3_fault_sweep.py reaches the same state with failing binlog.index uploads on S3 storage (500, 503 and lost requests, six in a row). When only the response is lost, the index is written and the next start works.
+
+        extra/qa/disk_fault_sweep.py reaches it on the filesystem backend with every failure of the binlog.index save (16 cases: open, write, fsync and rename, ENOSPC and EIO, once or persistent).
+
+      Verified on Linux (Ubuntu 24.04, GCC 14, debug and coverage builds) with the randomized crash test against MySQL 8.4.8, and with the MTR test on MySQL 8.0.45 and 8.4.8. The MTR test has not been run against a fixed build yet. Open on upstream main @ ee82afa.
+
+        Ticket 16 · Bug · binsrv/storage (S3 backend)
+
+        Every start with S3 storage outside EC2 waits about 6 seconds for the EC2 metadata service
+
+        StatusOpen
+PriorityLow
+Componentbinsrv (s3_storage_backend)
+
+      Copy summaryCopy description
+
+      Summary
+
+      s3_storage_backend::aws_context default-constructs its Aws::S3Crt::ClientConfiguration (s3_storage_backend.cpp:196). The SDK's default client configuration resolves its settings through the EC2 instance metadata service (IMDS) at 169.254.169.254 unless that is disabled. On a host outside EC2, nothing answers, so creating the S3 backend waits for those requests to time out. This happens even when the storage URI names the region (s3://bucket.region/...) or an S3-compatible endpoint (http[s]://host:port/bucket/...), where nothing needs to be looked up.
+
+      Measurements
+
+      Ubuntu 24.04 host outside AWS, S3-compatible server on 127.0.0.1:9000, debug build:
+
+        binlog_server search_by_timestamp on an empty S3 storage: 6.4 s (two runs: 6.48 s and 6.42 s), with the expected Binlog storage is empty result;
+
+        the same with AWS_EC2_METADATA_DISABLED=true: 0.4 s (0.42 s and 0.41 s);
+
+        creating 100 S3 backends with endpoint and region URIs (the property test S3StorageUriMatchesModel): 166 s by default, 22 s with IMDS disabled, about 1.4 s per backend;
+
+        curl http://169.254.169.254/latest/meta-data/ on that host gets no answer (timeout).
+
+      Impact
+
+        Every binlog_server invocation with S3 storage outside EC2 (on premises, other clouds, S3-compatible storage such as MinIO or Ceph) starts several seconds late. That includes the short-lived modes that tools and scripts call often: search_by_timestamp, search_by_gtid_set, list and purge_binlogs.
+
+        fetch started periodically (for example from cron) pays the same delay on every run.
+
+        Where traffic to 169.254.169.254 is silently dropped instead of refused, the delay depends on the SDK's timeouts and retries.
+
+        The requests to the metadata address can also show up as unexpected connection attempts in network monitoring.
+
+      Expected behaviour
+
+      When the storage URI gives an endpoint or a region, and the credentials come from the URI, creating the S3 backend makes no requests to the instance metadata service. Only the s3://bucket/... form without a region needs a lookup, and that one goes to S3 (GetBucketLocation).
+
+      Suggested fix
+
+      Construct the client configuration with IMDS disabled, for example Aws::Client::ClientConfigurationInitValues init{}; init.shouldDisableIMDS = true; passed to the S3CrtClientConfiguration constructor, or set configuration_.disableIMDS = true before it is used. If metadata lookups are wanted on EC2 (for example for instance-profile credentials), make them depend on the URI having neither credentials nor an endpoint or region. Until then, the README could mention AWS_EC2_METADATA_DISABLED=true as a workaround.
+
+      Tests
+
+        The property test S3StorageUriMatchesModel (tests/config_value_property_test.cpp) creates one S3 backend per test case without network access to S3. Its run time shows the delay: 166 s for 100 cases, 22 s with AWS_EC2_METADATA_DISABLED=true.
+
+        The ...OnS3 storage properties (tests/storage_property_test.cpp) run at about 9 seconds per test case, largely because of this delay in every storage instance they create.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14, debug build, AWS SDK C++ 1.11.774) with the timings above, against Versity S3 Gateway 1.8.0 as the S3-compatible server. The SDK version in use has both ClientConfigurationInitValues::shouldDisableIMDS and ClientConfiguration::disableIMDS. Open on upstream main @ ee82afa.
+
+        Ticket 17 · Bug · performance · binsrv/storage (S3 backend)
+
+        With checkpointing, the S3 backend uploads each binlog again in full at every checkpoint
+
+        StatusOpen
+PriorityHigh
+Componentbinsrv (s3_storage_backend)
+
+      Copy summaryCopy description
+
+      Summary
+
+      The S3 backend keeps the binlog being written in a local temporary file. Every write_data_to_stream() call (one per storage flush) appends to that file and then uploads the whole file as the S3 object (s3_storage_backend.cpp:850-863, upload_tmp_stream_internal() at 933-938). With checkpoint_size or checkpoint_interval set, the storage flushes at every checkpoint, so a binlog of size S written with checkpoints every C bytes is uploaded about S/C times, growing each time: about S² / (2C) bytes in total.
+
+      Measurements
+
+      One binlog of 64 MiB (64 transactions of 1 MiB), copied by binlog_server fetch into an empty S3 storage, with traffic counted by a proxy in front of the S3-compatible server. In every run the stored binlog was identical to the source's.
+
+        no checkpoint_size: 10 PUT requests, 64 MiB uploaded (1.0× the binlog), 1.8 s;
+
+        checkpoint_size 16M: 25 PUT requests, 160 MiB (2.5×), 2.4 s;
+
+        checkpoint_size 4M: 81 PUT requests, 544 MiB (8.5×), 6.4 s;
+
+        checkpoint_size 1M: 297 PUT requests, 2.03 GiB (32.5×), 21.8 s.
+
+      The ratios match the estimate: 64 / (2 × 1) = 32 for 1 MiB checkpoints.
+
+      Impact
+
+        For a binlog of the default max_binlog_size (1 GiB) with checkpoint_size 1M, the estimate is about 512 GiB uploaded and about 66,000 PUT requests per binlog (the client uploads in 8 MiB parts; the same estimate gives 288 for the 64 MiB run, which needed 297). At the measured local speed that is on the order of 90 minutes per binlog, so the Binlog Server falls behind any source that writes faster than that.
+
+        S3 request charges, and transfer charges where they apply, grow with the square of the binlog size.
+
+        Checkpointing exists to limit what a crash can lose (ticket 2); on S3 the cost of using it grows with the binlog size, so the setting that protects data most (small checkpoints) is the one that cannot keep up.
+
+        Recovery has the same pattern: truncating the last binlog on start (do_resize_object()) downloads and uploads the whole object, as the TODO in that function notes.
+
+      Expected behaviour
+
+      The data uploaded for a binlog stays proportional to its size (within a small factor) whatever the checkpoint settings, and the time a checkpoint takes does not grow with the size of the binlog written so far.
+
+      Suggested fix
+
+        Upload a binlog as an S3 multipart upload that grows with each checkpoint (one part per checkpoint, with parts of at least 5 MiB except the last), so each byte is uploaded once. Note that parts are not visible until the upload is completed, so readers (pull, the searches) and crash recovery need a design for the in-progress binlog, for example completing the upload at each checkpoint with UploadPartCopy of the existing object plus the new data.
+
+        Alternatively, store each binlog as a series of objects (one per checkpoint) and join them on read or when the binlog is closed.
+
+        At minimum, document the cost of checkpoint_size / checkpoint_interval with S3 storage, and warn at start when they are set with a small size on the S3 backend.
+
+      Tests
+
+        extra/qa/s3_upload_volume.py runs the measurement above: it writes the same workload for each checkpoint_size, runs fetch through extra/qa/s3_fault_proxy.py, and reports the PUT requests and bytes uploaded for the binlog object.
+
+        The ...OnS3 storage properties (tests/storage_property_test.cpp) and the MTR suite with the S3 backend pass, so the data is correct; the issue is only the volume and time.
+
+      Measured on Linux (Ubuntu 24.04, GCC 14, debug build, AWS SDK C++ 1.11.774) against Versity S3 Gateway 1.8.0 on the same host, MySQL 8.4.8 as the source. The 1 GiB figures are extrapolated from these measurements, not measured. Open on upstream main @ ee82afa.
+
+        Ticket 18 · Bug · data integrity · binsrv/storage
+
+        After a failed storage write, the same binlog data is written twice; if the metadata write failed, the duplicate is permanent
+
+        StatusOpen
+PriorityHigh
+Componentbinsrv/storage (storage, storage_core), filesystem and S3 backends
+
+      Copy summaryCopy description
+
+      Summary
+
+      storage::flush_event_buffer_internal() passes the buffered transactions to storage_core::write_event_block() and erases them from the buffer only after it returns (storage.cpp:276-302). write_event_block() appends the data to the binlog stream, then increases the binlog's size in memory, then saves the binlog metadata (storage_core.cpp:299-322). If any of these steps throws, the buffer keeps the data, and the next flush, normally the one in the storage destructor when fetch or pull exits after the error, writes the same data again.
+
+      On S3 the stream is a local temporary file that is appended to and then uploaded whole, so the data is in the file even when the upload fails, and the second flush leaves it there twice:
+
+        The binlog upload fails: the in-memory size was not increased, so the metadata saved by the second flush has the right size, while the object holds the new data twice. The next start truncates the last binlog to the metadata size, which removes the duplicate.
+
+        The binlog upload succeeds but the metadata upload fails: the in-memory size was already increased, and the second flush increases it again. The object holds the new data twice and the metadata size matches it, so nothing on start detects or repairs it.
+
+      Reproduction
+
+      Position mode, S3 storage through a proxy that answers 500 InternalError to six consecutive PUT requests (more than the SDK's retries), MySQL 8.4.8 with small binlogs:
+
+        Run fetch to the end, write a few transactions on the source, start fetch again with the failing PUTs.
+
+        Failing PUTs of the binlog object: fetch exits with 1; the stored binlog.000002 is 308,063 bytes (source: 154,699), its metadata size 154,699. A clean fetch exits with 0 and leaves exact copies.
+
+        Failing PUTs of the binlog metadata (binlog.000002.json): fetch exits with 1; the stored binlog.000002 is 308,063 bytes and its metadata size is also 308,063. Every later fetch exits with 1: cannot fetch binlog event: Client requested source to start replication from position > file size: CR_1236.
+
+      Impact
+
+        An S3 outage or throttling period that outlasts the SDK's retries corrupts the binlog being written. Readers of the storage (pull replicas, restores using the stored binlogs) get the duplicated events.
+
+        When the metadata write was the one that failed, the corruption is permanent. In position mode streaming then stops for good (the resume position is past the end of the source's binlog) until the storage is repaired by hand. In GTID mode resuming does not use that position, so it is expected to continue silently with the duplicated events in the stored binlog (not verified).
+
+        The filesystem backend is affected the same way, and there a single failure is enough because nothing retries: any failure while saving the binlog metadata (opening, writing, syncing or renaming binlog.NNNNNN.json.tmp, with ENOSPC or EIO) leaves the stored binlog.000002 at 308,063 bytes for the source's 154,699, as on S3. A full disk is enough to trigger it.
+
+      Expected behaviour
+
+      A failed write leaves the stored binlog and its metadata at the last complete state, and no data is ever written twice: either the retry continues from what is actually stored, or the storage stops accepting writes after a failure.
+
+      Suggested fix
+
+        Make write_event_block() all or nothing: on failure, restore the stream to the stored size (truncate the S3 temporary file, or the file on the filesystem backend) and leave the in-memory size unchanged; increase the size only after the metadata is saved.
+
+        Do not flush again in the destructor after a write has failed, or flush only after re-reading the stored size.
+
+        On start, check that each binlog's size in its metadata matches the end of its last complete event (the storage does not parse the stored data today; see the TODO in validate_binlog_index()).
+
+      Tests
+
+        extra/qa/s3_fault_sweep.py injects every fault of extra/qa/s3_fault_proxy.py into every kind of S3 request fetch makes, once and six times in a row. Single failures are all retried transparently; six failing PUTs of the binlog object or of its metadata produce this result.
+
+        The randomized crash test extra/qa/fetch_crash_test.py with --storage s3 --s3-fault-control covers the same faults in generated sequences.
+
+        extra/qa/disk_fault_sweep.py injects file system failures into the filesystem backend with the LD_PRELOAD library extra/qa/fsfault: every failure of the binlog metadata save (16 cases) produces this result; failures writing the binlog data itself are handled correctly.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14, debug build, AWS SDK C++ 1.11.774) against Versity S3 Gateway 1.8.0 behind s3_fault_proxy.py, MySQL 8.4.8, with the sweep and a targeted reproduction showing object and metadata sizes before and after a clean fetch; and on the filesystem backend with the disk fault sweep. Open on upstream main @ ee82afa.
+
+        Ticket 19 · Bug · durability · binsrv/storage (filesystem backend)
+
+        Binlog data is never synced to disk while its metadata is; after a power loss the storage cannot be opened
+
+        StatusOpen
+PriorityHigh
+Componentbinsrv (filesystem_storage_backend)
+
+      Copy summaryCopy description
+
+      Summary
+
+      The filesystem backend writes binlog data through a std::ofstream: do_write_data_to_stream() calls write() and flush(), and do_close_stream() only closes the file (filesystem_storage_backend.cpp). flush() hands the data to the kernel's page cache; nothing ever calls fsync on a binlog data file. The binlog metadata, which records the binlog's size, is written with put_object(), which syncs the file and the directory (filesystem_storage_backend.cpp:144-159). After every checkpoint the metadata on disk is therefore durable, while the data it describes may not be.
+
+      After a power loss or a kernel crash (a process crash keeps the page cache, so it is not affected), a binlog can be shorter on disk than its metadata says. The start-up recovery only handles the opposite case, a binlog longer than its metadata, which it truncates; this case it rejects.
+
+      Reproduction
+
+        Cause: the disk fault sweep (extra/qa/disk_fault_sweep.py), which intercepts every fsync in the storage directory, saw fsync calls for metadata and index files and none for any binlog data file during a complete fetch with two binlogs.
+
+        Consequence: after a complete fetch, cutting the last 1,000 bytes off the last stored binlog (binlog.000002, 1,335 bytes, metadata size 1,335), as lost page-cache data would, makes every start fail: std::exception caught: cannot perform recovery - size from the binlog metadata is bigger than the actual binlog file size. For a binlog other than the last, the error is size from the binlog metadata does not match the actual binlog size.
+
+      Impact
+
+        After a power loss or kernel crash during normal operation, the Binlog Server cannot start in any mode until the storage is repaired by hand. A binlog server exists to keep binlogs safe through failures of the source, so it should survive failures of its own host.
+
+        The data lost is what the metadata already recorded as stored: the GTID sets and positions in the metadata claim transactions that are not in the file.
+
+        S3 storage is not affected: each upload is durable when it returns.
+
+      Expected behaviour
+
+      Binlog data is durable before the metadata that describes it, so after a crash of any kind the data on disk is at least as long as its metadata says, and the existing recovery (truncating extra data) applies.
+
+      Suggested fix
+
+        Sync the binlog data file (fdatasync on the stream's file descriptor, for example by writing through a POSIX file descriptor instead of std::ofstream) before save_binlog_metadata() in storage_core::write_event_block(), and when a binlog is closed.
+
+        On start, treat a last binlog shorter than its metadata as the result of a crash: truncate the metadata (size, GTIDs and timestamps) back to the last complete transaction found in the file and stream the rest again from the source, instead of refusing to open the storage.
+
+      Tests
+
+        extra/qa/disk_fault_sweep.py with extra/qa/fsfault: the fsync rules targeting binlog data files are never hit.
+
+        A power-loss test would need a VM or a file system that can drop unsynced data (for example dm-log-writes or a dm-flakey target); the reproduction above simulates the resulting state.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14, debug build) by reading the backend code, with the disk fault sweep (no fsync of binlog data files), and with the simulated state above against MySQL 8.4.8. A real power loss was not tested. Open on upstream main @ ee82afa.
+
+        Ticket 20 · Bug · minimysql (replication source)
+
+        MySQL replicas cannot replicate from the replication source of pull mode
+
+        StatusOpen
+PriorityHigh
+Componentminimysql (network_service, connection_context)
+
+      Copy summaryCopy description
+
+      Summary
+
+      The README describes the replication_source listener of pull mode as one "so that downstream replicas can dump binary log events from it". A MySQL replica cannot. Its I/O thread runs a fixed set of queries before it asks for binlog events, and the listener answers only a few exact query strings (those mysqlbinlog sends) with a result; everything else gets a syntax error (network_service.cpp, known_queries). The replica stops at the second query.
+
+      With a MySQL 8.0.45, 8.4.8 or 9.7.2 replica (CHANGE REPLICATION SOURCE TO SOURCE_HOST=..., SOURCE_PORT=<replication_source.port>, SOURCE_USER='rpl', ...; START REPLICA), in position mode and in GTID auto-position mode, the I/O thread stops with:
+
+1064: The replica I/O thread stops because a fatal error is encountered when
+it try to get the value of SERVER_ID variable from source. Error: Syntax error
+
+      A MySQL 9.7.2 replica does not get that far by default: it requires SSL unless SOURCE_SSL=0 is given, and the listener does not support TLS, so the I/O thread stops with 2026: SSL connection error: SSL is required but the server doesn't support it. With SOURCE_SSL=0 it stops at SELECT @@GLOBAL.SERVER_ID as above.
+
+      What a replica sends
+
+      Recorded from a MySQL 8.4 source's general log while an 8.4 replica connected (the same in both modes):
+
+        SELECT UNIX_TIMESTAMP()
+
+        SELECT @@GLOBAL.SERVER_ID (an error here is fatal)
+
+        SET @master_heartbeat_period = <ns>, @source_heartbeat_period = <ns>
+
+        SET @master_binlog_checksum = @@global.binlog_checksum, @source_binlog_checksum = @@global.binlog_checksum (the listener knows only the 'NONE' form mysqlbinlog sends)
+
+        SELECT @source_binlog_checksum
+
+        SELECT @@GLOBAL.GTID_MODE
+
+        SELECT @@GLOBAL.SERVER_UUID
+
+        SET @slave_uuid = '<uuid>', @replica_uuid = '<uuid>'
+
+        COM_BINLOG_DUMP (position mode) or COM_BINLOG_DUMP_GTID with the replica's GTID set (auto-position).
+
+      Beyond the queries: COM_BINLOG_DUMP_GTID is parsed (connection_context.cpp:440) but answered with "unknown command", the listener reports its version as 9.7.0, and it sends no heartbeats, which a replica also relies on. (Honouring the requested start position and sending artificial ROTATE events, tickets 21 and 22, were fixed upstream in a338dde.)
+
+      Impact
+
+        The Binlog Server cannot be used as a replication source for MySQL replicas, which the README presents as the purpose of pull mode's listener. Only mysqlbinlog in text mode works against it today.
+
+        Without TLS on the listener, MySQL 9.x replicas need an explicit SOURCE_SSL=0, and the binlog stream travels unencrypted.
+
+      Expected behaviour
+
+      A MySQL 8.0 / 8.4 replica pointed at the listener replicates the stored binlogs (position-based and GTID auto-position), or the README states that only mysqlbinlog is supported.
+
+      Suggested fix
+
+        Answer the queries above: SERVER_ID and SERVER_UUID of the Binlog Server (configurable), the checksum algorithm of the stored binlogs, GTID_MODE from the storage's replication mode, the current time; accept the SET statements (and use the heartbeat period).
+
+        Implement COM_BINLOG_DUMP_GTID by finding the first binlog that holds a GTID missing from the replica's set (the storage already keeps per-binlog GTID sets). The start position of COM_BINLOG_DUMP is already honoured since ticket 21 was fixed.
+
+        Send heartbeat events while idle (artificial ROTATE events are sent since ticket 22 was fixed).
+
+        Support TLS on the listener (configurable certificate and key), so that replicas with the default SOURCE_SSL=1 of MySQL 9.x can connect.
+
+      Tests
+
+        extra/qa/pull_replica_test.py starts a source MySQL server, binlog_server pull and a replica MySQL server, points the replica at pull in position and GTID auto-position mode, and requires the replica's data to match the source's; on failure it reports the replica's I/O error and the statements pull rejected. It fails today on MySQL 8.0.45, 8.4.8 and 9.7.2 in both modes. It sets SOURCE_SSL=0 so that 9.x replicas reach the query stage.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14, debug build) with MySQL 8.0.45, 8.4.8 and 9.7.2 replicas, and the query list recorded from a MySQL 8.4.8 source. Open on upstream main @ ee82afa.
+
+        Ticket 21 · Bug · minimysql / operations (replication source)
+
+        The replication source ignores the requested binlog and position and always streams from the first binlog
+
+        StatusFixed upstream in a338dde (PBS-42 part 5)
+PriorityHigh
+Componentminimysql (network_service), operations (sender_context)
+
+      Copy summaryCopy description
+
+      Summary
+
+      COM_BINLOG_DUMP carries the binlog file and position the client wants to start from. The listener parses them (connection_context.cpp:429-430) but does not use them: handle_binlog_dump_command() creates its sender_context without them (network_service.cpp:298: // TODO: initialize sender_context with binlog_name:position extracted from the COM_BINLOG_DUMP command.), and the sender always starts at the first stored binlog. The client receives every stored event, labelled as if streaming had started where it asked.
+
+      Reproduction
+
+      Two batches of rows in binlog.000001, a rotation, a third batch in binlog.000002, then mysqlbinlog --read-from-remote-server --base64-output=decode-rows -v:
+
+        asking a MySQL source for binlog.000002: only the third batch;
+
+        asking pull for binlog.000002: all three batches;
+
+        asking pull for binlog.000001 with --start-position after the first batch: all three batches, the first one printed as # at <requested position>.
+
+      Impact
+
+        Point-in-time recovery with mysqlbinlog --start-position or from a later binlog against pull replays transactions that were already applied, without any error.
+
+        Any client that reconnects and resumes (a replica, once ticket 20 is fixed, or mysqlbinlog --stop-never after a disconnect) gets everything again from the start.
+
+      Expected behaviour
+
+      Streaming starts at the requested binlog file and position; a request for a binlog or position that is not stored gets an error (as a MySQL source returns ER_SOURCE_FATAL_ERROR_READING_BINLOG).
+
+      Suggested fix
+
+      Pass the requested binlog name and position to sender_context and start fetching there (the storage can already fetch an event block at a given binlog and range), after checking that the position is at an event boundary.
+
+      Resolution
+
+      Fixed upstream in a338dde ("PBS-42 feature: Implement basic support for COM_BINLOG_DUMP packet handling (part 5)"), which passes the requested binlog name and position from handle_binlog_dump_command() to sender_context and implements resuming from a position.
+
+      Tests
+
+        MTR: binlog_streaming.rs_start_position dumps from the second binlog and from a position after the first batch, and requires the dumps to contain only the later batches. It fails on MySQL 8.0.45 and 8.4.8 against pull; the same commands against the MySQL server itself pass on both.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14, debug build) with mysqlbinlog from MySQL 8.4.8 against pull and against the MySQL source, and with the MTR test on 8.0.45 and 8.4.8, on upstream main @ ee82afa. Fix confirmed on upstream main @ fd8a2d5: rs_start_position passes on MySQL 8.0.45 and 8.4.8.
+
+        Ticket 22 · Bug · minimysql / operations (replication source)
+
+        mysqlbinlog --raw cannot copy binlogs from the replication source
+
+        StatusFixed upstream in a338dde (PBS-42 part 5)
+PriorityMedium
+Componentoperations (sender_context), minimysql (network_service)
+
+      Copy summaryCopy description
+
+      Summary
+
+      A MySQL source starts every binlog it sends with an artificial ROTATE event that names the binlog and position. The storage does not keep artificial events, and the replication source sends the stored events as they are (sender_context::get_event()), so a client never learns the name of the binlog it is reading. mysqlbinlog --raw names its output files from that event and fails:
+
+mysqlbinlog: Can't create/write to file '' (OS errno 2 - No such file or directory)
+ERROR: Could not create log file ''
+
+      Reproduction
+
+      mysqlbinlog --read-from-remote-server --raw --to-last-log --result-file=<dir>/ binlog.000001 with two binlogs:
+
+        against the MySQL source: exit 0, binlog.000001 and binlog.000002 written, both identical to the source's files;
+
+        against pull: exit 1 with the error above, no files.
+
+      Impact
+
+        Raw binlog backups with mysqlbinlog --raw (usually with --stop-never), the common way to copy binlogs with mysqlbinlog, do not work against pull.
+
+        Replicas also rely on the artificial ROTATE events to track the source binlog name and position (see ticket 20).
+
+        It hides ticket 14's effect on clients: with the closing ROTATE of a binlog missing from the storage, a raw-mode client could not tell where one binlog ends and the next begins; this can only be checked once raw mode works.
+
+      Expected behaviour
+
+      The replication source sends an artificial ROTATE event (timestamp 0, LOG_EVENT_ARTIFICIAL_F, next position 0) naming the binlog and start position at the start of the stream and whenever it moves to the next stored binlog, as a MySQL source does, and mysqlbinlog --raw writes copies identical to the stored binlogs.
+
+      Suggested fix
+
+      Generate the artificial ROTATE in the sender when it starts a binlog (operations/event_generation_helpers.cpp already has generate_rotate_event(), used by the collector in rewrite mode), and send the FORMAT_DESCRIPTION event first when the requested position is past it, as a MySQL source does.
+
+      Resolution
+
+      Fixed upstream in a338dde ("PBS-42 feature: Implement basic support for COM_BINLOG_DUMP packet handling (part 5)"): sender_context now sends an artificial ROTATE event naming the binlog at the start of the stream and at every switch to the next binlog, and an artificial FORMAT_DESCRIPTION event when resuming from a position.
+
+      Tests
+
+        MTR: binlog_streaming.rs_raw_mode copies the binlogs from pull with mysqlbinlog --raw --to-last-log and compares the closed first binlog with the server's. It fails on MySQL 8.0.45 and 8.4.8 against pull; the same command against the MySQL server itself passes on both.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14, debug build) with mysqlbinlog from MySQL 8.4.8 against pull and against the MySQL source, and with the MTR test on 8.0.45 and 8.4.8, on upstream main @ ee82afa. Fix confirmed on upstream main @ fd8a2d5: rs_raw_mode passes on MySQL 8.0.45 and 8.4.8.
+
+        Ticket 23 · Bug · easymysql (MySQL connection)
+
+        fetch and pull cannot authenticate without SSL as a caching_sha2_password user
+
+        StatusOpen
+PriorityMedium
+Componenteasymysql (connection), connection configuration
+
+      Copy summaryCopy description
+
+      Summary
+
+      Over a connection without TLS, the caching_sha2_password plugin can send the password only RSA-encrypted with the server's public key, unless the server already has the password hash cached from an earlier login. The client gets that key only when MYSQL_OPT_GET_SERVER_PUBLIC_KEY or MYSQL_SERVER_PUBLIC_KEY is set. easymysql::connection sets the SSL and timeout options but neither of these (src/easymysql/connection.cpp), and the connection configuration has no setting for them, so with connection.ssl.mode = disabled the full authentication fails:
+
+unable to establish connection to mysql server
+
+      Reproduction
+
+      On a MySQL 8.4.8 and on a 9.7.2 server, create CREATE USER 'pwuser'@'%' IDENTIFIED WITH caching_sha2_password BY '...' with REPLICATION SLAVE, then run binlog_server fetch as that user before anything else logs in with it:
+
+        connection.ssl.mode = disabled: exit 1 with the error above, on both versions;
+
+        connection.ssl.mode = preferred: exit 0, on both versions.
+
+      The mysql client connects as such a user with --ssl-mode=DISABLED --get-server-public-key (the MTR test ssl_connection does this on MySQL 9.7).
+
+      Impact
+
+        On MySQL 8.0 and 8.4, SSL-disabled connections work only for users with mysql_native_password or, until the next server restart or FLUSH PRIVILEGES, after the user has logged in once over SSL.
+
+        MySQL 9.x no longer has mysql_native_password on the server, so there is no reliable way to connect without SSL.
+
+        The error message does not say that the server public key is the cause.
+
+        The MTR test ssl_connection does not catch this: its step "1.0. SSL mode disabled" runs the utility with ssl.mode = required.
+
+      Expected behaviour
+
+      With SSL disabled, the utility can authenticate as a caching_sha2_password user, as mysql --get-server-public-key and a replica with GET_SOURCE_PUBLIC_KEY=1 can.
+
+      Suggested fix
+
+      Add connection.get_server_public_key (boolean) and connection.server_public_key_path settings, and set MYSQL_OPT_GET_SERVER_PUBLIC_KEY and MYSQL_SERVER_PUBLIC_KEY from them in easymysql::connection. Include the client library's error text in the connection error.
+
+      Tests
+
+        None in the repository yet. A probe script (a fresh user per run, fetch with ssl.mode disabled, then preferred) shows the failure. A regression test would run ssl_connection step 1.0 with the utility's ssl.mode = disabled and a caching_sha2_password user.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14, debug build) against MySQL 8.4.8 and 9.7.2 servers. Open on upstream main @ ee82afa.
+
+        Ticket 24 · Bug · binsrv (storage)
+
+        Two fetch instances on one storage corrupt it; there is no cross-process lock
+
+        StatusOpen
+PriorityHigh
+Componentbinsrv (storage_core, filesystem_storage_backend)
+
+      Copy summaryCopy description
+
+      Summary
+
+      The storage guards its state only with an in-process mutex (storage_core's std::shared_mutex); there is no cross-process lock (no flock, lock file or O_EXCL). Nothing stops two binlog_server utilities from writing to the same storage directory at once. This is the shape of a routine accident: a fetch started from cron that overruns its interval and overlaps the next run (the same configuration, so the same storage).
+
+      When two fetch instances run on one storage, two things happen:
+
+        Usually they collide on the write-temp-then-rename idiom. Every object is written to a deterministically-named <name>.tmp and renamed into place (filesystem_storage_backend.cpp:130-157), so both instances use the same temporary file. One renames or removes it from under the other, which then throws at start-up with a misleading error and exits 1:
+cannot rename underlying tmp object file: No such file or directory
+cannot remove underlying object file: file does not exist
+
+        Sometimes the data file itself is corrupted. On start each instance truncates the current binlog to the size in its metadata and appends from there; two instances truncate to the same offset and both append the next events, so the binlog ends up longer than the source's and diverges exactly at the source's end. The winning instance exits 0 with no error, and the storage keeps the oversized binlog.
+
+      Reproduction
+
+      extra/qa/concurrent_storage_test.py primes a storage with fetch, then starts N fetch instances on it at once while a workload runs on the source, and checks the storage afterwards. With 2 or 3 instances on MySQL 8.4.8 (file storage), several runs out of five hit the data corruption, for example:
+
+binlog.000001: the stored file (124830 bytes) differs from the
+server's (124786 bytes) at byte 124786
+
+      The stored binlog.000001 is 44 bytes longer than the server's and diverges at the server's end. It is reproduced both with a distinct replication server_id per instance (two configurations pointed at one storage) and with a single shared server_id (--shared-server-id, one configuration, as an overlapping cron job would use).
+
+      Impact
+
+        Permanent storage corruption. A later clean fetch does not repair it: it never shrinks an earlier binlog that it already considers complete, so binlog.000001 stays 124830 bytes and the storage is no longer a valid copy of the source. Every search, resume and pull from that point reads a binlog the source never wrote.
+
+        The trigger is routine: two overlapping cron fetch runs, or two configurations that happen to share a storage. No warning is given; the surviving process exits 0.
+
+        The common outcome (an early crash with "No such file or directory" / "file does not exist") is itself a poor experience: the message does not say that another instance is using the storage.
+
+      Expected behaviour
+
+      A second utility that opens a storage another one is writing refuses to start with a clear message ("storage <uri> is in use by another process"), and the storage is never corrupted, whatever the timing.
+
+      Suggested fix
+
+        Take a cross-process exclusive lock on the storage at start-up for the writing operations (fetch, pull, purge_binlogs): an advisory flock on a lock file in the storage directory for the filesystem backend, and a lock object (conditional PUT/O_EXCL semantics) for S3. A second writer fails fast with a clear error.
+
+        Give each process a unique temporary object name (for example <name>.<pid>.tmp) so the temp-then-rename idiom cannot have two writers share one temporary file.
+
+      Tests
+
+        extra/qa/concurrent_storage_test.py runs several fetch instances on one storage and asserts that every stored binlog is a prefix of the source's ending at a transaction boundary, and that a single clean fetch afterwards heals the storage to an exact copy. It fails today on MySQL 8.4.8 with 2 and 3 instances, with distinct and with shared replication server ids.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14, AddressSanitizer build) with MySQL 8.4.8 and file storage. Open on upstream main @ ee82afa.
+
+        Ticket 25 · Bug · binsrv (storage), operations (collector)
+
+        A storage does not record its source, so a reset source wedges it and a different source silently corrupts it
+
+        StatusOpen
+PriorityHigh
+Componentbinsrv (storage_metadata), operations (collector_context)
+
+      Copy summaryCopy description
+
+      Summary
+
+      A storage is keyed only on the binlog file name and the offset reached in it. The storage metadata (storage_metadata.hpp) records just version, mode and encryption: nothing identifies the source server (no server_uuid) or the binlog lineage (no generation or reset marker). So fetch cannot tell a continuation of the same source from a source whose binlog sequence has restarted, or from a different server that happens to use the same binlog names. Two routine events then go wrong:
+
+        The source resets its binary logs. After RESET BINARY LOGS AND GTIDS (or RESET MASTER) the source starts a new, unrelated binlog.000001. fetch still thinks it must resume binlog.000001 at the old offset, which is past (and different from) the new file, and exits 1 at every run - the storage is wedged and can make no further progress without being wiped by hand.
+
+        The source is replaced by a different server. After a failover, pointing fetch at a promoted replica (a different server_uuid, its own binlog.000001) on the same host and port, fetch does not notice the server changed. When the new binlog.000001 reaches the stored offset it exits 0 with no error, while the stored binlog.000001 still holds the old server's bytes - a silently wrong backup.
+
+      Reproduction
+
+      extra/qa/source_change_test.py fetches a source into a storage, then changes the source and fetches again. On MySQL 8.4.8:
+
+        reset: after RESET BINARY LOGS AND GTIDS, fetch exits 1 ("binlog storage initialized at \"binlog.000001\":63818" while the source's binlog.000001 is now 63554 bytes), and the stored binlog.000001 differs from the source's from byte 4 on. It never recovers.
+
+        identity: with a second server (server_uuid d06bf668-... vs the first's c069942e-...), fetch exits 0, but the stored binlog.000001 (the first server's) differs from the second server's from byte 4 on; the storage is not a copy of the current source.
+
+      The other two changes the test exercises are handled correctly: a source whose early binlogs were PURGEd before any fetch is backed up from the first binlog that remains, and a source restarted while pull streams is reconnected to and caught up to an exact copy.
+
+      Impact
+
+        The identity case is a silent, wrong backup: after a failover the operator believes the binlogs are being captured, while the first binlog of the new source is missing and the storage holds a different server's data. Backups are safety-critical, so a silent exit 0 here is the worst outcome.
+
+        The reset case wedges the storage: every subsequent fetch exits 1 with a message about an offset, never saying that the source's history was reset, so the cause is hard to find.
+
+        Both are routine operations (a GTID reset, a promotion), not misuse.
+
+      Expected behaviour
+
+      The storage records the source's identity and lineage, and fetch refuses to continue against a source that does not match it, with a clear message ("this storage was written from server <uuid> / binlog generation <n>; the source is <uuid> / <n>"), so the operator starts a new storage deliberately rather than getting a wedged or silently wrong one.
+
+      Suggested fix
+
+        Record the source server_uuid (and, where available, a binlog lineage marker) in the storage metadata when a storage is first written, and verify it on every open; a mismatch is a clear, fatal error, not a resume.
+
+        Detect a restarted binlog sequence (the source's current binlog.000001 being shorter than, or different from, the stored one) and report it rather than looping on an out-of-range offset.
+
+      Tests
+
+        extra/qa/source_change_test.py runs the reset, identity, purge and restart scenarios and checks, after each, that the storage is still a valid copy of the current source. The reset and identity scenarios fail today on MySQL 8.4.8; purge and restart pass.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14, AddressSanitizer build) with MySQL 8.4.8 and file storage. Open on upstream main @ ee82afa.
+
+        Ticket 26 · PBS-96 · Bug · operations (replication source) · follow-up to PBS-91
+
+        A client resuming from a position is disconnected when it connects before PBS has pulled anything
+
+        StatusOpen
+PriorityMedium
+Componentoperations (sender_context)
+JiraPBS-96
+RelatedPBS-91 (0f56bd6)
+
+      Copy summaryCopy description
+
+      Summary
+
+      PBS-91 (0f56bd6) made storage_core::fetch_event_block() report an empty storage as EOF instead of an error, so that a client whose COM_BINLOG_DUMP arrives before the collector has stored anything keeps polling until the binlog appears. That fixes the request at position 4 only. A request at any other position takes a different path: sender_context starts in the start_from_offset state, and handle_start_states() first calls fetch_fde_from_storage() to read the binlog's FORMAT_DESCRIPTION event. On an empty storage that fetch now succeeds with an empty buffer, which is shorter than a common header, so fetch_fde_from_storage() returns false, get_event() fails, and handle_binlog_dump_command() logs failed to fetch next event block and closes the connection: the failure PBS-91 describes, on the position-based path.
+
+      This is not a regression: before PBS-91 the same request failed one step earlier, in the storage.
+
+      Reproduction
+
+        Create a sender_context on an empty storage for binlog.000001 at position 127 (the end of the FORMAT_DESCRIPTION event the binlog will start with), as handle_binlog_dump_command() does for a COM_BINLOG_DUMP with that name and position.
+
+        Call get_event(): it returns false instead of EOF (true with an empty event).
+
+        For comparison, the same request at position 4, with or without a binlog name, returns EOF until the binlog is written and then streams it from the beginning.
+
+      Through pull this corresponds to, for example, mysqlbinlog --read-from-remote-server --stop-never --start-position=<N> binlog.000001 started right after binlog_server pull, before the collector receives the first ROTATE from the source.
+
+      Impact
+
+        A client that resumes from its last position (a replica repointed at a freshly started Binlog Server, or mysqlbinlog --stop-never restarted with --start-position) is disconnected during PBS startup, instead of waiting for the data. mysqlbinlog exits; a client that retries succeeds only once the storage holds the binlog.
+
+        A non-blocking dump gets a closed connection instead of an EOF packet.
+
+        The window is short (from PBS start until the first ROTATE from the source is stored), as in PBS-91, and grows when the collector is slow to connect to the source.
+
+      Expected behaviour
+
+      A request at any position behaves like one at position 4 while the storage is empty: EOF (and polling, for a blocking dump) until the binlog exists, then the artificial ROTATE and FORMAT_DESCRIPTION events and the events from the requested position. Once the storage holds binlogs, a request for a binlog that is not there still fails, as today.
+
+      Suggested fix
+
+      In fetch_fde_from_storage() (or handle_start_states()), treat an empty buffer returned for an empty storage as EOF: return true with an empty event and stay in the start_from_offset state, so the next call tries again. Keep returning false for a binlog that exists but is shorter than a FORMAT_DESCRIPTION event (truncated or corrupt).
+
+      Tests
+
+        tests/sender_context_property_test.cpp: EmptyStorageIsPolledUntilTheBinlogArrivesFromPosition polls a reader on an empty storage 1 to 5 times at a generated event boundary, then writes the binlog and requires the artificial ROTATE (with the requested position), an artificial FORMAT_DESCRIPTION and the remaining events byte for byte. It fails in every run today, shrinking to a binlog holding only its FORMAT_DESCRIPTION event and a request at position 127: poll 1 of an empty storage, resuming at position 127, failed instead of reporting EOF.
+
+        The position-4 counterpart, EmptyStorageIsPolledUntilTheBinlogArrives, passes with PBS-91 and fails without it (checked by restoring the pre-PBS-91 rule).
+
+        The MTR test added with PBS-91, rs_blocking_dump_empty_storage, dumps from position 4 only. A copy that passes --start-position would cover this end to end.
+
+      Verified on Linux (Ubuntu 24.04, GCC 14, debug build) with the property test, on upstream main @ fd8a2d5. Not yet reproduced end to end with mysqlbinlog against pull.
+

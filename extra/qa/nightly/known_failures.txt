@@ -11,6 +11,7 @@ GtidSetDecodedFromBinaryIsPrintable  ticket 3: gtid_set GNO bounds
 IndexedEventBlockIndexesOnlyCompleteEvents  ticket 7: indexed_event_block loops on small event size
 CipherContextOffsetMatchesCounterReference  ticket 8: CTR counter carry in create_with_offset
 CipherContextDecryptionAtOffsetsRoundTrips  ticket 8: CTR counter carry in create_with_offset
+CipherContextSplitEncryptionMatchesWhole  ticket 8: CTR counter carry (split encryption variant)
 StoragePurgeKeepsStorageReopenable  ticket 9: purge during fetch leaves storage unopenable
 StoragePurgeKeepsStorageReopenableOnS3  ticket 9: purge during fetch leaves storage unopenable (S3 backend variant)
 MinimysqlBinlogEventFramesRoundTrip  ticket 10: binlog events of 16 MB or more in pull mode
@@ -18,3 +19,4 @@ TimestampParsingMatchesModel  ticket 11: out-of-range time of day accepted (sear
 FilesystemStorageUriMatchesModel  ticket 12: file URI with %00 opens the directory before it
 StorageOpeningOfDamagedFilesFailsCleanly  ticket 13: empty binlog list after opening dereferences binlog_records_.front() (segfault)
 StorageOpeningOfDamagedFilesFailsCleanlyOnS3  ticket 13: empty binlog list after opening dereferences binlog_records_.front() (segfault) (S3 backend variant)
+EmptyStorageIsPolledUntilTheBinlogArrivesFromPosition  ticket 26 (PBS-96): resuming from a position on an empty storage disconnects the client

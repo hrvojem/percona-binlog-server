@@ -216,7 +216,9 @@ nightly/coverage layers.
 `pull`** (`CHANGE REPLICATION SOURCE TO ... ; START REPLICA`), in both position
 and GTID auto-position mode, and requires the replica's data to match the
 source's. When it does not, it reports the replica's I/O-thread error and the
-statements `pull` rejected. It is the end-to-end check behind tickets 20-22.
+statements `pull` rejected. It is the end-to-end check behind tickets 20-22;
+tickets 21 (resuming from a position) and 22 (`mysqlbinlog --raw`) are fixed
+upstream in `a338dde` (PBS-42 part 5), ticket 20 is open for heartbeats.
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_replica_test.py \
@@ -285,9 +287,12 @@ what the nightly runs many cases of. Among them:
 (with a concurrent reader, also run under ThreadSanitizer),
 `indexed_event_block_property_test`, `cipher_context_property_test`,
 `minimysql_property_test` (the `pull` protocol codec), `rewriter_property_test`,
-`reader_context_property_test`, `config_value_property_test` and
+`reader_context_property_test`, `config_value_property_test`,
 `event_generation_property_test` (the artificial ROTATE / FORMAT_DESCRIPTION /
-PREVIOUS_GTIDS generators). Build them with `-DWITH_PROPERTY_TESTS=ON` and run
-them with `ctest`. Their design, settings profiles (`hegel.toml`), how to
+PREVIOUS_GTIDS generators), `search_helpers_property_test`,
+`purge_selection_property_test` and `sender_context_property_test` (the
+`pull` COM_BINLOG_DUMP streamer: the stream preamble, reading each stored byte
+once, partial events at EOF and polling an empty storage). Build them with
+`-DWITH_PROPERTY_TESTS=ON` and run them with `ctest`. Their design, settings profiles (`hegel.toml`), how to
 replay a failure, and a per-test rundown are documented in
 [`../../tests/PROPERTY_TESTS.md`](../../tests/PROPERTY_TESTS.md).

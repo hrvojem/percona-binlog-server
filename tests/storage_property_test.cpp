@@ -53,7 +53,11 @@
 //   rejected when streaming, damage the storage is designed to tolerate (a
 //   changed byte in binlog data, extra data at the end of the last binlog) is
 //   accepted with unchanged binlog records, and opening for queries skips
-//   exactly the binlogs whose metadata cannot be read.
+//   exactly the binlogs whose metadata cannot be read;
+// - opening a storage for queries (as 'list' and 'search_by_*' do, possibly
+//   while 'fetch' / 'pull' keeps running) never changes any of its objects,
+//   also with a configuration that adds encryption to a storage created
+//   without it.
 //
 // The generated events are not real binlog events, but each one starts with
 // a valid 19-byte common header (type code, event size), which is all the
@@ -84,6 +88,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <new>
 #include <memory>
 #include <numeric>
@@ -1253,7 +1258,8 @@ enum class checked_properties : std::uint8_t {
   read_back,
   concurrent_read_back,
   purge_reopenable,
-  damaged_files
+  damaged_files,
+  query_read_only
 };
 
 [[nodiscard]] bool reads_back(checked_properties properties) noexcept {
@@ -1422,6 +1428,42 @@ public:
   // damages one file (or every binlog metadata file) of a copy of the
   // storage as it is on disk now, and opens the copy for streaming and for
   // queries
+  // opens the storage for queries with 'query_settings' and checks that this
+  // left every object exactly as it was ('querying_only' is the mode of
+  // 'list' and 'search_by_*', which may run next to a writer and must not
+  // race it on any object)
+  void check_query_leaves_storage_unchanged(
+      const storage_settings &query_settings) {
+    if (query_settings.encryption.has_value()) {
+      std::ofstream keyring{root_.path() / keyring_name};
+      keyring << keyring_content;
+    }
+    const auto query_config{write_config(
+        root_.path(), location_->config_members(), query_settings)};
+    const auto before{snapshot()};
+    const auto outcome{open_storage(
+        query_config, binsrv::storage_construction_mode_type::querying_only)};
+    require(outcome.records.has_value(),
+            "the storage cannot be opened for queries: " + outcome.error);
+    const auto after{snapshot()};
+    std::string changes;
+    for (const auto &[name, content] : before) {
+      const auto found{after.find(name)};
+      if (found == std::cend(after)) {
+        changes += " '" + name + "' removed;";
+      } else if (found->second != content) {
+        changes += " '" + name + "' changed;";
+      }
+    }
+    for (const auto &[name, content] : after) {
+      if (!before.contains(name)) {
+        changes += " '" + name + "' added;";
+      }
+    }
+    require(changes.empty(),
+            "opening the storage for queries changed it:" + changes);
+  }
+
   void check_damaged_copy(const damage &value) {
     const auto copy{location_->make_sibling("damaged")};
     location_->copy_to(*copy);
@@ -1721,6 +1763,14 @@ private:
     }
   }
 
+  [[nodiscard]] std::map<std::string, object_bytes> snapshot() {
+    std::map<std::string, object_bytes> result;
+    for (const auto &name : location_->object_names()) {
+      result.emplace(name, location_->read(name));
+    }
+    return result;
+  }
+
   [[nodiscard]] std::unique_ptr<storage_location> make_location() {
     if (settings_.s3.has_value()) {
       // the scratch directory name is unique, and so is the prefix
@@ -1932,6 +1982,18 @@ void run_storage_property(hegel::TestCase &tc, checked_properties properties,
   if (properties == checked_properties::damaged_files) {
     damage_value = tc.draw("damage", damages());
   }
+  // the configuration of a query run: the same storage, encrypted in the
+  // configuration also when the storage was created without encryption
+  // (only adding encryption is accepted for an existing storage)
+  std::optional<storage_settings> query_settings;
+  if (properties == checked_properties::query_read_only) {
+    query_settings = settings;
+    if (!settings.encryption.has_value() &&
+        tc.draw("query_adds_encryption", gs::booleans())) {
+      query_settings->encryption =
+          encryption_settings{.kek_id = "gamma32", .data_cipher = "AES-256-CTR"};
+    }
+  }
   storage_harness harness{settings, properties};
   for (const auto &op : ops) {
     harness.apply(op);
@@ -1939,6 +2001,9 @@ void run_storage_property(hegel::TestCase &tc, checked_properties properties,
   harness.finish();
   if (damage_value.has_value()) {
     harness.check_damaged_copy(*damage_value);
+  }
+  if (query_settings.has_value()) {
+    harness.check_query_leaves_storage_unchanged(*query_settings);
   }
 }
 
@@ -2013,6 +2078,12 @@ BOOST_AUTO_TEST_CASE(StorageOpeningOfDamagedFilesFailsCleanly) {
   });
 }
 
+BOOST_AUTO_TEST_CASE(StorageQueryingLeavesItUnchanged) {
+  run_property([](hegel::TestCase &tc) {
+    run_storage_property(tc, checked_properties::query_read_only);
+  });
+}
+
 BOOST_AUTO_TEST_CASE(StorageMatchesModelOnS3) {
   run_s3_storage_property(checked_properties::model_agreement);
 }
@@ -2035,4 +2106,8 @@ BOOST_AUTO_TEST_CASE(StorageConcurrentReadBackMatchesDiskOnS3) {
 
 BOOST_AUTO_TEST_CASE(StorageOpeningOfDamagedFilesFailsCleanlyOnS3) {
   run_s3_storage_property(checked_properties::damaged_files);
+}
+
+BOOST_AUTO_TEST_CASE(StorageQueryingLeavesItUnchangedOnS3) {
+  run_s3_storage_property(checked_properties::query_read_only);
 }

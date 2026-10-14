@@ -20,8 +20,8 @@ FilesystemStorageUriMatchesModel  ticket 12: file URI with %00 opens the directo
 StorageOpeningOfDamagedFilesFailsCleanly  ticket 13: empty binlog list after opening dereferences binlog_records_.front() (segfault)
 StorageOpeningOfDamagedFilesFailsCleanlyOnS3  ticket 13: empty binlog list after opening dereferences binlog_records_.front() (segfault) (S3 backend variant)
 EmptyStorageIsPolledUntilTheBinlogArrivesFromPosition  ticket 26 (PBS-96): resuming from a position on an empty storage disconnects the client
-SwitchToTheNextBinlogEmitsArtificialRotate  no ticket yet: sender skips the artificial ROTATE when the next binlog holds only the magic (lead N5)
+SwitchToTheNextBinlogEmitsArtificialRotate  ticket 27: sender skips the artificial ROTATE when the next binlog holds only the magic (lead N5)
 MagicOnlyBinlogIsPolledUntilItsEventsArrive  ticket 26 (PBS-96) follow-up: resuming from a position in a binlog holding only the magic disconnects the client
 MisalignedDumpPositionNeverStreamsGarbage  ticket 7: event size below the common header size at a misaligned dump position aborts / loops
-StorageQueryingLeavesItUnchanged  no ticket yet: querying_only open rewrites metadata.json when the config adds encryption (storage_core.cpp:174-178)
-StorageQueryingLeavesItUnchangedOnS3  no ticket yet: querying_only open rewrites metadata.json when the config adds encryption (S3 backend variant)
+StorageQueryingLeavesItUnchanged  ticket 28: querying_only open rewrites metadata.json when the config adds encryption (storage_core.cpp:174-178)
+StorageQueryingLeavesItUnchangedOnS3  ticket 28: querying_only open rewrites metadata.json when the config adds encryption (S3 backend variant)

@@ -97,6 +97,7 @@ step_packages() {
     build-essential gcc-14 g++-14 cmake ninja-build git curl ca-certificates \
     pkg-config unzip xz-utils python3 python3-pip python3-venv \
     libssl-dev zlib1g-dev libaio-dev libnuma1 libncurses6 \
+    libcurl4-openssl-dev libmysqlclient-dev libzstd-dev \
     || fail "apt-get install failed"
   # the MySQL minimal tarballs link against libaio.so.1
   if [ ! -e /lib/x86_64-linux-gnu/libaio.so.1 ] && \

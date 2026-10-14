@@ -1,0 +1,249 @@
+# ==== Purpose ====
+#
+# Checks that the Binlog Server replication source ('pull' mode) sends the
+# artificial ROTATE event when a downstream client moves into a binary log
+# that, in the storage, still holds only the 4-byte magic.
+#
+# Without checkpointing, a binary log the source has just started stays
+# magic-only in the PBS storage until the next flush. When the previous binary
+# log ended with a ROTATE event, 'mysqlbinlog --raw' switches its output file
+# on that ROTATE anyway; when it ended with a STOP event (a graceful source
+# restart), the artificial ROTATE is the only thing that tells the client the
+# name of the next binary log. If it is missing, the client keeps writing the
+# next binary log into the file of the previous one and never creates a file
+# for the next one.
+#
+# This test:
+#   1. starts PBS pulling from the source in position mode, without
+#      checkpointing, and a 'mysqlbinlog --read-from-remote-server --raw
+#      --stop-never' client copying from PBS
+#   2. restarts the source gracefully (the current binary log ends with STOP)
+#   3. waits for the client to copy that binary log completely and to move
+#      into the next one while it is still magic-only in the PBS storage
+#   4. adds transactions and rotates twice, so that the binary log started
+#      by the restart and the one after it are closed
+#   5. checks that every closed binary log copied by the client is identical
+#      to the source's one.
+#
+# ==== References ====
+#
+# Ticket 27: the replication source skips the artificial ROTATE when it
+#            switches to a binary log that holds only the magic.
+
+--source ../include/have_binsrv.inc
+
+--source ../include/v80_v84_compatibility_defines.inc
+
+--source include/count_sessions.inc
+
+# in case of --repeat=N, we need to start from a fresh binary log to make
+# this test deterministic
+--echo *** Resetting replication at the very beginning of the test.
+--disable_query_log
+eval $stmt_reset_binary_logs_and_gtids;
+--enable_query_log
+
+# identifying backend storage type ('file' or 's3')
+--source ../include/identify_storage_backend.inc
+
+# No checkpointing: a new binary log stays magic-only in the storage until
+# PBS flushes it. A long read timeout keeps PBS from reconnecting (and
+# flushing) while the source is idle; it still notices the source shutdown
+# immediately, as the connection is closed.
+--let $binsrv_connect_timeout = 3
+--let $binsrv_read_timeout = 60
+--let $binsrv_idle_time = 1
+--let $binsrv_verify_checksum = TRUE
+--let $binsrv_replication_mode = position
+--source ../include/set_up_binsrv_environment.inc
+
+--echo
+--echo *** Determining the first binary log name.
+--let $first_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+
+--echo
+--echo *** Creating a table, filling it, rotating, and adding more rows.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(DEFAULT);
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES(DEFAULT);
+
+--echo
+--echo *** Determining the second binary log name.
+--let $second_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+
+--echo
+--echo *** Starting Binlog Server Utility in background in pull mode.
+--let $proc_command_line = $BINSRV pull $binsrv_config_file_path > /dev/null
+--source ../include/start_proc_in_background.inc
+--let $binsrv_pid = $proc_pid
+
+--echo
+--echo *** Waiting for the replication source listener port ready to accept
+--echo *** connections.
+--let $listening_port = $binsrv_replication_source_port
+--source ../include/wait_for_listening_port.inc
+
+--echo
+--echo *** Starting mysqlbinlog --read-from-remote-server --raw --stop-never
+--echo *** against PBS.
+--let $raw_directory = $MYSQL_TMP_DIR/rs_switch_to_empty_binlog_rotate
+--mkdir $raw_directory
+--let $proc_command_line = $MYSQL_BINLOG --read-from-remote-server --raw --stop-never --host=127.0.0.1 --port=$binsrv_replication_source_port --user=$binsrv_auth_user --password=$binsrv_auth_password --default-auth=caching_sha2_password --result-file=$raw_directory/ $first_binlog > /dev/null 2>&1
+--source ../include/start_proc_in_background.inc
+--let $client_pid = $proc_pid
+
+--echo
+--echo *** Restarting the source gracefully: the second binary log ends with
+--echo *** a STOP event, and the source starts the third one.
+--source include/restart_mysqld.inc
+
+--echo
+--echo *** Determining the third binary log name.
+--let $third_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+
+--echo
+--echo *** Waiting for PBS to switch to the third binary log.
+--let $max_number_of_attempts = 60
+--let $iteration = 0
+--let $grep_status = 1
+while ($iteration < $max_number_of_attempts)
+{
+  --error 0, 1
+  --exec grep --silent $third_binlog $binsrv_log_path
+  --let $grep_status = $__error
+  if ($grep_status == 0)
+  {
+    --let $iteration = $max_number_of_attempts
+  }
+  if ($grep_status != 0)
+  {
+    --sleep 1
+    --inc $iteration
+  }
+}
+if ($grep_status != 0)
+{
+  --die The Binlog Server Utility did not switch to the third binary log.
+}
+
+--echo
+--echo *** Waiting for the client to copy the second binary log completely
+--echo *** (up to and including the STOP event).
+--let EXPORTED_WAIT_SERVER_FILE = $binlog_base_dir$second_binlog
+--let EXPORTED_WAIT_CLIENT_FILE = $raw_directory/$second_binlog
+--perl
+  use strict;
+  use warnings;
+  my $server_size = -s $ENV{'EXPORTED_WAIT_SERVER_FILE'};
+  for (1 .. 60) {
+    my $client_size = -s $ENV{'EXPORTED_WAIT_CLIENT_FILE'};
+    exit 0 if defined $client_size && $client_size == $server_size;
+    sleep 1;
+  }
+  die "the client did not copy the second binary log completely within 60 seconds";
+EOF
+
+--echo
+--echo *** Letting the client move into the third binary log while PBS still
+--echo *** holds only its magic.
+--sleep 2
+
+--echo
+--echo *** Adding rows and rotating: PBS writes the third binary log.
+INSERT INTO t1 VALUES(DEFAULT);
+FLUSH BINARY LOGS;
+
+--echo
+--echo *** Determining the fourth binary log name.
+--let $fourth_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+
+--echo
+--echo *** Adding rows and rotating once more, so that the fourth binary log
+--echo *** is closed as well.
+INSERT INTO t1 VALUES(DEFAULT);
+FLUSH BINARY LOGS;
+
+--echo
+--echo *** Waiting for the client to copy the fourth binary log completely.
+--let EXPORTED_WAIT_SERVER_FILE = $binlog_base_dir$fourth_binlog
+--let EXPORTED_WAIT_CLIENT_FILE = $raw_directory/$fourth_binlog
+--perl
+  use strict;
+  use warnings;
+  my $server_size = -s $ENV{'EXPORTED_WAIT_SERVER_FILE'};
+  for (1 .. 60) {
+    my $client_size = -s $ENV{'EXPORTED_WAIT_CLIENT_FILE'};
+    exit 0 if defined $client_size && $client_size == $server_size;
+    sleep 1;
+  }
+  die "the client did not copy the fourth binary log completely within 60 seconds";
+EOF
+
+--echo
+--echo *** Sending SIGTERM to the mysqlbinlog client and waiting for it to
+--echo *** terminate.
+--error 0, 1
+--exec kill -0 $client_pid 2>/dev/null
+--let $client_kill_status = $__error
+if ($client_kill_status == 0)
+{
+  --let $proc_pid = $client_pid
+  --source ../include/terminate_proc.inc
+}
+
+--echo
+--echo *** Comparing the client's copies of the closed binary logs with the
+--echo *** source's ones.
+--let EXPORTED_SERVER_DIR = $binlog_base_dir
+--let EXPORTED_CLIENT_DIR = $raw_directory
+--let EXPORTED_BINLOGS = $first_binlog $second_binlog $third_binlog $fourth_binlog
+--perl
+  use strict;
+  use warnings;
+  my @labels = ('first', 'second', 'third', 'fourth');
+  my @names = split ' ', $ENV{'EXPORTED_BINLOGS'};
+  for my $i (0 .. $#names) {
+    my $server_file = "$ENV{'EXPORTED_SERVER_DIR'}$names[$i]";
+    my $client_file = "$ENV{'EXPORTED_CLIENT_DIR'}/$names[$i]";
+    my $status;
+    if (! -e $client_file) {
+      $status = "missing from the client's copy";
+    } else {
+      local $/;
+      open my $sf, '<:raw', $server_file or die "cannot open $server_file: $!";
+      open my $cf, '<:raw', $client_file or die "cannot open $client_file: $!";
+      my $server_data = <$sf>;
+      my $client_data = <$cf>;
+      close $sf;
+      close $cf;
+      $status = $server_data eq $client_data
+        ? 'identical'
+        : sprintf('DIFFERS (source %d bytes, client %d bytes)',
+                  length($server_data), length($client_data));
+    }
+    print "$labels[$i] binary log: $status\n";
+  }
+EOF
+
+--force-rmdir $raw_directory
+
+--echo
+--echo *** Dropping the table.
+DROP TABLE t1;
+
+--echo
+--echo *** Sending SIGTERM signal to the Binlog Server Utility and waiting
+--echo *** for the process to terminate.
+--let $proc_pid = $binsrv_pid
+--source ../include/terminate_proc.inc
+
+# cleaning up
+--source ../include/tear_down_binsrv_environment.inc
+
+# As the Binlog Server Utility interrupts the connection upon termination,
+# close it on the MySQL server side as well, so that MTR 'check-test' before
+# and after the test produces the same output.
+--source ../include/kill_binlog_dump_connection.inc
+
+--source include/wait_until_count_sessions.inc

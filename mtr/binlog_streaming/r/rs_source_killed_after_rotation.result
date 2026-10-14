@@ -1,0 +1,62 @@
+*** Resetting replication at the very beginning of the test.
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+
+*** Determining binlog file directory from the server.
+
+*** Creating a temporary directory <BINSRV_STORAGE_PATH> for storing
+*** binlog files downloaded via the Binlog Server utility.
+
+*** Determining the first binary log name.
+
+*** Creating a table and filling it with some data.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(DEFAULT);
+
+*** Starting Binlog Server Utility in background in pull mode.
+
+*** Waiting for the replication source listener port ready to accept
+*** connections.
+
+*** Waiting for PBS to start receiving the first binary log.
+
+*** Rotating the binary log on the source and killing the source before
+*** any transaction is written to the second binary log.
+FLUSH BINARY LOGS;
+# Kill the server
+
+*** Restarting the source: it starts the third binary log.
+# restart
+
+*** Determining the third binary log name.
+
+*** Adding rows and rotating, so that PBS closes the third binary log.
+INSERT INTO t1 VALUES(DEFAULT);
+INSERT INTO t1 VALUES(DEFAULT);
+FLUSH BINARY LOGS;
+
+*** Determining the fourth binary log name.
+
+*** Waiting for PBS to switch to the fourth binary log, checking that it
+*** is still running meanwhile.
+
+*** Sending SIGTERM signal to the Binlog Server Utility and waiting
+*** for the process to terminate.
+
+*** Comparing server and stored versions of the first binary log.
+
+*** Comparing server and stored versions of the second binary log (the
+*** one the source was killed in, holding no transactions).
+
+*** Comparing server and stored versions of the third binary log (the
+*** transactions written after the restart).
+
+*** Dropping the table.
+DROP TABLE t1;
+
+*** Removing the Binlog Server utility storage directory.
+
+*** Removing the Binlog Server utility log file.
+
+*** Removing the Binlog Server utility configuration file.

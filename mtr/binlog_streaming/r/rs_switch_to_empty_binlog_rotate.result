@@ -1,0 +1,76 @@
+*** Resetting replication at the very beginning of the test.
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+
+*** Determining binlog file directory from the server.
+
+*** Creating a temporary directory <BINSRV_STORAGE_PATH> for storing
+*** binlog files downloaded via the Binlog Server utility.
+
+*** Determining the first binary log name.
+
+*** Creating a table, filling it, rotating, and adding more rows.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(DEFAULT);
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES(DEFAULT);
+
+*** Determining the second binary log name.
+
+*** Starting Binlog Server Utility in background in pull mode.
+
+*** Waiting for the replication source listener port ready to accept
+*** connections.
+
+*** Starting mysqlbinlog --read-from-remote-server --raw --stop-never
+*** against PBS.
+
+*** Restarting the source gracefully: the second binary log ends with
+*** a STOP event, and the source starts the third one.
+# restart
+
+*** Determining the third binary log name.
+
+*** Waiting for PBS to switch to the third binary log.
+
+*** Waiting for the client to copy the second binary log completely
+*** (up to and including the STOP event).
+
+*** Letting the client move into the third binary log while PBS still
+*** holds only its magic.
+
+*** Adding rows and rotating: PBS writes the third binary log.
+INSERT INTO t1 VALUES(DEFAULT);
+FLUSH BINARY LOGS;
+
+*** Determining the fourth binary log name.
+
+*** Adding rows and rotating once more, so that the fourth binary log
+*** is closed as well.
+INSERT INTO t1 VALUES(DEFAULT);
+FLUSH BINARY LOGS;
+
+*** Waiting for the client to copy the fourth binary log completely.
+
+*** Sending SIGTERM to the mysqlbinlog client and waiting for it to
+*** terminate.
+
+*** Comparing the client's copies of the closed binary logs with the
+*** source's ones.
+first binary log: identical
+second binary log: identical
+third binary log: identical
+fourth binary log: identical
+
+*** Dropping the table.
+DROP TABLE t1;
+
+*** Sending SIGTERM signal to the Binlog Server Utility and waiting
+*** for the process to terminate.
+
+*** Removing the Binlog Server utility storage directory.
+
+*** Removing the Binlog Server utility log file.
+
+*** Removing the Binlog Server utility configuration file.

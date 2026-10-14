@@ -252,8 +252,7 @@ public:
       source_config_.get<"port">() = pick_free_port();
       source_config_.validate();
       try {
-        service_.emplace(std::make_shared<binsrv::null_logger>(), io_context_,
-                         storage_, source_config_);
+        service_.emplace(logger_, io_context_, storage_, source_config_);
       } catch (const boost::system::system_error &) {
         if (attempt == max_bind_attempts) {
           throw;
@@ -285,6 +284,10 @@ private:
   std::unique_ptr<binsrv::main_config> config_{};
   binsrv::storage_ptr storage_{};
   binsrv::replication_source_config source_config_{};
+  // owned here, and declared before the io_context, as pull_operation.cpp
+  // keeps its logger alive: destroying the io_context destroys the listener
+  // coroutines, whose scope tracers still log on the way out
+  binsrv::basic_logger_ptr logger_{std::make_shared<binsrv::null_logger>()};
   boost::asio::io_context io_context_{};
   std::optional<minimysql::network_service> service_{};
   std::jthread thread_{};

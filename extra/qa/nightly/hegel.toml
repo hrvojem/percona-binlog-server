@@ -22,3 +22,10 @@ test_cases = 300
 database = "@NIGHTLY_DIR@/hegel-db/tsan_gcc14"
 suppress_health_check = ["too_slow"]
 report_multiple_failures = true
+
+# release_gcc14 (RelWithDebInfo, NDEBUG): fewer cases than debug, each case
+# also runs under a wall-clock limit in run_nightly.sh (RELEASE_CASE_TIMEOUT)
+[profiles.nightly_release]
+test_cases = 500
+database = "@NIGHTLY_DIR@/hegel-db/release_gcc14"
+report_multiple_failures = true

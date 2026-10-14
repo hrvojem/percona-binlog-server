@@ -19,6 +19,9 @@ writes a log per failing case into --out.
        as a case of the build 'qa-<series>' (program: the harness name).
        Known failures: qa_known_failures.txt, lines
        '<harness> <case>  ticket N: ...' (or '<harness> *' for every case).
+       --config records the cases under another build label instead of
+       'qa-<series>' (the release stage's fetch_crash_test run uses
+       'release_gcc14').
 
 Statuses: passed, known (a listed failure), new (an unlisted failure),
 known-passed (a listed case that passed), skipped (MTR skipped the test), and
@@ -274,8 +277,8 @@ def harness_cases(args, returncode: int, output: str) -> list:
 
 
 def run_qa(args) -> int:
-    recorder = Recorder(args, f"qa-{args.series}", args.harness,
-                        args.harness + "/")
+    recorder = Recorder(args, args.config or f"qa-{args.series}",
+                        args.harness, args.harness + "/")
     known = read_known(Path(args.known))
     workdir = Path(args.workdir)
     shutil.rmtree(workdir, ignore_errors=True)
@@ -336,6 +339,8 @@ def main():
                         help="minutes")
     # qa
     parser.add_argument("--harness")
+    parser.add_argument("--config", default="",
+                        help="build label of the cases (default qa-<series>)")
     parser.add_argument("--qa-dir", help="extra/qa of the source tree")
     parser.add_argument("--workdir")
     parser.add_argument("--port", type=int, default=24500)

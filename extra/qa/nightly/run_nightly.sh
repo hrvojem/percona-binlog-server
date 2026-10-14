@@ -17,12 +17,25 @@
 # are compared with mtr_known_failures.txt and qa_known_failures.txt (see
 # nightly_stages.py, which runs those stages).
 #
-# STAGES selects what runs (default "cpp mtr qa"); without "cpp" nothing is
-# built and the existing binaries are used. OUT_DIR runs into another
-# directory instead of runs/<date> and then leaves history.tsv, the latest
-# symlink and old runs alone, to try a stage out without touching the
-# nightly's own results, e.g.
+# The release stage builds release_gcc14 (the project's RelWithDebInfo preset:
+# -O2, NDEBUG, against release builds of Boost and the AWS SDK) in its own
+# build directory, configuring it the first time, and runs its unit tests and
+# every property test case like the C++ stage (profile nightly_release), but
+# each case under a short wall-clock limit (RELEASE_CASE_TIMEOUT): without the
+# assertions some known bugs loop forever instead of aborting (ticket 7), and
+# a hang must come out as a TIMEOUT failure, not a stuck nightly. Then a short
+# fetch_crash_test run uses the release binary. Release-only behaviour of a
+# known failure is listed in known_failures.txt as 'release_gcc14:<case>'.
+#
+# STAGES selects what runs (default "cpp mtr qa release"); without "cpp" the
+# debug / ASan / TSan trees are not built and the existing binaries are used.
+# OUT_DIR runs into another directory instead of runs/<date> and then leaves
+# history.tsv, the latest symlink and old runs alone, to try a stage out
+# without touching the nightly's own results, e.g.
 #   STAGES=mtr OUT_DIR=~/ws/qa/nightly-try ~/ws/nightly/run_nightly.sh
+# (for the cpp / release stages keep OUT_DIR under $NIGHTLY: the property
+# tests find hegel.toml in an ancestor of their working directory, e.g.
+#   STAGES=release OUT_DIR=~/ws/nightly/try-release ...)
 #
 # Results: ~/ws/nightly/runs/<date>/summary.txt (also ~/ws/nightly/latest),
 # one log per test case next to it, results.jsonl (one JSON line per test
@@ -41,12 +54,19 @@ SRC=$WS/percona-binlog-server
 NIGHTLY=${NIGHTLY:-$WS/nightly}
 KEEP_DAYS=30
 CASE_TIMEOUT=3600
+# the release stage's limit per property test case: a release case of 500
+# examples takes seconds to a few minutes, so anything near this is a hang
+RELEASE_CASE_TIMEOUT=${RELEASE_CASE_TIMEOUT:-600}
+# and its address-space limit per case (ulimit -v, MB): with the assertions
+# compiled out, ticket 7 makes indexed_event_block grow its index until
+# std::bad_alloc, 8+ GB on this 16 GB host shared with other jobs
+RELEASE_CASE_MEMORY_MB=${RELEASE_CASE_MEMORY_MB:-4096}
 # property test cases run several at a time; each one is a separate process
 # with its own Hegel database subtree, so they do not interfere. ThreadSanitizer
 # cases are memory-heavy, so they use a smaller pool.
 JOBS=${JOBS:-4}
 TSAN_JOBS=${TSAN_JOBS:-2}
-STAGES=" ${STAGES:-cpp mtr qa} "
+STAGES=" ${STAGES:-cpp mtr qa release} "
 # MTR stage: <series>:<distribution under $WS/dist>; its own build thread
 # (ports) and var directories so it does not collide with manual MTR runs.
 # A worker of build thread N uses ports 10000+10*N.. (30 per worker) and the
@@ -64,6 +84,8 @@ QA_PORT=${QA_PORT:-24470}
 QA_RUNS=${QA_RUNS:-500}
 QA_EXAMPLES=${QA_EXAMPLES:-10}
 QA_STEPS=${QA_STEPS:-8}
+# release stage: one short fetch_crash_test run with the release binary
+RELEASE_QA_EXAMPLES=${RELEASE_QA_EXAMPLES:-5}
 export PYTHONPATH=${PYTHONPATH:-$WS/qa/pylib}
 want() { [[ "$STAGES" == *" $1 "* ]]; }
 
@@ -92,20 +114,28 @@ log() { echo "[$(date -u "+%F %T")] $*" | tee -a "$out/nightly.log"; }
 # outcome to "$status_dir/<test case>" as tab-separated fields the main loop
 # aggregates afterwards: status, program, test case, ticket, reason, seconds,
 # and the human-readable summary line. Reads $config / $work / $profile /
-# $run_prefix / $status_dir / known[] from the enclosing config iteration.
+# $run_prefix / $status_dir / $case_timeout / $case_memory_kb / known[] from
+# the enclosing config iteration. A known_failures.txt line
+# '<config>:<test case>' takes precedence over a plain '<test case>' line for
+# that build.
 run_case() {
   local program=$1 binary=$2 test_case=$3
   local case_log=$out/$config-$test_case.log
   local case_started
   case_started=$(date +%s)
-  (cd "$work" && HEGEL_DEFAULT_PROFILE=$profile \
-    timeout "$CASE_TIMEOUT" "${run_prefix[@]}" "$binary" \
+  local s3_cases=${PBS_TEST_S3_TEST_CASES:-}
+  [ "$config" = debug_gcc14 ] && [ -n "${S3_DEBUG_TEST_CASES:-}" ] &&
+    s3_cases=$S3_DEBUG_TEST_CASES
+  (cd "$work" && { [ -z "$case_memory_kb" ] || ulimit -v "$case_memory_kb"; } &&
+    env ${s3_cases:+PBS_TEST_S3_TEST_CASES=$s3_cases} \
+    HEGEL_DEFAULT_PROFILE=$profile \
+    timeout -k 30 "$case_timeout" "${run_prefix[@]}" "$binary" \
     --run_test="$test_case" > "$case_log" 2>&1)
   local rc=$?
   local case_seconds=$(( $(date +%s) - case_started ))
   local tsan_reports
   tsan_reports=$(grep -c "WARNING: ThreadSanitizer" "$case_log")
-  local ticket=${known[$test_case]:-}
+  local ticket=${known[$config:$test_case]:-${known[$test_case]:-}}
   local status reason="" line=""
   if [ $rc -eq 0 ] && [ "$tsan_reports" -eq 0 ]; then
     rm -f "$case_log"
@@ -117,13 +147,18 @@ run_case() {
     fi
   else
     reason=$(grep -m1 -oE "Exception: .{0,150}" "$case_log")
-    [ $rc -eq 124 ] && reason="timed out after ${CASE_TIMEOUT}s"
+    # 124: timeout's TERM worked, 137: the case ignored it and was killed
+    local timed_out=""
+    if [ $rc -eq 124 ] || [ $rc -eq 137 ]; then
+      timed_out=" [TIMEOUT]"
+      reason="TIMEOUT: no result after ${case_timeout}s (hang?)"
+    fi
     [ "$tsan_reports" -gt 0 ] && reason="$tsan_reports ThreadSanitizer reports"
     grep -q "ERROR: AddressSanitizer" "$case_log" &&
       reason=$(grep -m1 -oE "ERROR: AddressSanitizer: .{0,120}" "$case_log")
     if [ -n "$ticket" ]; then
       status=known
-      line="known         $config  $test_case  ($ticket)"
+      line="known         $config  $test_case  ($ticket)$timed_out"
     else
       status=new
       line="NEW FAILURE   $config  $test_case  $reason  ($(basename "$case_log"))"
@@ -200,6 +235,11 @@ if curl -s -o /dev/null --max-time 5 http://127.0.0.1:9000/; then
   export PBS_TEST_S3_SECRET_KEY='pbs/secret+key=1'
   export PBS_TEST_S3_BUCKET=pbs-mtr
   log "S3 backend property variants enabled (127.0.0.1:9000, bucket pbs-mtr)"
+  # nightly only: the storage '...OnS3' properties run 20 cases by default
+  # (PBS_TEST_S3_TEST_CASES); the debug build runs more of them (they run
+  # serially, and 100 cases in every build would add 1-3 hours a night)
+  S3_DEBUG_TEST_CASES=${S3_DEBUG_TEST_CASES:-100}
+  log "S3 storage property variants run $S3_DEBUG_TEST_CASES cases each in debug_gcc14, 20 elsewhere"
 else
   log "S3 server not reachable; S3 property variants will be skipped"
 fi
@@ -212,13 +252,30 @@ results=()
 declare -A build_failed
 
 cpp_configs=()
-want cpp && cpp_configs=(debug_gcc14 asan_gcc14 tsan_gcc14)
+want cpp && cpp_configs+=(debug_gcc14 asan_gcc14 tsan_gcc14)
+want release && cpp_configs+=(release_gcc14)
 for config in "${cpp_configs[@]}"; do
   build_dir=$WS/percona-binlog-server-build-$config
+  config_started=$(date +%s)
   targets=()
   run_prefix=()
   property_tests=()
+  case_timeout=$CASE_TIMEOUT
+  case_memory_kb=""
   case $config in
+    release_gcc14)
+      profile=nightly_release
+      case_timeout=$RELEASE_CASE_TIMEOUT
+      case_memory_kb=$(( RELEASE_CASE_MEMORY_MB * 1024 ))
+      # the only tree the nightly configures itself (the others come from
+      # setup_test_environment.sh / build_project.sh)
+      if [ ! -f "$build_dir/CMakeCache.txt" ]; then
+        log "configuring $config"
+        cmake -S "$SRC" -B "$build_dir" --preset release_gcc14 \
+          -DWITH_PROPERTY_TESTS=ON > "$out/configure-$config.log" 2>&1 ||
+          log "CONFIGURE FAILED: $config (configure-$config.log)"
+      fi
+      ;;
     debug_gcc14) profile=nightly_debug ;;
     asan_gcc14)  profile=nightly_asan ;;
     tsan_gcc14)
@@ -349,10 +406,12 @@ for config in "${cpp_configs[@]}"; do
         ;;
     esac
   done
+  log "$config done in $(( ($(date +%s) - config_started) / 60 )) min"
 done
 
 debug_binsrv=$WS/percona-binlog-server-build-debug_gcc14/binlog_server
 asan_binsrv=$WS/percona-binlog-server-build-asan_gcc14/binlog_server
+release_binsrv=$WS/percona-binlog-server-build-release_gcc14/binlog_server
 
 # the binlog_streaming MTR suite with the debug build, one MySQL version at a
 # time (each run is already parallel)
@@ -379,18 +438,20 @@ fi
 
 # black-box QA harnesses from extra/qa (one MySQL version); workdirs are kept
 # short because the mysqld socket path is limited to 107 characters
+qa_series=${QA_DIST%%:*}
+qa_args=(--dist "$WS/dist/${QA_DIST#*:}" --series "$qa_series"
+  --known "$NIGHTLY/qa_known_failures.txt" --results "$stage_results"
+  --lines "$stage_lines" --out "$out" --qa-dir "$SRC/extra/qa")
+# qa_run <harness> <name> [--config <build label>] <harness options>...
+qa_run() {
+  local harness=$1 name=$2 label="qa-$qa_series"; shift 2
+  [ "${1:-}" = --config ] && label=$2
+  log "QA harness $name"
+  python3 "$NIGHTLY/nightly_stages.py" qa "${qa_args[@]}" \
+    --harness "$harness" "$@" >> "$out/nightly.log" 2>&1
+  tally_stage $? "$label" "$harness"
+}
 if want qa; then
-  qa_series=${QA_DIST%%:*}
-  qa_args=(--dist "$WS/dist/${QA_DIST#*:}" --series "$qa_series"
-    --known "$NIGHTLY/qa_known_failures.txt" --results "$stage_results"
-    --lines "$stage_lines" --out "$out" --qa-dir "$SRC/extra/qa")
-  qa_run() {
-    local harness=$1 name=$2; shift 2
-    log "QA harness $name"
-    python3 "$NIGHTLY/nightly_stages.py" qa "${qa_args[@]}" \
-      --harness "$harness" "$@" >> "$out/nightly.log" 2>&1
-    tally_stage $? "qa-$qa_series" "$harness"
-  }
   if [ -n "${build_failed[debug_gcc14]:-}" ]; then
     log "QA harnesses on the debug build skipped: the debug build failed"
   else
@@ -413,6 +474,20 @@ if want qa; then
     done
   fi
 fi
+# the release stage's crash/resume run: release-only misbehaviour of the
+# resume path (wrong state where debug would assert) under the same oracle
+if want release; then
+  if [ -n "${build_failed[release_gcc14]:-}" ]; then
+    log "release fetch_crash_test skipped: the release build failed"
+  else
+    stage_started=$(date +%s)
+    qa_run fetch_crash_test "fetch_crash_test (release, gtid)" \
+      --config release_gcc14 --binsrv "$release_binsrv" \
+      --workdir "$out/qa/fc-release" --port $((QA_PORT + 50)) --mode gtid \
+      --examples "$RELEASE_QA_EXAMPLES" --steps "$QA_STEPS" --timeout 900
+    log "release fetch_crash_test done in $(( ($(date +%s) - stage_started) / 60 )) min"
+  fi
+fi
 rm -f "$stage_results" "$stage_lines"
 
 duration=$(( ($(date +%s) - started) / 60 ))
@@ -422,7 +497,7 @@ duration=$(( ($(date +%s) - started) / 60 ))
   echo
   printf '%s\n' "${results[@]}" | sort
   echo
-  echo "Replay a property failure: cd $out/work-<build> && HEGEL_DEFAULT_PROFILE=<profile> <test binary> --run_test=<test case>"
+  echo "Replay a property failure: cd $out/work-<build> && HEGEL_DEFAULT_PROFILE=<profile> <test binary> --run_test=<test case> (profile nightly_<debug|asan|tsan|release>; release cases under 'timeout $RELEASE_CASE_TIMEOUT')"
   echo "Replay an MTR failure: cd $WS/dist/<distribution>/mysql-test && BINSRV=$debug_binsrv ./mtr --build-thread=$MTR_BUILD_THREAD binlog_streaming.<test> (log: mtr-<series>-<test>.log)"
   echo "Replay a QA failure: see the command at the top of qa-<series>-<case>.log"
 } >> "$summary"

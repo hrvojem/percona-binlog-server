@@ -35,7 +35,7 @@
 #   REPO_URL     git URL to clone if the repo is not already under WS
 #                (default: https://github.com/Percona-Lab/percona-binlog-server.git)
 #   REPO_BRANCH  branch to clone                (default: main)
-#   PROJECT_PRESETS  project configs to build   (default: "debug_gcc14 asan_gcc14 tsan_gcc14 coverage_gcc14")
+#   PROJECT_PRESETS  project configs to build   (default: "debug_gcc14 asan_gcc14 tsan_gcc14 release_gcc14 coverage_gcc14")
 #   JOBS         parallel build jobs            (default: nproc)
 #   NIGHTLY_CRON cron schedule for the nightly   (default: "30 1 * * *";
 #                run, five fields; empty string   empty installs the runner
@@ -49,7 +49,7 @@ set -uo pipefail
 WS="${WS:-$HOME/ws}"
 REPO_URL="${REPO_URL:-https://github.com/Percona-Lab/percona-binlog-server.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
-PROJECT_PRESETS="${PROJECT_PRESETS:-debug_gcc14 asan_gcc14 tsan_gcc14 coverage_gcc14}"
+PROJECT_PRESETS="${PROJECT_PRESETS:-debug_gcc14 asan_gcc14 tsan_gcc14 release_gcc14 coverage_gcc14}"
 JOBS="${JOBS:-$(nproc)}"
 SRC="$WS/percona-binlog-server"
 

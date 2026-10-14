@@ -295,6 +295,48 @@ if(WITH_PROPERTY_TESTS)
     CXX_EXTENSIONS NO
   )
 
+  # the replication source listener (minimysql::network_service, PBS-90) and
+  # everything it runs are part of the executable's sources, so they are
+  # compiled into the test directly: the listener is started in-process and
+  # driven over a real TCP connection
+  add_executable(replication_source_property_test
+    replication_source_property_test.cpp
+    "${PROJECT_SOURCE_DIR}/src/minimysql/network_service.cpp"
+    "${PROJECT_SOURCE_DIR}/src/minimysql/network_io_operations.cpp"
+    "${PROJECT_SOURCE_DIR}/src/minimysql/connection_context.cpp"
+    "${PROJECT_SOURCE_DIR}/src/minimysql/caching_sha2_password_authenticator.cpp"
+    "${PROJECT_SOURCE_DIR}/src/operations/sender_context.cpp"
+    "${PROJECT_SOURCE_DIR}/src/operations/event_generation_helpers.cpp"
+  )
+  target_include_directories(replication_source_property_test
+    PRIVATE
+      "${PROJECT_SOURCE_DIR}/src"
+      "${PROJECT_SOURCE_DIR}/extra/mysql_protocol"
+  )
+  target_link_libraries(replication_source_property_test
+    PRIVATE
+      binlog_server_compiler_flags
+      binsrv::lib_binsrv
+      binsrv::lib_opensslpp
+      binsrv::lib_util
+      Boost::headers Boost::asio
+      MySQL::client
+      Boost::unit_test_framework
+      hegel
+  )
+  set_target_properties(replication_source_property_test PROPERTIES
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+  )
+  # GCC 14 at -O2 (release_gcc14) reports false -Wnull-dereference warnings
+  # inside Boost.Asio's io_context / scheduler code inlined into this test
+  # (which -Werror turns into errors); the debug builds do not inline it. A
+  # source-file option, so it comes after binlog_server_compiler_flags'
+  # -Wnull-dereference on the command line.
+  set_source_files_properties(replication_source_property_test.cpp
+    TARGET_DIRECTORY replication_source_property_test
+    PROPERTIES COMPILE_OPTIONS $<$<CXX_COMPILER_ID:GNU>:-Wno-null-dereference>)
+
   add_executable(rewriter_property_test rewriter_property_test.cpp)
   target_include_directories(rewriter_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
   target_link_libraries(rewriter_property_test
@@ -424,6 +466,7 @@ if(WITH_PROPERTY_TESTS)
   add_test(NAME indexed_event_block_property_test COMMAND indexed_event_block_property_test ${test_run_options})
   add_test(NAME cipher_context_property_test COMMAND cipher_context_property_test ${test_run_options})
   add_test(NAME minimysql_property_test COMMAND minimysql_property_test ${test_run_options})
+  add_test(NAME replication_source_property_test COMMAND replication_source_property_test ${test_run_options})
   add_test(NAME rewriter_property_test COMMAND rewriter_property_test ${test_run_options})
   add_test(NAME event_generation_property_test COMMAND event_generation_property_test ${test_run_options})
   add_test(NAME reader_context_property_test COMMAND reader_context_property_test ${test_run_options})

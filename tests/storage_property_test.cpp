@@ -64,7 +64,12 @@
 //   backend is wrapped through the storage_backend_factory test seam) leaves
 //   a storage that opens again, holds every binlog but the last completely
 //   and the last one up to a transaction boundary, never holds data twice,
-//   and resumes right after the data on disk.
+//   and resumes right after the data on disk;
+// - with an encrypted storage, a writer killed right after appending data
+//   that its metadata does not cover yet, recovered by the next start (which
+//   truncates that tail) and then writing different events, never encrypts
+//   an offset twice with the same AES-CTR keystream (the XOR of the two
+//   ciphertexts must not be the XOR of the two plaintexts).
 //
 // The generated events are not real binlog events, but each one starts with
 // a valid 19-byte common header (type code, event size), which is all the
@@ -1306,6 +1311,9 @@ struct fault_plan {
   // for a crash: whether the chosen call still completes before the process
   // dies (otherwise it dies right before the call)
   bool after_call{false};
+  // count only the calls that write binlog data to the stream (the crash
+  // then always leaves data the metadata does not cover yet)
+  bool only_stream_writes{false};
 
   // counting starts once armed, after the initial storage is set up
   bool armed{false};
@@ -1344,6 +1352,10 @@ private:
   [[nodiscard]] bool before_mutation(const std::string &what) {
     fail_if_dead();
     if (!plan_->armed || plan_->triggered) {
+      return false;
+    }
+    if (plan_->only_stream_writes &&
+        !what.starts_with("write_data_to_stream")) {
       return false;
     }
     if (++plan_->calls != plan_->target_call) {
@@ -2479,6 +2491,243 @@ void run_s3_storage_property(checked_properties properties,
       settings, location);
 }
 
+
+// ---------------------------------------------------------------------------
+// keystream reuse after crash recovery
+// ---------------------------------------------------------------------------
+
+// one event of the keystream property, optionally followed by a flush
+struct keystream_write {
+  std::size_t event_size;
+  bool at_transaction_boundary;
+  bool flush_after;
+};
+
+std::ostream &operator<<(std::ostream &output, const keystream_write &value) {
+  return output << "write(" << value.event_size << " bytes"
+                << (value.at_transaction_boundary ? ", end of transaction" : "")
+                << (value.flush_after ? ", flush" : "") << ')';
+}
+
+[[nodiscard]] gs::Generator<keystream_write> keystream_writes() {
+  return gs::compose([](const hegel::TestCase &tc) {
+    return keystream_write{
+        .event_size = tc.draw(gs::integers<std::size_t>(
+            {.min_value = min_event_size, .max_value = max_event_size})),
+        .at_transaction_boundary = tc.draw(gs::booleans()),
+        .flush_after = tc.draw(gs::booleans())};
+  });
+}
+
+// the bytes of an event: a valid common header and a pattern that depends on
+// 'seed', so that the two lives of the storage write different bytes
+[[nodiscard]] std::vector<std::byte> keystream_event_bytes(std::size_t size,
+                                                           std::uint64_t seed) {
+  using header = binsrv::events::common_header_view_base;
+  static constexpr std::uint64_t byte_multiplier{29ULL};
+  std::vector<std::byte> result(size);
+  for (std::size_t index{0U}; index < size; ++index) {
+    result[index] =
+        static_cast<std::byte>((seed + index * byte_multiplier) & 0xFFULL);
+  }
+  assert(size >= header::size_in_bytes);
+  const auto write_field{[&result](std::size_t offset, auto value) {
+    util::byte_span field{std::next(std::data(result),
+                                    static_cast<std::ptrdiff_t>(offset)),
+                          sizeof value};
+    util::insert_fixed_int_to_byte_span(field, value);
+  }};
+  write_field(header::type_code_offset,
+              static_cast<std::uint8_t>(binsrv::events::code_type::query));
+  write_field(header::event_size_offset, static_cast<std::uint32_t>(size));
+  return result;
+}
+
+// writes the events to the storage and appends them to 'plaintext' (the
+// binlog file is the magic followed by every event in order, as nothing is
+// discarded)
+void write_keystream_events(binsrv::storage &target,
+                            const std::vector<keystream_write> &writes,
+                            std::uint64_t seed,
+                            std::vector<std::byte> &plaintext) {
+  static constexpr std::uint64_t event_seed_step{97ULL};
+  for (const auto &write : writes) {
+    const auto bytes{keystream_event_bytes(write.event_size, seed)};
+    seed += event_seed_step;
+    plaintext.insert(std::end(plaintext), std::cbegin(bytes), std::cend(bytes));
+    target.write_event(util::const_byte_span{bytes},
+                       write.at_transaction_boundary, binsrv::gtids::gtid{},
+                       util::ctime_timestamp{std::time_t{1}}, 0ULL);
+    if (write.flush_after) {
+      target.flush_event_buffer();
+    }
+  }
+  target.flush_event_buffer();
+}
+
+// AES-CTR turns the same key, IV and offset into the same keystream byte,
+// so no offset of a binlog may be encrypted twice for different plaintext:
+// the XOR of the two ciphertexts would be the XOR of the two plaintexts.
+// A writer killed right after appending data its metadata does not cover
+// yet leaves a tail that the next start truncates (storage_core recovery);
+// whatever is written next lands at the same offsets of the same file,
+// whose key and IV come from the same binlog metadata.
+void run_keystream_property(hegel::TestCase &tc) {
+  const auto kek_id{tc.draw("kek_id", gs::sampled_from(keyring_key_ids))};
+  const bool block_mode_kek{std::ranges::find(block_mode_key_ids, kek_id) !=
+                            std::cend(block_mode_key_ids)};
+  const auto data_cipher{tc.draw(
+      "data_cipher",
+      gs::sampled_from(block_mode_kek
+                           ? std::vector<std::string>{"AES-128-CTR",
+                                                      "AES-256-CTR"}
+                           : std::vector<std::string>{"AES-128-CTR",
+                                                      "AES-192-CTR",
+                                                      "AES-256-CTR"}))};
+  static constexpr std::uint64_t min_checkpoint_size{64ULL};
+  static constexpr std::uint64_t max_checkpoint_size{4096ULL};
+  std::optional<std::uint64_t> checkpoint_size{};
+  if (tc.draw("with_checkpoint_size", gs::booleans())) {
+    checkpoint_size = tc.draw(
+        "checkpoint_size",
+        gs::integers<std::uint64_t>({.min_value = min_checkpoint_size,
+                                     .max_value = max_checkpoint_size}));
+  }
+  static constexpr std::size_t max_writes{30U};
+  const auto first_life{tc.draw(
+      "first_life",
+      gs::vectors(keystream_writes(), {.min_size = 1U, .max_size = max_writes}))};
+  static constexpr std::size_t max_crash_write{20U};
+  const auto crash_write{tc.draw(
+      "crash_after_stream_write",
+      gs::integers<std::size_t>({.min_value = 1U, .max_value = max_crash_write}))};
+  const auto second_life{tc.draw(
+      "second_life",
+      gs::vectors(keystream_writes(), {.min_size = 1U, .max_size = max_writes}))};
+
+  const storage_settings settings{
+      .s3 = std::nullopt,
+      .gtid_mode = false,
+      .checkpoint_size = checkpoint_size,
+      .encryption =
+          encryption_settings{.kek_id = kek_id, .data_cipher = data_cipher},
+      .tailing_reader_block_size = 0U,
+      .fresh_reader_block_size = 0U};
+  const scratch_directory root{};
+  {
+    std::ofstream keyring{root.path() / keyring_name};
+    keyring << keyring_content;
+  }
+  directory_location location{root.path() / "storage"};
+  const auto config{
+      write_config(root.path(), location.config_members(), settings)};
+  const binsrv::events::composite_binlog_name name{binlog_base_name, 1U};
+
+  fault_plan plan{};
+  plan.kind = fault_kind::crash;
+  plan.after_call = true;
+  plan.only_stream_writes = true;
+  plan.target_call = crash_write;
+  std::unique_ptr<storage_location> snapshot{};
+  plan.on_crash = [&location, &snapshot] {
+    snapshot = location.make_sibling("crash");
+    location.copy_to(*snapshot);
+  };
+  const fault_injection_scope scope{plan};
+
+  // the first life, killed right after its chosen data write
+  std::vector<std::byte> first_plaintext{
+      std::cbegin(binsrv::events::magic_binlog_payload),
+      std::cend(binsrv::events::magic_binlog_payload)};
+  {
+    const auto writer{make_storage(config)};
+    require(writer->open_binlog(name) == binsrv::open_binlog_status::created,
+            "the binlog was not created");
+    plan.armed = true;
+    try {
+      write_keystream_events(*writer, first_life, 1ULL, first_plaintext);
+    } catch (const simulated_crash &) {
+    }
+  }
+  plan.armed = false;
+  plan.dead = false;
+  if (!snapshot) {
+    // the first life wrote less often than the chosen crash point
+    return;
+  }
+  const auto first_ciphertext{snapshot->read(name.str())};
+
+  // the second life: the next start recovers the copy the crash left behind
+  // and appends different events
+  const auto crash_config{
+      write_config(root.path(), snapshot->config_members(), settings)};
+  std::uint64_t resumed_at{0ULL};
+  std::vector<std::byte> second_plaintext;
+  {
+    const auto writer{make_storage(crash_config)};
+    require(writer->open_binlog(name) != binsrv::open_binlog_status::created,
+            "the recovered binlog was created anew");
+    resumed_at = writer->get_current_position();
+    require(resumed_at <= std::size(first_ciphertext) &&
+                resumed_at <= std::size(first_plaintext),
+            "resuming at " + std::to_string(resumed_at) +
+                ", past the data of the first life");
+    second_plaintext.assign(
+        std::cbegin(first_plaintext),
+        std::next(std::cbegin(first_plaintext),
+                  static_cast<std::ptrdiff_t>(resumed_at)));
+    static constexpr std::uint64_t second_life_seed{0x5AULL};
+    write_keystream_events(*writer, second_life, second_life_seed,
+                           second_plaintext);
+  }
+  const auto second_ciphertext{snapshot->read(name.str())};
+
+  // sanity: the data really is encrypted, and recovery kept the prefix
+  require(std::size(first_ciphertext) <= std::size(first_plaintext),
+          "the first life left more bytes than it wrote");
+  require(!std::equal(std::cbegin(first_ciphertext),
+                      std::cend(first_ciphertext),
+                      std::cbegin(first_plaintext)),
+          "the binlog is stored unencrypted");
+  require(std::size(second_ciphertext) >= resumed_at &&
+              std::equal(std::cbegin(first_ciphertext),
+                         std::next(std::cbegin(first_ciphertext),
+                                   static_cast<std::ptrdiff_t>(resumed_at)),
+                         std::cbegin(second_ciphertext)),
+          "recovery changed the binlog before " + std::to_string(resumed_at));
+
+  // offsets written in both lives with different plaintext, and how many of
+  // them were encrypted with the same keystream byte; with independent
+  // keystreams that happens for about 1 in 256 of them
+  const auto overlap_end{std::min(std::size(first_ciphertext),
+                                  std::size(second_ciphertext))};
+  std::size_t differing{0U};
+  std::size_t same_keystream{0U};
+  for (auto offset{static_cast<std::size_t>(resumed_at)}; offset < overlap_end;
+       ++offset) {
+    if (first_plaintext[offset] == second_plaintext[offset]) {
+      continue;
+    }
+    ++differing;
+    if ((first_ciphertext[offset] ^ first_plaintext[offset]) ==
+        (second_ciphertext[offset] ^ second_plaintext[offset])) {
+      ++same_keystream;
+    }
+  }
+  static constexpr std::size_t min_reused{8U};
+  static constexpr std::size_t chance_divisor{16U};
+  require(same_keystream < min_reused ||
+              same_keystream * chance_divisor <= differing,
+          "the keystream of bytes " + std::to_string(resumed_at) + ".." +
+              std::to_string(overlap_end) + " (" +
+              std::to_string(std::size(first_ciphertext) - resumed_at) +
+              " byte(s) truncated by recovery) was reused for different "
+              "plaintext: " +
+              std::to_string(same_keystream) + " of " +
+              std::to_string(differing) +
+              " differing byte(s) encrypted with the same keystream");
+}
+
 } // anonymous namespace
 
 BOOST_AUTO_TEST_CASE(StorageMatchesModel) {
@@ -2575,4 +2824,12 @@ BOOST_AUTO_TEST_CASE(StorageQueryingLeavesItUnchangedOnS3) {
 
 BOOST_AUTO_TEST_CASE(StorageSurvivesAFaultAtAnyBackendCallOnS3) {
   run_s3_storage_property(checked_properties::injected_fault);
+}
+
+// no offset of an encrypted binlog is encrypted twice with the same AES-CTR
+// key, IV and counter for different plaintext, also when a crash left data
+// that the next start truncates and writes over (catalog property
+// ctr-keystream-not-reused-across-truncation)
+BOOST_AUTO_TEST_CASE(StorageNeverReusesKeystreamAfterCrashRecovery) {
+  run_property([](hegel::TestCase &tc) { run_keystream_property(tc); });
 }

@@ -27,3 +27,10 @@ StorageClosingMidTransactionDropsIt  ticket 6: closing a binlog mid-transaction 
 StorageConcurrentQueriesSucceed  ticket 29: a query next to a writer fails stat()ing a .tmp file the writer renamed away
 StorageSurvivesAFaultAtAnyBackendCall  tickets 15/18: crash while creating a binlog leaves an unopenable storage; a failed metadata save makes the final flush write the data twice
 StorageSurvivesAFaultAtAnyBackendCallOnS3  tickets 15/18: crash while creating a binlog leaves an unopenable storage; a failed metadata save makes the final flush write the data twice (S3 backend variant)
+StorageNeverReusesKeystreamAfterCrashRecovery  no ticket yet: CTR keystream reuse after crash truncation (recovery truncates the unrecorded tail and the next write reuses the file's key/IV at the same offsets)
+ReplicationSourceMatchesStatementsExactlyOrByPrefix  no ticket yet: listener prefix match ignores the delimiter ('SET @source_heartbeat_period', 'SET @slave_uuidx = 1' answered OK, network_service.cpp known_prefix_queries)
+# Release build (release_gcc14, assertions compiled out): how a known bug
+# fails differently there. '<build>:<test case>' lines win for that build.
+release_gcc14:IndexedEventBlockIndexesOnlyCompleteEvents  ticket 7 (release): no assert, an event size of 0 never advances the offset and index_ grows until std::bad_alloc (8+ GB RSS; capped by RELEASE_CASE_MEMORY_MB), debug aborts at indexed_event_block.cpp:43
+release_gcc14:MisalignedDumpPositionNeverStreamsGarbage  ticket 7 (release): streams an event cut out of the middle of the stored data, debug throws 'invalid event code in event header'
+release_gcc14:StorageClosingMidTransactionDropsIt  ticket 6 (release): no assert, the binlog record keeps the dropped events' timestamps ('timestamps do not match the events on disk'), debug aborts at storage.cpp:138

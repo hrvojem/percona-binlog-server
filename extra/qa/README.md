@@ -247,7 +247,7 @@ server rather than starting one.
 
 [`nightly/`](nightly) holds the nightly test runner and its data:
 
-- **`run_nightly.sh`** — runs three stages:
+- **`run_nightly.sh`** — runs four stages:
   1. **C++** (`cpp`): builds the `debug_gcc14`, `asan_gcc14` and
      `tsan_gcc14` trees in place, runs the unit tests, then runs **every
      Hegel property-test case separately** with many more cases than the
@@ -271,6 +271,37 @@ server rather than starting one.
      compared against `qa_known_failures.txt`. A failing harness keeps its
      workdir under `qa/` in the run directory, minus the MySQL data
      directories.
+  4. **Release** (`release`): the `release_gcc14` preset (RelWithDebInfo:
+     `-O2 -g -DNDEBUG`, against release builds of Boost and the AWS SDK,
+     `$WS/{boost,aws-sdk-cpp}-install-release_gcc14`) in its own tree
+     `$WS/percona-binlog-server-build-release_gcc14`, configured by the
+     nightly the first time (`-DWITH_PROPERTY_TESTS=ON`). It runs the unit
+     tests and every property-test case separately like the C++ stage
+     (profile `nightly_release`, 500 cases), but each case under a
+     wall-clock limit of 600 s (`RELEASE_CASE_TIMEOUT`; `timeout -k 30`), so
+     a hang is recorded as a failure with the reason `TIMEOUT` (and
+     `[TIMEOUT]` in the summary line) instead of stalling the night, and
+     under an address-space limit of 4 GB (`RELEASE_CASE_MEMORY_MB`,
+     `ulimit -v`), so runaway allocation fails the case instead of the
+     host. Then one short `fetch_crash_test.py` run (`gtid`, 5 examples,
+     `RELEASE_QA_EXAMPLES`, port `QA_PORT`+50) uses the release binary. All of it is the build `release_gcc14`. It is a stage of its own
+     because release behaviour differs exactly where known bugs live: an
+     `assert` that aborts the debug build is compiled out, so the bug runs on
+     (ticket 7 runs away, ticket 6 keeps wrong timestamps). Property failures are
+     compared against `known_failures.txt`; a line
+     `release_gcc14:<test case>  ticket N: ...` takes precedence for that
+     build and records how the release build fails differently. Found so
+     far: ticket 7 does not hang in release but never advances past an event
+     size of 0, so `indexed_event_block`'s index grows to 8+ GB until
+     `std::bad_alloc` (hence the memory limit), and a misaligned dump
+     position streams an event cut out of the stored data; ticket 6 keeps
+     the wrong timestamps instead of aborting at `storage.cpp:138`. The
+     dependencies are built once with `setup_test_environment.sh deps` (or
+     `build_deps.sh release_gcc14`; about 40 min, 1.9 GB), the project tree
+     takes about 1.4 GB. The stage takes 15-30 min (property cases 14-29 min,
+     the first night longest, then the failure database replays the known
+     failures quickly; `fetch_crash_test` 1-2 min) plus the incremental
+     build (a clean build is about 8 min).
 
   Results go to `$WS/nightly/runs/<date>/` (and the `latest` symlink):
   `summary.txt`, one log per failing case (`<build>-<test case>.log`; for MTR
@@ -285,11 +316,13 @@ server rather than starting one.
   there is a new failure or something is broken, and it is guarded by a
   `flock` so overlapping runs do not collide. The MTR stage and the debug
   build harnesses are skipped when the debug build fails, `fetch_crash_test`
-  when the ASan build fails. Tonight's whole run takes about 40-50 min for the
+  when the ASan build fails, the release `fetch_crash_test` when the release
+  build fails. Tonight's whole run takes about 40-50 min for the
   C++ stage plus 35-50 min of MTR (9-26 min per version) and about 12 min of QA harnesses.
 
   To try a stage without touching the nightly's own results, select stages
-  with `STAGES` (default `cpp mtr qa`; without `cpp` nothing is built) and
+  with `STAGES` (default `cpp mtr qa release`; without `cpp` the debug,
+  ASan and TSan trees are not built) and
   write elsewhere with `OUT_DIR` (then `history.tsv`, `latest` and old runs
   are left alone):
 
@@ -300,21 +333,25 @@ server rather than starting one.
   `run_nightly.sh`, parses its outcome into cases, matches them against the
   stage's known-failure list and appends the result lines.
 - **`hegel.toml`** — the Hegel settings profiles (`nightly_debug`,
-  `nightly_asan`, `nightly_tsan`) selected per build via
+  `nightly_asan`, `nightly_tsan`, `nightly_release`) selected per build via
   `HEGEL_DEFAULT_PROFILE`; each has its own failure database so a failure found
   one night is replayed first the next. The database paths are templated
   (`@NIGHTLY_DIR@`) and filled in for the workspace by the setup script.
 - **`known_failures.txt`** — maps property-test case names to the ticket that
   explains them; a listed failure is reported as *known*, any other as *new*.
   Remove a line once its bug is fixed. CI uses the same list (see below).
+  A line `<build>:<test case>  ...` applies to that build only and wins over
+  the plain line (used for `release_gcc14`; CI ignores such lines).
 - **`mtr_known_failures.txt`** — the same for the MTR stage, one line per
   `<series> <test>  ticket N: ...`, where `<series>` is `8.0`, `8.4`, `9.7` or
   `*` (every version) and `<test>` is a test name (every combination) or
   `<test>/<combination>`.
 - **`qa_known_failures.txt`** — the same for the QA-harness stage:
   `<harness> <case>  ticket N: ...` (`<case>` may be `*`), e.g.
-  `pull_replica_test gtid` (ticket 20) and
-  `query_race_test list_next_to_pull` (ticket 29).
+  `pull_replica_test gtid` (ticket 20),
+  `query_race_test list_next_to_pull` (ticket 29) and
+  `fetch_crash_test gtid` (ticket 14, when the run generates a fetch /
+  `FLUSH BINARY LOGS` / fetch sequence).
 - **`ci_property_tests.sh`** — what the CI job *GCC 14 Debug Property Tests*
   (`.github/workflows/cmake.yml`, configured with `-DWITH_PROPERTY_TESTS=ON`)
   runs: every property test through `ctest` at Hegel's default settings,
@@ -325,7 +362,7 @@ server rather than starting one.
   `extra/qa/nightly/ci_property_tests.sh <build dir>`.
 - **`build_report_data.py`** — turns the run directories into the JSON behind
   the nightly report page: the results of every stage (grouped by build
-  label: `debug_gcc14`, ..., `mtr-8.4`, `qa-8.4`), a description of every
+  label: `debug_gcc14`, ..., `release_gcc14`, `mtr-8.4`, `qa-8.4`), a description of every
   build label, and the entries of all three known-failure lists (each with
   its `kind` and `scope`).
 

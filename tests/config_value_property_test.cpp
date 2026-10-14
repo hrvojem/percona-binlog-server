@@ -92,6 +92,7 @@
 #include "binsrv/keyring_record_collection.hpp"
 #include "binsrv/log_severity.hpp"
 #include "binsrv/main_config.hpp"
+#include "binsrv/replication_mode_type.hpp"
 #include "binsrv/s3_storage_backend.hpp"
 #include "binsrv/size_unit.hpp"
 #include "binsrv/storage_backend_type.hpp"

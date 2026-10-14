@@ -6,14 +6,16 @@ every run directory still kept (results.jsonl, or for runs from before it
 existed, a reconstruction from nightly.log and summary.txt) and the
 known-failure lists, and writes ~/ws/nightly/report.json.
 
-Besides the property-test builds (debug_gcc14, asan_gcc14, tsan_gcc14), a
+Besides the property-test builds (debug_gcc14, asan_gcc14, tsan_gcc14, and
+release_gcc14, which also holds a fetch_crash_test case), a
 run's results hold the MTR stage as builds 'mtr-<series>' (program
 'binlog_streaming', one case per test or test/combination) and the QA-harness
 stage as builds 'qa-<series>' (program: the harness, one case per mode or
 harness case). Their statuses are the same, plus 'skipped' for MTR tests the
 suite skipped. Every known failure carries the 'kind' of list it comes from
 (property, mtr, qa) and its 'scope' (the MySQL series or '*' for MTR, the
-harness for QA, empty for property cases).
+harness for QA; for property cases the build of a '<build>:<test case>'
+line, else empty).
 """
 
 import json
@@ -123,6 +125,9 @@ def known_failures():
             scope = ""
             if scoped:
                 scope, _, name = name.strip().partition(" ")
+            elif ":" in name:
+                # a build-specific property line, e.g. release_gcc14:<case>
+                scope, _, name = name.strip().partition(":")
             known.append({"kind": kind, "scope": scope,
                           "test_case": name.strip(),
                           "ticket": ticket.strip()})
@@ -134,7 +139,11 @@ def builds(runs):
     described = {"debug_gcc14": "debug, 2000 cases per property",
                  "asan_gcc14": "AddressSanitizer, 500 cases",
                  "tsan_gcc14": "ThreadSanitizer, storage test only, "
-                               "300 cases"}
+                               "300 cases",
+                 "release_gcc14": "release (RelWithDebInfo, NDEBUG), 500 "
+                                  "cases, 600 s and 4 GB limits per case (a "
+                                  "hang is a TIMEOUT failure); short "
+                                  "fetch_crash_test"}
     for run in runs:
         for result in run["results"]:
             label = result.get("config", "")

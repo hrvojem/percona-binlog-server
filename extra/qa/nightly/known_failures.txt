@@ -25,3 +25,5 @@ MagicOnlyBinlogIsPolledUntilItsEventsArrive  ticket 26 (PBS-96) follow-up: resum
 MisalignedDumpPositionNeverStreamsGarbage  ticket 7: event size below the common header size at a misaligned dump position aborts / loops
 StorageQueryingLeavesItUnchanged  ticket 28: querying_only open rewrites metadata.json when the config adds encryption (storage_core.cpp:174-178)
 StorageQueryingLeavesItUnchangedOnS3  ticket 28: querying_only open rewrites metadata.json when the config adds encryption (S3 backend variant)
+StorageClosingMidTransactionDropsIt  ticket 6: closing a binlog mid-transaction keeps the dropped events' timestamps (assert at storage.cpp:138)
+StorageConcurrentQueriesSucceed  ticket 29: a query next to a writer fails stat()ing a .tmp file the writer renamed away

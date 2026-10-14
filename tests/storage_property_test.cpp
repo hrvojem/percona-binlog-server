@@ -57,7 +57,13 @@
 // - opening a storage for queries (as 'list' and 'search_by_*' do, possibly
 //   while 'fetch' / 'pull' keeps running) never changes any of its objects,
 //   also with a configuration that adds encryption to a storage created
-//   without it.
+//   without it;
+// - closing a binlog while an incomplete transaction is still buffered (as
+//   the collector does when a reconnect's artificial ROTATE names another
+//   binlog) drops that transaction completely, including its timestamps;
+// - opening the storage for queries on another thread while it is being
+//   written, rotated, restarted and checkpointed always succeeds and lists
+//   the binlogs without a gap.
 //
 // The generated events are not real binlog events, but each one starts with
 // a valid 19-byte common header (type code, event size), which is all the
@@ -564,7 +570,13 @@ enum class operation_kind : std::uint8_t {
   rotate,
   restart,
   crash,
-  purge
+  purge,
+  // closing the binlog and opening the next one without discarding the
+  // incomplete transaction first, as the collector does when the artificial
+  // ROTATE of a reconnect names another binlog while the events re-sent at
+  // the start of the old one (FORMAT_DESCRIPTION, PREVIOUS_GTIDS) are still
+  // buffered
+  close_mid_transaction
 };
 
 struct operation {
@@ -596,6 +608,8 @@ std::ostream &operator<<(std::ostream &output, const operation &op) {
     return output << "crash";
   case operation_kind::purge:
     return output << "purge(" << op.purge_count << ')';
+  case operation_kind::close_mid_transaction:
+    return output << "close_mid_transaction";
   }
   return output;
 }
@@ -604,18 +618,24 @@ constexpr std::size_t min_event_size{
     binsrv::events::common_header_view_base::size_in_bytes};
 constexpr std::size_t max_event_size{512U};
 
-[[nodiscard]] gs::Generator<operation> operations() {
-  return gs::compose([](const hegel::TestCase &tc) {
-    // writes are listed several times so that most sequences build up
-    // enough data to exercise checkpointing
-    const auto kind{tc.draw(gs::sampled_from(
-        {operation_kind::write_event, operation_kind::write_event,
-         operation_kind::write_event, operation_kind::write_event,
-         operation_kind::write_event, operation_kind::write_event,
-         operation_kind::discard_incomplete_transaction, operation_kind::flush,
-         operation_kind::rotate, operation_kind::rotate,
-         operation_kind::restart, operation_kind::crash,
-         operation_kind::purge}))};
+[[nodiscard]] gs::Generator<operation>
+operations(bool with_close_mid_transaction = false) {
+  // writes are listed several times so that most sequences build up enough
+  // data to exercise checkpointing
+  std::vector<operation_kind> kinds{
+      operation_kind::write_event, operation_kind::write_event,
+      operation_kind::write_event, operation_kind::write_event,
+      operation_kind::write_event, operation_kind::write_event,
+      operation_kind::discard_incomplete_transaction, operation_kind::flush,
+      operation_kind::rotate, operation_kind::rotate,
+      operation_kind::restart, operation_kind::crash,
+      operation_kind::purge};
+  if (with_close_mid_transaction) {
+    kinds.push_back(operation_kind::close_mid_transaction);
+    kinds.push_back(operation_kind::close_mid_transaction);
+  }
+  return gs::compose([kinds](const hegel::TestCase &tc) {
+    const auto kind{tc.draw(gs::sampled_from(kinds))};
     static constexpr std::size_t max_purge_count{3U};
     operation result{.kind = kind,
                      .event_size = 0U,
@@ -1259,7 +1279,9 @@ enum class checked_properties : std::uint8_t {
   concurrent_read_back,
   purge_reopenable,
   damaged_files,
-  query_read_only
+  query_read_only,
+  close_mid_transaction,
+  concurrent_queries
 };
 
 [[nodiscard]] bool reads_back(checked_properties properties) noexcept {
@@ -1321,6 +1343,57 @@ void read_concurrently(const std::stop_token &stop,
   }
 }
 
+// the first error any query thread of the concurrent-query property hit in
+// this process: whether a query lands between a writer's directory read and
+// its rename is a matter of timing, so the outcome does not repeat when Hegel
+// replays a test case; the test case therefore reports it after the run
+// instead of failing the property (which Hegel would report as flaky)
+std::string first_concurrent_query_error{};
+
+// what the query thread of the concurrent-query property saw; written only
+// by that thread and read only after it has been joined
+struct concurrent_query_result {
+  std::size_t queries{0U};
+  std::string error;
+};
+
+// opens the storage for queries again and again (as 'list' and
+// 'search_by_*' do next to a running 'fetch' / 'pull') until stopped; every
+// opening must succeed and list the binlogs without a gap: the first one
+// (nothing is purged here) followed by each next one
+void query_concurrently(const std::stop_token &stop,
+                        const std::filesystem::path &config_path,
+                        concurrent_query_result &result) {
+  try {
+    while (!stop.stop_requested()) {
+      const auto storage{make_storage(
+          config_path, binsrv::storage_construction_mode_type::querying_only)};
+      const auto records{storage->get_binlog_records()};
+      ++result.queries;
+      binsrv::events::composite_binlog_name expected{binlog_base_name, 1U};
+      for (const auto &record : records) {
+        if (record.name != expected) {
+          result.error = "query " + std::to_string(result.queries) +
+                         " listed '" + record.name.str() + "' where '" +
+                         expected.str() + "' was expected (" +
+                         std::to_string(std::size(records)) + " record(s))";
+          return;
+        }
+        expected = expected.next();
+      }
+      if (records.empty()) {
+        result.error = "query " + std::to_string(result.queries) +
+                       " listed no binlogs";
+        return;
+      }
+      std::this_thread::yield();
+    }
+  } catch (const std::exception &e) {
+    result.error = "query " + std::to_string(result.queries + 1U) +
+                   " failed: " + e.what();
+  }
+}
+
 class storage_harness {
 public:
   storage_harness(const storage_settings &settings,
@@ -1343,12 +1416,26 @@ public:
         read_concurrently(stop, *concurrent_reader_, concurrent_result_);
       }};
     }
+    if (properties_ == checked_properties::concurrent_queries) {
+      query_thread_ = std::jthread{[this](const std::stop_token &stop) {
+        query_concurrently(stop, config_path_, query_result_);
+      }};
+    }
     check();
   }
 
   // called after the last operation: for the concurrent property, stops the
   // reader and compares what it received with what is on disk
   void finish() {
+    if (properties_ == checked_properties::concurrent_queries) {
+      query_thread_.request_stop();
+      query_thread_.join();
+      if (!query_result_.error.empty() &&
+          first_concurrent_query_error.empty()) {
+        first_concurrent_query_error = query_result_.error;
+      }
+      return;
+    }
     if (properties_ != checked_properties::concurrent_read_back) {
       return;
     }
@@ -1420,6 +1507,16 @@ public:
       break;
     case operation_kind::purge:
       purge(op.purge_count);
+      break;
+    case operation_kind::close_mid_transaction:
+      // whatever is buffered past the last transaction boundary is dropped
+      // with the binlog it belongs to, as with 'rotate'
+      storage_->close_binlog();
+      model_.rotate();
+      require(storage_->open_binlog(model_.get_current_binlog().name) ==
+                  binsrv::open_binlog_status::created,
+              "the next binlog was not reported as created");
+      write_first_binlog_event();
       break;
     }
     check();
@@ -1750,6 +1847,10 @@ private:
   std::unique_ptr<operations::sender_context> concurrent_reader_{};
   concurrent_read_result concurrent_result_{};
   std::jthread concurrent_thread_{};
+  // the query thread of the concurrent-query property, likewise stopped and
+  // joined before the result it writes to is destroyed
+  concurrent_query_result query_result_{};
+  std::jthread query_thread_{};
 
   void restart_tailing_reader() {
     tailing_reader_.reset();
@@ -1928,7 +2029,8 @@ private:
         unflushed_complete_size(current, state.transactions_on_disk)};
 
     if (properties_ == checked_properties::model_agreement ||
-        properties_ == checked_properties::damaged_files) {
+        properties_ == checked_properties::damaged_files ||
+        properties_ == checked_properties::close_mid_transaction) {
       const auto expected_position{state.file_size + unflushed +
                                    model_.get_incomplete_size()};
       require(storage_->get_current_position() == expected_position,
@@ -1977,7 +2079,9 @@ void run_storage_property(hegel::TestCase &tc, checked_properties properties,
                           const std::optional<s3_server> &s3 = std::nullopt) {
   auto settings{tc.draw("settings", storage_settings_generator())};
   settings.s3 = s3;
-  const auto ops{tc.draw("ops", gs::vectors(operations()))};
+  const auto ops{tc.draw(
+      "ops", gs::vectors(operations(
+                 properties == checked_properties::close_mid_transaction)))};
   std::optional<damage> damage_value;
   if (properties == checked_properties::damaged_files) {
     damage_value = tc.draw("damage", damages());
@@ -2082,6 +2186,27 @@ BOOST_AUTO_TEST_CASE(StorageQueryingLeavesItUnchanged) {
   run_property([](hegel::TestCase &tc) {
     run_storage_property(tc, checked_properties::query_read_only);
   });
+}
+
+// a binlog closed while an incomplete transaction is still buffered (the
+// collector does this when a reconnect's artificial ROTATE names another
+// binlog) leaves no trace of that transaction: neither its bytes nor its
+// timestamps or sequence number end up in any binlog or record
+BOOST_AUTO_TEST_CASE(StorageClosingMidTransactionDropsIt) {
+  run_property([](hegel::TestCase &tc) {
+    run_storage_property(tc, checked_properties::close_mid_transaction);
+  });
+}
+
+BOOST_AUTO_TEST_CASE(StorageConcurrentQueriesSucceed) {
+  first_concurrent_query_error.clear();
+  run_property([](hegel::TestCase &tc) {
+    run_storage_property(tc, checked_properties::concurrent_queries);
+  });
+  if (!first_concurrent_query_error.empty()) {
+    BOOST_FAIL("a query next to the writer failed: " +
+               first_concurrent_query_error);
+  }
 }
 
 BOOST_AUTO_TEST_CASE(StorageMatchesModelOnS3) {

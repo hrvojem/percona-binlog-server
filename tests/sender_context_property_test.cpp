@@ -975,6 +975,117 @@ BOOST_AUTO_TEST_CASE(MagicOnlyBinlogIsPolledUntilItsEventsArrive) {
   });
 }
 
+// the retention cycle a 'pull' deployment runs (README: stop pull, run
+// purge_binlogs, start pull again): after the oldest binlogs are purged, a
+// reader on the restarted storage streams every surviving binlog byte for
+// byte, each announced by an artificial ROTATE, and a request for a purged
+// binlog fails without streaming anything
+BOOST_AUTO_TEST_CASE(PurgedStorageServesTheSurvivingBinlogs) {
+  run_property([](hegel::TestCase &tc) {
+    const temp_dir directory;
+    const auto binlog_sizes{tc.draw(
+        "binlogs",
+        gs::vectors(event_size_lists(), {.min_size = 2U, .max_size = 5U}))};
+    const auto purge_count{tc.draw(
+        "purge_count",
+        gs::integers<std::size_t>({.min_value = 1U,
+                                   .max_value = std::size(binlog_sizes) - 1U}))};
+    const auto block_size{tc.draw("block", block_sizes())};
+    const bool request_purged{tc.draw("request_purged", gs::booleans())};
+
+    const auto config_path{write_config(directory.path())};
+    std::vector<events::composite_binlog_name> names;
+    std::vector<std::vector<byte_vector>> stored;
+    {
+      // 'pull' running: writes the binlogs, then is stopped
+      auto storage{make_storage(config_path)};
+      events::composite_binlog_name name{the_binlog};
+      std::uint32_t first_id{1U};
+      for (const auto &sizes : binlog_sizes) {
+        if (!names.empty()) {
+          storage->close_binlog();
+        }
+        require(storage->open_binlog(name) ==
+                    binsrv::open_binlog_status::created,
+                "binlog " + name.str() + " was not created");
+        auto seeded{fill_open_binlog(storage, sizes, first_id)};
+        first_id += 1'000U;
+        names.push_back(name);
+        stored.push_back(std::move(seeded.events));
+        name = name.next();
+      }
+    }
+    {
+      // 'purge_binlogs' up to the last purged binlog
+      const binsrv::main_config config{config_path.string()};
+      binsrv::storage purger{
+          std::make_shared<binsrv::null_logger>(), config,
+          binsrv::storage_construction_mode_type::purging};
+      const auto [purged, warning]{
+          purger.purge_binlogs(names[purge_count - 1U])};
+      require(warning.empty(), "purge reported a warning: " + warning);
+      require(std::size(purged) == purge_count,
+              "purge removed " + std::to_string(std::size(purged)) +
+                  " binlog(s) instead of " + std::to_string(purge_count));
+    }
+
+    // 'pull' started again
+    const auto storage{make_storage(config_path)};
+    if (request_purged) {
+      const auto purged_index{tc.draw(
+          "purged_index",
+          gs::integers<std::size_t>({.min_value = 0U,
+                                     .max_value = purge_count - 1U}))};
+      operations::sender_context reader{
+          std::make_shared<binsrv::null_logger>(),
+          storage,
+          block_size,
+          names[purged_index].str(),
+          events::magic_binlog_offset,
+          /*session_source_binlog_checksum=*/true};
+      const auto outcome{stream_until_end(reader, 4U)};
+      require(outcome.failed && outcome.events.empty(),
+              "a request for purged binlog " + names[purged_index].str() +
+                  " did not fail cleanly (" +
+                  std::to_string(std::size(outcome.events)) +
+                  " event(s) streamed)");
+      return;
+    }
+
+    operations::sender_context reader{
+        std::make_shared<binsrv::null_logger>(),
+        storage,
+        block_size,
+        std::string_view{},
+        events::magic_binlog_offset,
+        /*session_source_binlog_checksum=*/true};
+    std::size_t expected_count{0U};
+    for (std::size_t index{purge_count}; index != std::size(names); ++index) {
+      expected_count += std::size(stored[index]) + 1U;
+    }
+    const auto emitted{drain(reader, expected_count)};
+    require(std::size(emitted) == expected_count,
+            "expected " + std::to_string(expected_count) +
+                " event(s) from the surviving binlogs, got " +
+                std::to_string(std::size(emitted)));
+    std::size_t position{0U};
+    for (std::size_t index{purge_count}; index != std::size(names); ++index) {
+      require(is_artificial_rotate_to(emitted[position], names[index],
+                                      events::magic_binlog_offset),
+              "no artificial ROTATE to surviving binlog " +
+                  names[index].str());
+      ++position;
+      for (std::size_t event{0U}; event != std::size(stored[index]);
+           ++event) {
+        require(emitted[position] == stored[index][event],
+                "event " + std::to_string(event) + " of surviving binlog " +
+                    names[index].str() + " was not streamed byte for byte");
+        ++position;
+      }
+    }
+  });
+}
+
 // a dump position that is not the start of an event (a client error, or a
 // position remembered from a different binlog) cannot be streamed from:
 // the reader must never hand out bytes from the middle of an event as if

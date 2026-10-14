@@ -41,10 +41,6 @@
 // - a reader running on another thread while the storage is being written
 //   (as in 'pull' mode, where the collector writes while replicas read)
 //   ends up with exactly the events of the complete transactions on disk;
-// - purging the oldest binlogs from another storage instance in purging mode
-//   (as the 'purge_binlogs' operation does while 'fetch' / 'pull' keeps
-//   running) leaves a storage that can be opened again at any moment and
-//   holds exactly the remaining binlogs;
 // - opening a storage in which one file was damaged afterwards (deleted,
 //   truncated, extended, a byte changed, a JSON value replaced, an unexpected
 //   file added, binlog index entries dropped, duplicated, swapped or added,
@@ -1471,7 +1467,6 @@ enum class checked_properties : std::uint8_t {
   checkpoint_size_bound,
   read_back,
   concurrent_read_back,
-  purge_reopenable,
   damaged_files,
   query_read_only,
   close_mid_transaction,
@@ -2169,33 +2164,16 @@ private:
             std::string{label} + ": the existing binlog was created anew");
   }
 
-  // purges the oldest binlogs through a separate storage instance in purging
-  // mode, as a 'purge_binlogs' process does while this one keeps running;
-  // only the purge property uses it
+  // purges the oldest binlogs; only the injected-fault property uses it,
+  // through the supported procedure (purging while the writer keeps running
+  // is unsupported: PBS-75)
   void purge(std::size_t requested_count) {
     const auto &binlogs{model_.get_binlogs()};
-    if ((properties_ != checked_properties::purge_reopenable &&
-         properties_ != checked_properties::injected_fault) ||
+    if (properties_ != checked_properties::injected_fault ||
         std::size(binlogs) < 2U) {
       return;
     }
-    if (properties_ == checked_properties::injected_fault) {
-      purge_stopped(requested_count);
-      return;
-    }
-    // the current (last) binlog cannot be purged
-    const auto count{std::min(requested_count, std::size(binlogs) - 1U)};
-    const auto target{binlogs[count - 1U].name};
-    {
-      const auto purger{make_storage(
-          config_path_, binsrv::storage_construction_mode_type::purging)};
-      const auto [purged, warning]{purger->purge_binlogs(target)};
-      require(warning.empty(), "purge reported a warning: " + warning);
-      require(std::size(purged) == count,
-              "purge removed " + std::to_string(std::size(purged)) +
-                  " binlog(s) instead of " + std::to_string(count));
-    }
-    model_.purge(count);
+    purge_stopped(requested_count);
   }
 
   // the retention procedure the README asks for: stop the writer, run
@@ -2356,14 +2334,6 @@ private:
   }
 
   void check() {
-    if (properties_ == checked_properties::purge_reopenable) {
-      // after a purge by another process, the running storage's own list of
-      // binlogs is stale by design; what must hold at every moment is that
-      // the storage on disk can be opened again (as after a restart or a
-      // crash) and holds exactly the remaining binlogs
-      crash();
-      return;
-    }
     const auto state{require_disk_matches_model(
         *location_, storage_->get_binlog_records(), model_,
         settings_)};
@@ -2527,12 +2497,6 @@ BOOST_AUTO_TEST_CASE(StorageReadBackMatchesDisk) {
   });
 }
 
-BOOST_AUTO_TEST_CASE(StoragePurgeKeepsStorageReopenable) {
-  run_property([](hegel::TestCase &tc) {
-    run_storage_property(tc, checked_properties::purge_reopenable);
-  });
-}
-
 BOOST_AUTO_TEST_CASE(StorageConcurrentReadBackMatchesDisk) {
   run_property([](hegel::TestCase &tc) {
     run_storage_property(tc, checked_properties::concurrent_read_back);
@@ -2593,10 +2557,6 @@ BOOST_AUTO_TEST_CASE(StorageRespectsCheckpointSizeOnS3) {
 
 BOOST_AUTO_TEST_CASE(StorageReadBackMatchesDiskOnS3) {
   run_s3_storage_property(checked_properties::read_back);
-}
-
-BOOST_AUTO_TEST_CASE(StoragePurgeKeepsStorageReopenableOnS3) {
-  run_s3_storage_property(checked_properties::purge_reopenable);
 }
 
 BOOST_AUTO_TEST_CASE(StorageConcurrentReadBackMatchesDiskOnS3) {

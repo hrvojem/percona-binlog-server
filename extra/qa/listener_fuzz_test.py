@@ -339,6 +339,14 @@ def streams_binlogs(host: str, port: int) -> bool:
     try:
         if not client.handshake():
             return False
+        # since PBS-90 the listener refuses a dump from a client that has not
+        # declared @source_binlog_checksum, so declare it as mysqlbinlog does
+        client.send(frame(0, bytes([COM_QUERY]) +
+                          b"SET @master_binlog_checksum = 'NONE', "
+                          b"@source_binlog_checksum = 'NONE'"))
+        reply = client.read_frame()
+        if reply is None or reply[1][:1] != b"\x00":
+            return False
         # flags = 1 (BINLOG_DUMP_NON_BLOCK), from binlog.000001 position 4
         client.send(frame(0, bytes([COM_BINLOG_DUMP]) + struct.pack("<I", 4) +
                           struct.pack("<H", 1) + struct.pack("<I", 4242) +
@@ -395,7 +403,9 @@ def main():
         binsrv.write_config()
         config = json.loads(binsrv.config_path.read_text())
         config["replication_source"] = {
-            "port": pull_port, "read_timeout": 3, "write_timeout": 3,
+            "port": pull_port, "server_id": 142,
+            "server_uuid": "00000000-0000-0000-0000-00000000008e",
+            "read_timeout": 3, "write_timeout": 3,
             "authentication": {"user": PULL_USER, "password": PULL_PASSWORD,
                                "plugin": "caching_sha2_password"}}
         binsrv.config_path.write_text(json.dumps(config, indent=2))

@@ -54,7 +54,7 @@ DROP DATABASE source_db;
 *** Restoring source_db from the PBS-served dump.
 
 *** Comparing the restored and backup rows via an order-independent
-*** per-row signature. BIT_XOR of CRC32 over (id, length, MD5(data))
+*** per-row signature. BIT_XOR of CRC32 over (id, length, SHA2(data, 256))
 *** fits in a single BIGINT and avoids both GROUP_CONCAT limits and
 *** sort-buffer sizing for the ~2 MiB total blob payload.
 

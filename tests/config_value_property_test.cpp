@@ -698,7 +698,8 @@ struct config_spec {
         "rewrite_mode",        "rewrite_file_size_unit",
         "rewrite_file_size",   "source_port_zero",
         "source_port_range",   "source_read_timeout",
-        "source_write_timeout", "authentication_user",
+        "source_write_timeout", "source_server_id_range",
+        "source_server_uuid",  "authentication_user",
         "authentication_password", "authentication_plugin",
         "backend",             "checkpoint_size",
         "checkpoint_interval", "encryption_format",
@@ -831,6 +832,51 @@ struct config_spec {
       source["port"] = static_cast<std::int64_t>(tc.draw(
           gs::integers<std::uint16_t>({.min_value = 1U, .max_value = 65535U})));
     }
+    // the identity presented to downstream replicas (PBS-90): any server id,
+    // and a UUID in the canonical 8-4-4-4-12 lowercase hex form the README
+    // documents (upper case is not generated: the README asks for lower
+    // case, while the check accepts both)
+    source["server_id"] = is_defect("source_server_id_range")
+                              ? out_of_range(uint32_max)
+                              : valid_uint32();
+    {
+      static constexpr std::string_view hex_digits{"0123456789abcdef"};
+      std::string uuid;
+      for (std::size_t index{0U}; index < 36U; ++index) {
+        if (index == 8U || index == 13U || index == 18U || index == 23U) {
+          uuid += '-';
+        } else {
+          uuid += hex_digits[tc.draw(gs::integers<std::size_t>(
+              {.min_value = 0U, .max_value = 15U}))];
+        }
+      }
+      if (is_defect("source_server_uuid")) {
+        const auto damage{tc.draw(gs::integers<int>(
+            {.min_value = 0, .max_value = 5}))};
+        switch (damage) {
+        case 0: // one character short
+          uuid.pop_back();
+          break;
+        case 1: // one character too many
+          uuid += 'a';
+          break;
+        case 2: // a separator in the wrong place
+          std::swap(uuid[8U], uuid[9U]);
+          break;
+        case 3: // a character that is not a hex digit
+          uuid[tc.draw(gs::sampled_from<std::size_t>({0U, 10U, 35U}))] =
+              tc.draw(gs::sampled_from<char>({'g', 'z', ' ', '_'}));
+          break;
+        case 4: // no separators
+          std::erase(uuid, '-');
+          break;
+        default: // braced, as some tools print it
+          uuid = '{' + uuid + '}';
+          break;
+        }
+      }
+      source["server_uuid"] = uuid;
+    }
     source["read_timeout"] = is_defect("source_read_timeout")
                                  ? std::int64_t{0}
                                  : valid_uint32();
@@ -891,6 +937,8 @@ struct config_spec {
                {"replication", "server_id"},
                {"replication", "mode"},
                {"replication_source", "authentication"},
+               {"replication_source", "server_id"},
+               {"replication_source", "server_uuid"},
                {"storage", "uri"},
                {"storage", ""},
                {"logger", ""}}))};
@@ -1558,6 +1606,10 @@ BOOST_AUTO_TEST_CASE(ConfigFileMatchesModel) {
                 boost::lexical_cast<std::string>(replication.get<"mode">()));
     const auto &source{root.get<"replication_source">()};
     same_number("replication_source", "port", source.get<"port">());
+    same_number("replication_source", "server_id",
+                source.get<"server_id">());
+    same_string("replication_source", "server_uuid",
+                source.get<"server_uuid">());
     same_number("replication_source", "read_timeout",
                 source.get<"read_timeout">());
     same_number("replication_source", "write_timeout",

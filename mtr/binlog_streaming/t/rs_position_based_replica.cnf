@@ -3,6 +3,11 @@
 
 [mysqld.1]
 log-bin= master-bin
+# a non-GTID source, as the test intends (MySQL 9.7 defaults to gtid_mode =
+# ON, and a position-mode PBS reports GTID_MODE = OFF to its replicas while
+# passing the source's GTID events through)
+loose-gtid-mode= OFF
+loose-enforce-gtid-consistency= OFF
 loose-innodb_write_io_threads= 2
 loose-innodb_read_io_threads= 2
 
@@ -14,6 +19,10 @@ loose-innodb_read_io_threads= 2
 
 # Do not auto-start replication - the test wires server_2 to PBS by hand.
 skip-replica-start
+# PBS runs a position-mode storage here and reports GTID_MODE = OFF; MySQL
+# 9.7 defaults to gtid_mode = ON, and a GTID replica refuses such a source
+loose-gtid-mode= OFF
+loose-enforce-gtid-consistency= OFF
 
 [ENV]
 MASTER_MYPORT= @mysqld.1.port

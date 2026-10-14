@@ -100,11 +100,11 @@ DROP DATABASE source_db;
 
 --echo
 --echo *** Comparing the restored and backup rows via an order-independent
---echo *** per-row signature. BIT_XOR of CRC32 over (id, length, MD5(data))
+--echo *** per-row signature. BIT_XOR of CRC32 over (id, length, SHA2(data, 256))
 --echo *** fits in a single BIGINT and avoids both GROUP_CONCAT limits and
 --echo *** sort-buffer sizing for the ~2 MiB total blob payload.
---let $src_sig = `SELECT BIT_XOR(CRC32(CONCAT_WS('|', id, LENGTH(data), MD5(data)))) FROM source_db.tbl`
---let $bkp_sig = `SELECT BIT_XOR(CRC32(CONCAT_WS('|', id, LENGTH(data), MD5(data)))) FROM backup_db.tbl`
+--let $src_sig = `SELECT BIT_XOR(CRC32(CONCAT_WS('|', id, LENGTH(data), SHA2(data, 256)))) FROM source_db.tbl`
+--let $bkp_sig = `SELECT BIT_XOR(CRC32(CONCAT_WS('|', id, LENGTH(data), SHA2(data, 256)))) FROM backup_db.tbl`
 if ($src_sig != $bkp_sig) {
   --echo source signature: $src_sig
   --echo backup signature: $bkp_sig

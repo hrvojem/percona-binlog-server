@@ -124,7 +124,9 @@ def write_config(args, workdir, storage_dir):
         },
         # required by the config schema even though only 'pull' uses it
         "replication_source": {
-            "port": free_tcp_port(), "read_timeout": 60, "write_timeout": 60,
+            "port": free_tcp_port(), "server_id": 142,
+            "server_uuid": "00000000-0000-0000-0000-00000000008e",
+            "read_timeout": 60, "write_timeout": 60,
             "authentication": {"user": "rpl", "password": "password",
                                "plugin": "caching_sha2_password"},
         },

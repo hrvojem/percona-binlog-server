@@ -83,7 +83,9 @@ def run_case(args, gtid_mode: bool) -> dict:
         config = json.loads(binsrv.config_path.read_text())
         config["logger"]["level"] = "debug"
         config["replication_source"] = {
-            "port": pull_port, "read_timeout": 60, "write_timeout": 60,
+            "port": pull_port, "server_id": 142,
+            "server_uuid": "00000000-0000-0000-0000-00000000008e",
+            "read_timeout": 60, "write_timeout": 60,
             "authentication": {"user": PULL_USER, "password": PULL_PASSWORD,
                                "plugin": "caching_sha2_password"}}
         binsrv.config_path.write_text(json.dumps(config, indent=2))

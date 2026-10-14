@@ -370,7 +370,9 @@ class BinlogServer:
                 "verify_checksum": True,
                 "mode": "gtid" if self.gtid_mode else "position"},
             "replication_source": {
-                "port": 0xFFFF, "read_timeout": 60, "write_timeout": 60,
+                "port": 0xFFFF, "server_id": 142,
+                "server_uuid": "00000000-0000-0000-0000-00000000008e",
+                "read_timeout": 60, "write_timeout": 60,
                 "authentication": {
                     "user": "unused", "password": "unused",
                     "plugin": "caching_sha2_password"}},

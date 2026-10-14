@@ -333,7 +333,9 @@ write_config(const std::filesystem::path &directory,
          << (settings.gtid_mode ? "gtid" : "position") << R"("
   },
   "replication_source": {
-    "port": 3307, "read_timeout": 60, "write_timeout": 60,
+    "port": 3307, "server_id": 142,
+    "server_uuid": "00000000-0000-0000-0000-00000000008e",
+    "read_timeout": 60, "write_timeout": 60,
     "authentication": {
       "user": "rpl", "password": "password", "plugin": "caching_sha2_password"
     }

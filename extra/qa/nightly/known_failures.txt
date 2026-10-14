@@ -27,3 +27,5 @@ StorageQueryingLeavesItUnchanged  ticket 28: querying_only open rewrites metadat
 StorageQueryingLeavesItUnchangedOnS3  ticket 28: querying_only open rewrites metadata.json when the config adds encryption (S3 backend variant)
 StorageClosingMidTransactionDropsIt  ticket 6: closing a binlog mid-transaction keeps the dropped events' timestamps (assert at storage.cpp:138)
 StorageConcurrentQueriesSucceed  ticket 29: a query next to a writer fails stat()ing a .tmp file the writer renamed away
+StorageSurvivesAFaultAtAnyBackendCall  tickets 15/18: crash while creating a binlog leaves an unopenable storage; a failed metadata save makes the final flush write the data twice
+StorageSurvivesAFaultAtAnyBackendCallOnS3  tickets 15/18: crash while creating a binlog leaves an unopenable storage; a failed metadata save makes the final flush write the data twice (S3 backend variant)

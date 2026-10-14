@@ -17,6 +17,7 @@
 
 #include <cassert>
 #include <memory>
+#include <utility>
 
 #include "binsrv/basic_storage_backend_fwd.hpp"
 #include "binsrv/filesystem_storage_backend.hpp"
@@ -26,19 +27,42 @@
 
 namespace binsrv {
 
+#ifdef BINSRV_STORAGE_BACKEND_TEST_HOOK
+namespace {
+
+[[nodiscard]] storage_backend_factory::backend_decorator &test_decorator() {
+  static storage_backend_factory::backend_decorator instance{};
+  return instance;
+}
+
+} // anonymous namespace
+
+void storage_backend_factory::set_test_decorator(backend_decorator decorator) {
+  test_decorator() = std::move(decorator);
+}
+#endif
+
 basic_storage_backend_ptr
 storage_backend_factory::create(const storage_config &config) {
   const auto storage_backend = config.get<"backend">();
 
+  basic_storage_backend_ptr result{};
   switch (storage_backend) {
   case storage_backend_type::file:
-    return std::make_unique<filesystem_storage_backend>(config);
+    result = std::make_unique<filesystem_storage_backend>(config);
+    break;
   case storage_backend_type::s3:
-    return std::make_unique<s3_storage_backend>(config);
+    result = std::make_unique<s3_storage_backend>(config);
+    break;
   default:
     assert(false);
   }
-  return {}; // should never get here
+#ifdef BINSRV_STORAGE_BACKEND_TEST_HOOK
+  if (test_decorator()) {
+    result = test_decorator()(std::move(result));
+  }
+#endif
+  return result;
 }
 
 } // namespace binsrv

@@ -705,6 +705,11 @@ set_target_properties(lib_binsrv PROPERTIES
   CXX_STANDARD_REQUIRED YES
   CXX_EXTENSIONS NO
 )
+# the property tests wrap the storage backends through a test-only seam in
+# storage_backend_factory (inert unless a test sets it)
+if(WITH_PROPERTY_TESTS)
+  target_compile_definitions(lib_binsrv PUBLIC BINSRV_STORAGE_BACKEND_TEST_HOOK)
+endif()
 add_library(binsrv::lib_binsrv ALIAS lib_binsrv)
 
 set(mysql_harness_source_files

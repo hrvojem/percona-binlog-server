@@ -63,7 +63,12 @@
 //   binlog) drops that transaction completely, including its timestamps;
 // - opening the storage for queries on another thread while it is being
 //   written, rotated, restarted and checkpointed always succeeds and lists
-//   the binlogs without a gap.
+//   the binlogs without a gap;
+// - a writer killed, or hitting a storage error, at any backend call (the
+//   backend is wrapped through the storage_backend_factory test seam) leaves
+//   a storage that opens again, holds every binlog but the last completely
+//   and the last one up to a transaction boundary, never holds data twice,
+//   and resumes right after the data on disk.
 //
 // The generated events are not real binlog events, but each one starts with
 // a valid 19-byte common header (type code, event size), which is all the
@@ -92,6 +97,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -148,12 +154,14 @@
 #include "operations/event_generation_helpers.hpp"
 #include "operations/sender_context.hpp"
 
+#include "util/byte_range.hpp"
 #include "util/byte_span.hpp"
 #include "util/byte_span_fwd.hpp"
 #include "util/byte_span_inserters.hpp"
 #include "util/ctime_timestamp.hpp"
 #include "util/semantic_version.hpp"
 #include "util/ctime_timestamp_range.hpp"
+#include "util/dynamic_byte_buffer_fwd.hpp"
 
 namespace {
 
@@ -1269,6 +1277,192 @@ open_storage(const std::filesystem::path &config_path,
 }
 
 // ---------------------------------------------------------------------------
+// fault injection through the storage_backend_factory test seam
+// ---------------------------------------------------------------------------
+
+// thrown by a backend call of a "crashed" process: the process is gone, so
+// this and every later backend call fails (the storage destructor swallows
+// it, as it swallows any error of its final flush)
+class simulated_crash : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+// thrown once by the backend call chosen for an injected failure (an I/O
+// error such as ENOSPC or a failed S3 request); the process keeps running
+class injected_failure : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+enum class fault_kind : std::uint8_t { crash, failure };
+
+// which backend call to hit and how; shared by every backend the factory
+// creates while the plan is installed (the writer, a restarted writer, a
+// purging instance)
+struct fault_plan {
+  // 1-based number of the mutating backend call to hit (put, resize,
+  // remove, opening / writing / closing the binlog stream)
+  std::size_t target_call{0U};
+  fault_kind kind{fault_kind::crash};
+  // for a crash: whether the chosen call still completes before the process
+  // dies (otherwise it dies right before the call)
+  bool after_call{false};
+
+  // counting starts once armed, after the initial storage is set up
+  bool armed{false};
+  std::size_t calls{0U};
+  bool triggered{false};
+  bool dead{false};
+  std::string triggered_at{};
+  // takes the snapshot of what a killed process leaves behind
+  std::function<void()> on_crash{};
+};
+
+std::ostream &operator<<(std::ostream &output, const fault_plan &plan) {
+  return output << (plan.kind == fault_kind::crash ? "crash " : "failure ")
+                << (plan.kind == fault_kind::crash && plan.after_call
+                        ? "right after"
+                        : "at")
+                << " mutating backend call " << plan.target_call;
+}
+
+// forwards to the real backend, applying the plan to every mutating call
+class faulty_backend final : public binsrv::basic_storage_backend {
+public:
+  faulty_backend(binsrv::basic_storage_backend_ptr inner, fault_plan &plan)
+      : inner_{std::move(inner)}, plan_{&plan} {}
+
+private:
+  binsrv::basic_storage_backend_ptr inner_;
+  fault_plan *plan_;
+
+  void fail_if_dead() const {
+    if (plan_->dead) {
+      throw simulated_crash{"the process has crashed"};
+    }
+  }
+  // true when the chosen call must die after it completes
+  [[nodiscard]] bool before_mutation(const std::string &what) {
+    fail_if_dead();
+    if (!plan_->armed || plan_->triggered) {
+      return false;
+    }
+    if (++plan_->calls != plan_->target_call) {
+      return false;
+    }
+    plan_->triggered = true;
+    plan_->triggered_at = what;
+    if (plan_->kind == fault_kind::failure) {
+      throw injected_failure{"injected backend failure at " + what};
+    }
+    if (plan_->after_call) {
+      return true;
+    }
+    crash_now();
+    return false;
+  }
+  void crash_now() {
+    if (plan_->on_crash) {
+      plan_->on_crash();
+    }
+    plan_->dead = true;
+    throw simulated_crash{"crashed at " + plan_->triggered_at};
+  }
+  template <typename Call> void mutate(const std::string &what, Call call) {
+    const bool die_after{before_mutation(what)};
+    call();
+    if (die_after) {
+      crash_now();
+    }
+  }
+
+  [[nodiscard]] binsrv::storage_object_name_container
+  do_list_objects() override {
+    fail_if_dead();
+    return inner_->list_objects();
+  }
+  [[nodiscard]] util::dynamic_byte_buffer
+  do_get_object(std::string_view name, const util::byte_range &range) override {
+    fail_if_dead();
+    return inner_->get_object(name, range);
+  }
+  void do_put_object(std::string_view name,
+                     util::const_byte_span content) override {
+    mutate("put_object(" + std::string{name} + ")",
+           [&] { inner_->put_object(name, content); });
+  }
+  void do_resize_object(std::string_view name,
+                        std::uint64_t new_size) override {
+    mutate("resize_object(" + std::string{name} + ", " +
+               std::to_string(new_size) + ")",
+           [&] { inner_->resize_object(name, new_size); });
+  }
+  void do_remove_object(std::string_view name) override {
+    // the wrapped backend's remove_object() includes its durability barrier
+    mutate("remove_object(" + std::string{name} + ")",
+           [&] { inner_->remove_object(name); });
+  }
+  void do_fsync() override { fail_if_dead(); }
+  [[nodiscard]] std::uint64_t
+  do_open_stream(std::string_view name,
+                 binsrv::storage_backend_open_stream_mode mode) override {
+    std::uint64_t result{0ULL};
+    mutate("open_stream(" + std::string{name} + ")",
+           [&] { result = inner_->open_stream(name, mode); });
+    return result;
+  }
+  void do_write_data_to_stream(util::const_byte_span data) override {
+    mutate("write_data_to_stream(" + std::to_string(std::size(data)) +
+               " bytes)",
+           [&] { inner_->write_data_to_stream(data); });
+  }
+  void do_close_stream() override {
+    mutate("close_stream", [&] { inner_->close_stream(); });
+  }
+  [[nodiscard]] std::string do_get_description() const override {
+    return inner_->get_description();
+  }
+  [[nodiscard]] std::string
+  do_get_object_uri(std::string_view name) const override {
+    return inner_->get_object_uri(name);
+  }
+};
+
+// installs 'plan' for every backend the factory creates while it lives
+class fault_injection_scope {
+public:
+  explicit fault_injection_scope(fault_plan &plan) {
+    binsrv::storage_backend_factory::set_test_decorator(
+        [&plan](binsrv::basic_storage_backend_ptr inner)
+            -> binsrv::basic_storage_backend_ptr {
+          return std::make_unique<faulty_backend>(std::move(inner), plan);
+        });
+  }
+  fault_injection_scope(const fault_injection_scope &) = delete;
+  fault_injection_scope &operator=(const fault_injection_scope &) = delete;
+  fault_injection_scope(fault_injection_scope &&) = delete;
+  fault_injection_scope &operator=(fault_injection_scope &&) = delete;
+  ~fault_injection_scope() {
+    binsrv::storage_backend_factory::set_test_decorator({});
+  }
+};
+
+[[nodiscard]] gs::Generator<fault_plan> fault_plans() {
+  return gs::compose([](const hegel::TestCase &tc) {
+    static constexpr std::size_t max_target_call{80U};
+    fault_plan result{};
+    result.target_call = tc.draw(gs::integers<std::size_t>(
+        {.min_value = 1U, .max_value = max_target_call}));
+    result.kind = tc.draw(gs::booleans()) ? fault_kind::crash
+                                          : fault_kind::failure;
+    result.after_call =
+        result.kind == fault_kind::crash && tc.draw(gs::booleans());
+    return result;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // running a sequence of operations
 // ---------------------------------------------------------------------------
 
@@ -1281,7 +1475,8 @@ enum class checked_properties : std::uint8_t {
   damaged_files,
   query_read_only,
   close_mid_transaction,
-  concurrent_queries
+  concurrent_queries,
+  injected_fault
 };
 
 [[nodiscard]] bool reads_back(checked_properties properties) noexcept {
@@ -1503,7 +1698,10 @@ public:
       restart_tailing_reader();
       break;
     case operation_kind::crash:
-      crash();
+      // with injected faults the crash happens at a chosen backend call
+      if (properties_ != checked_properties::injected_fault) {
+        crash();
+      }
       break;
     case operation_kind::purge:
       purge(op.purge_count);
@@ -1834,6 +2032,8 @@ private:
   scratch_directory root_{};
   std::unique_ptr<storage_location> location_;
   std::filesystem::path config_path_;
+  // what a process killed by an injected crash left behind
+  std::unique_ptr<storage_location> fault_snapshot_{};
   binsrv::storage_ptr storage_{};
   storage_model model_{};
   std::uint64_t event_counter_{0ULL};
@@ -1932,9 +2132,12 @@ private:
         settings_.gtid_mode
             ? binsrv::gtids::gtid{binsrv::gtids::uuid{transaction_uuid}, gno}
             : binsrv::gtids::gtid{}};
+    // the model goes first: storage::write_event() buffers the event before
+    // it may flush, so the event belongs to the storage's state even when an
+    // injected fault interrupts that flush
+    model_.write_event(bytes, timestamp, at_boundary);
     storage_->write_event(util::const_byte_span{bytes}, at_boundary,
                           transaction_gtid, timestamp, sequence_number);
-    model_.write_event(std::move(bytes), timestamp, at_boundary);
   }
 
   void write_event(const operation &op) {
@@ -1971,8 +2174,13 @@ private:
   // only the purge property uses it
   void purge(std::size_t requested_count) {
     const auto &binlogs{model_.get_binlogs()};
-    if (properties_ != checked_properties::purge_reopenable ||
+    if ((properties_ != checked_properties::purge_reopenable &&
+         properties_ != checked_properties::injected_fault) ||
         std::size(binlogs) < 2U) {
+      return;
+    }
+    if (properties_ == checked_properties::injected_fault) {
+      purge_stopped(requested_count);
       return;
     }
     // the current (last) binlog cannot be purged
@@ -1988,6 +2196,141 @@ private:
                   " binlog(s) instead of " + std::to_string(count));
     }
     model_.purge(count);
+  }
+
+  // the retention procedure the README asks for: stop the writer, run
+  // 'purge_binlogs', start the writer again
+  void purge_stopped(std::size_t requested_count) {
+    const auto &binlogs{model_.get_binlogs()};
+    const auto count{std::min(requested_count, std::size(binlogs) - 1U)};
+    const auto target{binlogs[count - 1U].name};
+    storage_.reset();
+    model_.drop_incomplete_transaction();
+    std::string warning;
+    {
+      const auto purger{make_storage(
+          config_path_, binsrv::storage_construction_mode_type::purging)};
+      warning = purger->purge_binlogs(target).second;
+    }
+    model_.purge(count);
+    if (!warning.empty()) {
+      // the purge committed the new index but could not remove every file
+      // (an injected failure inside the batch removal): judged like any
+      // other failure, by what the next start finds
+      throw injected_failure{"purge_binlogs reported a warning: " + warning};
+    }
+    storage_ = make_storage(config_path_);
+    reopen_current_binlog(*storage_, "purge");
+  }
+
+public:
+  // installs the crash snapshot for 'plan' and starts counting its calls
+  void arm(fault_plan &plan) {
+    plan.on_crash = [this] {
+      fault_snapshot_ = location_->make_sibling("fault");
+      location_->copy_to(*fault_snapshot_);
+    };
+    plan.armed = true;
+  }
+
+  // what the next start finds after the fault: a crashed process leaves the
+  // snapshot taken at the crash; a process that hit a failure stops (the
+  // collector does not handle storage errors) and its storage destructor
+  // runs the final flush. Either way the storage must open, hold every
+  // binlog but the last completely and the last one up to a transaction
+  // boundary, with records that describe exactly that, and resume right
+  // after the data of the last binlog.
+  void check_after_fault(fault_plan &plan) {
+    tailing_reader_.reset();
+    storage_.reset();
+    plan.armed = false;
+    plan.dead = false;
+    const bool crashed{plan.kind == fault_kind::crash};
+    storage_location &leftover{crashed ? *fault_snapshot_ : *location_};
+    const auto config{crashed ? write_config(root_.path(),
+                                             leftover.config_members(),
+                                             settings_)
+                              : config_path_};
+    std::ostringstream label_stream;
+    label_stream << (crashed ? "after a crash " : "after a failure ")
+                 << (crashed && plan.after_call ? "right after " : "at ")
+                 << plan.triggered_at;
+    const auto label{label_stream.str()};
+
+    binsrv::storage_ptr reopened;
+    try {
+      reopened = make_storage(config);
+    } catch (const std::exception &e) {
+      require(false,
+              label + ": the storage cannot be opened again: " + e.what());
+    }
+    const auto records{reopened->get_binlog_records()};
+    require_resumable_prefix(leftover, records, label);
+
+    const auto &last{records.back()};
+    binsrv::open_binlog_status status{};
+    try {
+      status = reopened->open_binlog(last.name);
+    } catch (const std::exception &e) {
+      require(false, label + ": cannot resume in '" + last.name.str() +
+                         "': " + e.what());
+    }
+    require(status != binsrv::open_binlog_status::created,
+            label + ": resuming created '" + last.name.str() + "' anew");
+    require(reopened->get_current_position() == last.size,
+            label + ": resuming at position " +
+                std::to_string(reopened->get_current_position()) +
+                " instead of right after the data of '" + last.name.str() +
+                "' (" + std::to_string(last.size) + ")");
+  }
+
+private:
+  // the stored binlogs are consecutive binlogs of the model (a purge stopped
+  // by the fault may already have removed some of the oldest); every one
+  // but the last holds all of its transactions, the last a prefix of them,
+  // and every record matches its file
+  void require_resumable_prefix(storage_location &location,
+                                const binsrv::binlog_record_container &records,
+                                const std::string &label) {
+    const auto &binlogs{model_.get_binlogs()};
+    require(!records.empty(), label + ": no binlogs left");
+    const auto first_it{std::ranges::find(binlogs, records.front().name,
+                                          &model_binlog::name)};
+    require(first_it != std::cend(binlogs),
+            label + ": unexpected first binlog '" +
+                records.front().name.str() + "'");
+    const auto first_index{
+        static_cast<std::size_t>(std::distance(std::cbegin(binlogs), first_it))};
+    require(first_index + std::size(records) <= std::size(binlogs),
+            label + ": " + std::to_string(std::size(records)) +
+                " binlog record(s) from '" + records.front().name.str() +
+                "' but the model has only " +
+                std::to_string(std::size(binlogs) - first_index));
+
+    const bool encrypted{settings_.encryption.has_value()};
+    binsrv::gtids::gtid_set earlier_gtids{model_.get_purged_gtids()};
+    for (std::size_t index{0U}; index < first_index; ++index) {
+      earlier_gtids += model_gtids(binlogs[index],
+                                   std::size(binlogs[index].transactions));
+    }
+    for (std::size_t index{0U}; index < std::size(records); ++index) {
+      const auto &binlog{binlogs[first_index + index]};
+      const auto file_content{location.read(binlog.name.str())};
+      const auto transactions_on_disk{
+          match_file_with_model(file_content, binlog, encrypted)};
+      if (index + 1U < std::size(records)) {
+        require(transactions_on_disk == std::size(binlog.transactions),
+                label + ": " + describe_binlog(binlog) + " lost " +
+                    std::to_string(std::size(binlog.transactions) -
+                                   transactions_on_disk) +
+                    " complete transaction(s) although a later binlog "
+                    "exists");
+      }
+      require_record_matches(records[index], binlog, transactions_on_disk,
+                             std::size(file_content), earlier_gtids,
+                             settings_.gtid_mode, encrypted);
+      earlier_gtids += model_gtids(binlog, transactions_on_disk);
+    }
   }
 
   // a copy of the storage directory taken now is what a killed process
@@ -2030,7 +2373,8 @@ private:
 
     if (properties_ == checked_properties::model_agreement ||
         properties_ == checked_properties::damaged_files ||
-        properties_ == checked_properties::close_mid_transaction) {
+        properties_ == checked_properties::close_mid_transaction ||
+        properties_ == checked_properties::injected_fault) {
       const auto expected_position{state.file_size + unflushed +
                                    model_.get_incomplete_size()};
       require(storage_->get_current_position() == expected_position,
@@ -2097,6 +2441,25 @@ void run_storage_property(hegel::TestCase &tc, checked_properties properties,
       query_settings->encryption =
           encryption_settings{.kek_id = "gamma32", .data_cipher = "AES-256-CTR"};
     }
+  }
+  if (properties == checked_properties::injected_fault) {
+    auto plan{tc.draw("fault", fault_plans())};
+    const fault_injection_scope scope{plan};
+    storage_harness harness{settings, properties};
+    harness.arm(plan);
+    try {
+      for (const auto &op : ops) {
+        harness.apply(op);
+      }
+    } catch (const simulated_crash &) {
+      harness.check_after_fault(plan);
+      return;
+    } catch (const injected_failure &) {
+      harness.check_after_fault(plan);
+      return;
+    }
+    plan.armed = false;
+    return;
   }
   storage_harness harness{settings, properties};
   for (const auto &op : ops) {
@@ -2209,6 +2572,17 @@ BOOST_AUTO_TEST_CASE(StorageConcurrentQueriesSucceed) {
   }
 }
 
+// a writer that is killed, or hits a storage error, at any backend call -
+// while writing, checkpointing, rotating, restarting or purging (stopped,
+// as the README asks) - leaves a storage that the next start opens and
+// resumes: every binlog but the last complete, the last one up to a
+// transaction boundary, no data written twice, records matching the files
+BOOST_AUTO_TEST_CASE(StorageSurvivesAFaultAtAnyBackendCall) {
+  run_property([](hegel::TestCase &tc) {
+    run_storage_property(tc, checked_properties::injected_fault);
+  });
+}
+
 BOOST_AUTO_TEST_CASE(StorageMatchesModelOnS3) {
   run_s3_storage_property(checked_properties::model_agreement);
 }
@@ -2235,4 +2609,8 @@ BOOST_AUTO_TEST_CASE(StorageOpeningOfDamagedFilesFailsCleanlyOnS3) {
 
 BOOST_AUTO_TEST_CASE(StorageQueryingLeavesItUnchangedOnS3) {
   run_s3_storage_property(checked_properties::query_read_only);
+}
+
+BOOST_AUTO_TEST_CASE(StorageSurvivesAFaultAtAnyBackendCallOnS3) {
+  run_s3_storage_property(checked_properties::injected_fault);
 }

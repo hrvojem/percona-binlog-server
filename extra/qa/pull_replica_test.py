@@ -95,8 +95,11 @@ def run_case(args, gtid_mode: bool) -> dict:
             env=dict(os.environ, AWS_EC2_METADATA_DISABLED="true"))
         time.sleep(3)
 
+        # the source creates the 'qa' database before resetting its binary
+        # logs (see fetch_crash_test.Server), so the schema is not in any
+        # binlog: the replica starts from an empty 'qa' of its own
         replica.sql("STOP REPLICA; RESET REPLICA ALL; "
-                    "DROP DATABASE IF EXISTS qa;")
+                    "DROP DATABASE IF EXISTS qa; CREATE DATABASE qa;")
         if gtid_mode:
             replica.sql("RESET BINARY LOGS AND GTIDS"
                         if replica.version() >= (8, 2, 0) else "RESET MASTER")

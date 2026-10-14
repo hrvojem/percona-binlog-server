@@ -3,8 +3,17 @@
 
 Reads ~/ws/nightly/history.tsv (one line per run), the per-test results of
 every run directory still kept (results.jsonl, or for runs from before it
-existed, a reconstruction from nightly.log and summary.txt) and
-known_failures.txt, and writes ~/ws/nightly/report.json.
+existed, a reconstruction from nightly.log and summary.txt) and the
+known-failure lists, and writes ~/ws/nightly/report.json.
+
+Besides the property-test builds (debug_gcc14, asan_gcc14, tsan_gcc14), a
+run's results hold the MTR stage as builds 'mtr-<series>' (program
+'binlog_streaming', one case per test or test/combination) and the QA-harness
+stage as builds 'qa-<series>' (program: the harness, one case per mode or
+harness case). Their statuses are the same, plus 'skipped' for MTR tests the
+suite skipped. Every known failure carries the 'kind' of list it comes from
+(property, mtr, qa) and its 'scope' (the MySQL series or '*' for MTR, the
+harness for QA, empty for property cases).
 """
 
 import json
@@ -101,22 +110,51 @@ def run_details():
 
 def known_failures():
     known = []
-    for line in (NIGHTLY / "known_failures.txt").read_text().splitlines():
-        if not line.strip() or line.startswith("#"):
+    for kind, file_name, scoped in (("property", "known_failures.txt", False),
+                                    ("mtr", "mtr_known_failures.txt", True),
+                                    ("qa", "qa_known_failures.txt", True)):
+        path = NIGHTLY / file_name
+        if not path.exists():
             continue
-        name, _, ticket = line.partition("  ")
-        known.append({"test_case": name.strip(), "ticket": ticket.strip()})
+        for line in path.read_text().splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            name, _, ticket = line.partition("  ")
+            scope = ""
+            if scoped:
+                scope, _, name = name.strip().partition(" ")
+            known.append({"kind": kind, "scope": scope,
+                          "test_case": name.strip(),
+                          "ticket": ticket.strip()})
     return known
 
 
+def builds(runs):
+    """A description of every build label that occurs in the kept runs."""
+    described = {"debug_gcc14": "debug, 2000 cases per property",
+                 "asan_gcc14": "AddressSanitizer, 500 cases",
+                 "tsan_gcc14": "ThreadSanitizer, storage test only, "
+                               "300 cases"}
+    for run in runs:
+        for result in run["results"]:
+            label = result.get("config", "")
+            if label in described:
+                continue
+            if label.startswith("mtr-"):
+                described[label] = (f"binlog_streaming MTR suite, debug build, "
+                                    f"MySQL {label[4:]}")
+            elif label.startswith("qa-"):
+                described[label] = (f"black-box QA harnesses (extra/qa), "
+                                    f"MySQL {label[3:]}")
+    return described
+
+
 def main():
+    runs = run_details()
     report = {"generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-              "history": history(), "runs": run_details(),
+              "history": history(), "runs": runs,
               "known_failures": known_failures(),
-              "builds": {"debug_gcc14": "debug, 2000 cases per property",
-                         "asan_gcc14": "AddressSanitizer, 500 cases",
-                         "tsan_gcc14": "ThreadSanitizer, storage test only, "
-                                       "300 cases"}}
+              "builds": builds(runs)}
     (NIGHTLY / "report.json").write_text(json.dumps(report, indent=1))
     print(f"{len(report['history'])} runs in history, "
           f"{len(report['runs'])} with details")

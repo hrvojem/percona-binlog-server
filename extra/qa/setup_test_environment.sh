@@ -353,6 +353,9 @@ step_nightly() {
   # install the nightly runner and its data files
   install -m 0755 "$src_dir/run_nightly.sh" "$dst_dir/run_nightly.sh"
   install -m 0644 "$src_dir/known_failures.txt" "$dst_dir/known_failures.txt"
+  install -m 0644 "$src_dir/mtr_known_failures.txt" "$dst_dir/mtr_known_failures.txt"
+  install -m 0644 "$src_dir/qa_known_failures.txt" "$dst_dir/qa_known_failures.txt"
+  install -m 0755 "$src_dir/nightly_stages.py" "$dst_dir/nightly_stages.py"
   install -m 0644 "$src_dir/tsan.supp" "$dst_dir/tsan.supp"
   install -m 0644 "$src_dir/build_report_data.py" "$dst_dir/build_report_data.py"
   # hegel.toml needs absolute database paths, filled in from this workspace

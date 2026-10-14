@@ -1,0 +1,8 @@
+# Black-box QA harness cases (extra/qa) that fail because of known, unfixed
+# bugs: <harness> <case>  <ticket>
+# <harness> is the script name without .py, <case> the case it reports (a
+# mode, or the harness's single case name), or * for all of its cases.
+# A failure listed here is reported as known; any other failure is NEW.
+# Remove a line once its bug is fixed.
+pull_replica_test gtid  ticket 20: COM_BINLOG_DUMP_GTID unsupported (GTID auto-position replica of pull)
+query_race_test list_next_to_pull  ticket 29: a query next to a writer fails stat()ing a .tmp file the writer renamed away

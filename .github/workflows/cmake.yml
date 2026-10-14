@@ -99,6 +99,15 @@ jobs:
             valgrind_options: "valgrind --error-exitcode=42 --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --num-callers=64"
           }
         - {
+            # Hegel property tests at the default (fast) settings; the cases
+            # extra/qa/nightly/known_failures.txt lists (known, unfixed bugs)
+            # are skipped, so any other failure fails the job
+            name: "GCC 14 Debug Property Tests",
+            label: "debug_gcc14",
+            cmake_options: "-DWITH_PROPERTY_TESTS=ON",
+            run_property_tests: true
+          }
+        - {
             name: "Clang 20 Debug",
             label: "debug_clang20",
             run_clang_tidy: true,
@@ -255,7 +264,7 @@ jobs:
       run: cmake --install ${{github.workspace}}/aws-sdk-cpp-build-${{matrix.config.label}}
 
     - name: Configure CMake
-      run: cmake ${{github.workspace}}/src --preset ${{matrix.config.label}}
+      run: cmake ${{github.workspace}}/src --preset ${{matrix.config.label}} ${{matrix.config.cmake_options}}
 
     - name: CMake info
       run: cmake -L ${{github.workspace}}/src-build-${{matrix.config.label}}
@@ -383,6 +392,16 @@ jobs:
       run: |
         ${{matrix.config.openssl_ia32cap_fix}} \
         ctest --parallel --output-on-failure ${{matrix.config.ctest_options}}
+
+    - name: Property tests
+      if: matrix.config.run_property_tests
+      # Hegel's default settings (no hegel.toml above the build directory);
+      # the known failures are passed as a Boost.Test run filter
+      run: |
+        ${{github.workspace}}/src/extra/qa/nightly/ci_property_tests.sh \
+          ${{github.workspace}}/src-build-${{matrix.config.label}} \
+          ${{github.workspace}}/src/extra/qa/nightly/known_failures.txt \
+          --parallel ${{steps.cpu-cores.outputs.count}}
 
     - name: Info Build artifacts
       run: |

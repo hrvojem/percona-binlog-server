@@ -10,6 +10,20 @@
 # property tests exercise the S3 backend (PBS_TEST_S3_*) instead of skipping
 # it. Failures are compared with known_failures.txt.
 #
+# After the C++ stages, the whole binlog_streaming MTR suite runs with the
+# debug build on MySQL 8.0, 8.4 and 9.7 (MTR_DISTS), and a few black-box QA
+# harnesses from extra/qa run against MySQL 8.4 (pull_replica_test.py, a
+# short fetch_crash_test.py run per mode, query_race_test.py); their failures
+# are compared with mtr_known_failures.txt and qa_known_failures.txt (see
+# nightly_stages.py, which runs those stages).
+#
+# STAGES selects what runs (default "cpp mtr qa"); without "cpp" nothing is
+# built and the existing binaries are used. OUT_DIR runs into another
+# directory instead of runs/<date> and then leaves history.tsv, the latest
+# symlink and old runs alone, to try a stage out without touching the
+# nightly's own results, e.g.
+#   STAGES=mtr OUT_DIR=~/ws/qa/nightly-try ~/ws/nightly/run_nightly.sh
+#
 # Results: ~/ws/nightly/runs/<date>/summary.txt (also ~/ws/nightly/latest),
 # one log per test case next to it, results.jsonl (one JSON line per test
 # case: build, program, test case, status, ticket, reason, seconds) and
@@ -24,7 +38,7 @@ export AWS_EC2_METADATA_DISABLED=true
 
 WS=${WS:-$HOME/ws}
 SRC=$WS/percona-binlog-server
-NIGHTLY=$WS/nightly
+NIGHTLY=${NIGHTLY:-$WS/nightly}
 KEEP_DAYS=30
 CASE_TIMEOUT=3600
 # property test cases run several at a time; each one is a separate process
@@ -32,12 +46,32 @@ CASE_TIMEOUT=3600
 # cases are memory-heavy, so they use a smaller pool.
 JOBS=${JOBS:-4}
 TSAN_JOBS=${TSAN_JOBS:-2}
+STAGES=" ${STAGES:-cpp mtr qa} "
+# MTR stage: <series>:<distribution under $WS/dist>; its own build thread
+# (ports) and var directories so it does not collide with manual MTR runs.
+# A worker of build thread N uses ports 10000+10*N.. (30 per worker) and the
+# rs_* tests make 'pull' listen 1000 above the server's port, so build thread
+# 500 (ports 15000-15119 and 16000-16119 with 4 workers) stays clear of the
+# automatic build threads (300-399: 13000-14999 including the +1000), e.g.
+# a manual run with --build-thread=300.
+MYSQL_SUFFIX=linux-glibc2.28-x86_64
+MTR_DISTS=${MTR_DISTS:-"8.0:mysql-8.0.45-$MYSQL_SUFFIX 8.4:mysql-8.4.8-$MYSQL_SUFFIX-minimal 9.7:mysql-9.7.2-$MYSQL_SUFFIX-minimal"}
+MTR_BUILD_THREAD=${MTR_BUILD_THREAD:-500}
+MTR_PARALLEL=${MTR_PARALLEL:-4}
+# QA-harness stage: one MySQL version, the Python libraries, a port range
+QA_DIST=${QA_DIST:-8.4:mysql-8.4.8-$MYSQL_SUFFIX-minimal}
+QA_PORT=${QA_PORT:-24470}
+QA_RUNS=${QA_RUNS:-500}
+QA_EXAMPLES=${QA_EXAMPLES:-10}
+QA_STEPS=${QA_STEPS:-8}
+export PYTHONPATH=${PYTHONPATH:-$WS/qa/pylib}
+want() { [[ "$STAGES" == *" $1 "* ]]; }
 
 exec 9> "$NIGHTLY/.lock"
 flock -n 9 || { echo "another nightly run is in progress"; exit 0; }
 
 day=$(date -u +%F)
-out=$NIGHTLY/runs/$day
+out=${OUT_DIR:-$NIGHTLY/runs/$day}
 rm -rf "$out"
 mkdir -p "$out" "$NIGHTLY/hegel-db"
 summary=$out/summary.txt
@@ -102,6 +136,42 @@ run_case() {
     "$case_seconds" > "$status_dir/$test_case.json"
 }
 
+# appends the results of one nightly_stages.py call (written to
+# $stage_results / $stage_lines) to the run's results and counters; if the
+# call failed (exit code $1) without recording anything, that counts as
+# broken for build $2 / program $3
+stage_results=$out/.stage-results.jsonl
+stage_lines=$out/.stage-lines.txt
+tally_stage() {
+  local rc=$1 config=$2 program=$3 status
+  if [ "$rc" -ne 0 ] && [ ! -s "$stage_results" ]; then
+    record "$config" "$program" "" "no-test-cases" "" \
+      "nightly_stages.py failed with exit code $rc, see nightly.log" 0 \
+      > "$stage_results"
+    echo "NO TEST CASES $config  $program  (nightly_stages.py failed with exit code $rc, see nightly.log)" \
+      > "$stage_lines"
+  fi
+  while read -r status; do
+    case $status in
+      passed) passed=$((passed + 1)) ;;
+      known-passed) unexpected_pass=$((unexpected_pass + 1)); passed=$((passed + 1)) ;;
+      known) known_failed=$((known_failed + 1)) ;;
+      new) new=$((new + 1)) ;;
+      no-test-cases) broken=$((broken + 1)) ;;
+      skipped) skipped=$((skipped + 1)) ;;
+    esac
+  done < <(python3 -c 'import json,sys
+for line in open(sys.argv[1]):
+    if line.strip(): print(json.loads(line)["status"])' "$stage_results")
+  cat "$stage_results" >> "$results_file"
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] && results+=("$line")
+  done < "$stage_lines"
+  : > "$stage_results"
+  : > "$stage_lines"
+}
+
 declare -A known
 while read -r name ticket; do
   [[ -z "$name" || "$name" == \#* ]] && continue
@@ -134,10 +204,16 @@ else
   log "S3 server not reachable; S3 property variants will be skipped"
 fi
 
-new=0; known_failed=0; passed=0; unexpected_pass=0; broken=0
+new=0; known_failed=0; passed=0; unexpected_pass=0; broken=0; skipped=0
 results=()
+: > "$stage_results"
+: > "$stage_lines"
+# builds that failed tonight (the later stages skip what needs them)
+declare -A build_failed
 
-for config in debug_gcc14 asan_gcc14 tsan_gcc14; do
+cpp_configs=()
+want cpp && cpp_configs=(debug_gcc14 asan_gcc14 tsan_gcc14)
+for config in "${cpp_configs[@]}"; do
   build_dir=$WS/percona-binlog-server-build-$config
   targets=()
   run_prefix=()
@@ -163,6 +239,7 @@ for config in debug_gcc14 asan_gcc14 tsan_gcc14; do
     record "$config" "" "build" "build-failed" "" "see build-$config.log" 0 \
       >> "$results_file"
     broken=$((broken + 1))
+    build_failed[$config]=1
     continue
   fi
 
@@ -274,20 +351,91 @@ for config in debug_gcc14 asan_gcc14 tsan_gcc14; do
   done
 done
 
+debug_binsrv=$WS/percona-binlog-server-build-debug_gcc14/binlog_server
+asan_binsrv=$WS/percona-binlog-server-build-asan_gcc14/binlog_server
+
+# the binlog_streaming MTR suite with the debug build, one MySQL version at a
+# time (each run is already parallel)
+if want mtr; then
+  if [ -n "${build_failed[debug_gcc14]:-}" ]; then
+    log "MTR stage skipped: the debug build failed"
+  else
+    for entry in $MTR_DISTS; do
+      series=${entry%%:*}
+      stage_started=$(date +%s)
+      log "MTR suite on MySQL $series"
+      python3 "$NIGHTLY/nightly_stages.py" mtr --dist "$WS/dist/${entry#*:}" \
+        --series "$series" --binsrv "$debug_binsrv" \
+        --known "$NIGHTLY/mtr_known_failures.txt" --results "$stage_results" \
+        --lines "$stage_lines" --out "$out" \
+        --vardir "$WS/mtr-var-nightly-$series" \
+        --build-thread "$MTR_BUILD_THREAD" --parallel "$MTR_PARALLEL" \
+        >> "$out/nightly.log" 2>&1
+      tally_stage $? "mtr-$series" binlog_streaming
+      log "MTR suite on MySQL $series done in $(( ($(date +%s) - stage_started) / 60 )) min"
+    done
+  fi
+fi
+
+# black-box QA harnesses from extra/qa (one MySQL version); workdirs are kept
+# short because the mysqld socket path is limited to 107 characters
+if want qa; then
+  qa_series=${QA_DIST%%:*}
+  qa_args=(--dist "$WS/dist/${QA_DIST#*:}" --series "$qa_series"
+    --known "$NIGHTLY/qa_known_failures.txt" --results "$stage_results"
+    --lines "$stage_lines" --out "$out" --qa-dir "$SRC/extra/qa")
+  qa_run() {
+    local harness=$1 name=$2; shift 2
+    log "QA harness $name"
+    python3 "$NIGHTLY/nightly_stages.py" qa "${qa_args[@]}" \
+      --harness "$harness" "$@" >> "$out/nightly.log" 2>&1
+    tally_stage $? "qa-$qa_series" "$harness"
+  }
+  if [ -n "${build_failed[debug_gcc14]:-}" ]; then
+    log "QA harnesses on the debug build skipped: the debug build failed"
+  else
+    qa_run pull_replica_test pull_replica_test \
+      --binsrv "$debug_binsrv" --workdir "$out/qa/pr" --port "$QA_PORT" \
+      --timeout 900
+    qa_run query_race_test query_race_test \
+      --binsrv "$debug_binsrv" --workdir "$out/qa/qr" \
+      --port $((QA_PORT + 30)) --runs "$QA_RUNS" --timeout 1200
+  fi
+  # the crash/resume test runs against the ASan build to catch memory errors
+  if [ -n "${build_failed[asan_gcc14]:-}" ]; then
+    log "fetch_crash_test skipped: the ASan build failed"
+  else
+    for mode in gtid position; do
+      qa_run fetch_crash_test "fetch_crash_test ($mode)" \
+        --binsrv "$asan_binsrv" --workdir "$out/qa/fc-$mode" \
+        --port $((QA_PORT + 10)) --mode "$mode" --examples "$QA_EXAMPLES" \
+        --steps "$QA_STEPS" --timeout 1800
+    done
+  fi
+fi
+rm -f "$stage_results" "$stage_lines"
+
 duration=$(( ($(date +%s) - started) / 60 ))
 {
-  echo "new failures: $new, build failures: $broken, known failures: $known_failed, known failures that passed: $unexpected_pass, passed: $passed"
+  echo "new failures: $new, build failures: $broken, known failures: $known_failed, known failures that passed: $unexpected_pass, passed: $passed, skipped (MTR): $skipped"
   echo "duration: $duration min"
   echo
   printf '%s\n' "${results[@]}" | sort
   echo
-  echo "Replay a failure: cd $out/work-<build> && HEGEL_DEFAULT_PROFILE=<profile> <test binary> --run_test=<test case>"
+  echo "Replay a property failure: cd $out/work-<build> && HEGEL_DEFAULT_PROFILE=<profile> <test binary> --run_test=<test case>"
+  echo "Replay an MTR failure: cd $WS/dist/<distribution>/mysql-test && BINSRV=$debug_binsrv ./mtr --build-thread=$MTR_BUILD_THREAD binlog_streaming.<test> (log: mtr-<series>-<test>.log)"
+  echo "Replay a QA failure: see the command at the top of qa-<series>-<case>.log"
 } >> "$summary"
+python3 -c 'import json,sys; print(json.dumps(dict(zip(["day","started","revision","new","broken","known","known_passed","passed","skipped","minutes"], sys.argv[1:4]+[int(v) for v in sys.argv[4:]])), indent=1))' \
+  "$day" "$started_utc" "$revision" "$new" "$broken" "$known_failed" \
+  "$unexpected_pass" "$passed" "$skipped" "$duration" > "$out/run.json"
+if [ -n "${OUT_DIR:-}" ]; then
+  log "done (OUT_DIR run, history not updated): $new new, $broken build failures, $known_failed known"
+  [ $new -eq 0 ] && [ $broken -eq 0 ]
+  exit
+fi
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$day" "$revision" "$new" "$broken" \
   "$known_failed" "$passed" "$duration" >> "$NIGHTLY/history.tsv"
-python3 -c 'import json,sys; print(json.dumps(dict(zip(["day","started","revision","new","broken","known","known_passed","passed","minutes"], sys.argv[1:4]+[int(v) for v in sys.argv[4:]])), indent=1))' \
-  "$day" "$started_utc" "$revision" "$new" "$broken" "$known_failed" \
-  "$unexpected_pass" "$passed" "$duration" > "$out/run.json"
 ln -sfn "runs/$day" "$NIGHTLY/latest"
 find "$NIGHTLY/runs" -mindepth 1 -maxdepth 1 -type d -mtime +"$KEEP_DAYS" \
   -exec rm -rf {} +

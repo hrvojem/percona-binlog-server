@@ -113,6 +113,7 @@ JSON and exits non-zero on a failure.
 | `concurrent_storage_test.py` | runs several `fetch` instances against **one** storage at once (a cron `fetch` overrunning into the next run); checks the storage is not corrupted and heals. Two writers on one storage are an unsupported scenario (ticket 24, closed as not a bug in PBS-87), so its failures document misuse, not defects | ticket 24 |
 | `source_change_test.py` | changes the source under a running backup: `RESET BINARY LOGS`, a different server (failover), binlogs purged before fetch, a mid-stream restart | ticket 25 |
 | `event_variety_test.py` | drives less common event types — transaction compression, `binlog_row_image=MINIMAL`, partial JSON, XA, tagged GTIDs — through a full fetch and a kill/resume | — (no bug) |
+| `query_race_test.py` | runs `binlog_server list` `--runs` times (default 500) next to a `pull` writing a filesystem storage with `checkpoint_size` `"1K"` while the source gets small inserts and a `FLUSH BINARY LOGS` every 20 of them; reports the failed `list` runs and each distinct error message | ticket 29 |
 
 Examples:
 
@@ -126,7 +127,17 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/concurrent_storage_test.py \
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/source_change_test.py \
   --mysql-basedir <dist> --binsrv <asan-binary> --workdir ~/ws/qa/source-change \
   --scenarios reset,identity,purge,restart
+
+# 'list' next to a writing 'pull' (ticket 29); keep --workdir short, the
+# mysqld socket lives in it
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/query_race_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/qrace --runs 500
 ```
+
+`query_race_test.py` prints one JSON line: `runs`, `failed`, and `errors`, a
+list of the distinct error messages (runs of 3+ digits replaced by `N`, so differing file
+names do not split one error) with a count and one verbatim example. It exits
+with 1 when any `list` run failed or `pull` died.
 
 ## Fault injection
 
@@ -219,6 +230,9 @@ source's. When it does not, it reports the replica's I/O-thread error and the
 statements `pull` rejected. It is the end-to-end check behind tickets 20-22;
 tickets 21 (resuming from a position) and 22 (`mysqlbinlog --raw`) are fixed
 upstream in `a338dde` (PBS-42 part 5), ticket 20 is open for heartbeats.
+The nightly runs it (see below); its `gtid` case fails because `pull` does
+not support `COM_BINLOG_DUMP_GTID` yet and is listed as a known failure
+(ticket 20), while the `position` case must pass.
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_replica_test.py \
@@ -233,15 +247,58 @@ server rather than starting one.
 
 [`nightly/`](nightly) holds the nightly test runner and its data:
 
-- **`run_nightly.sh`** — builds the `debug_gcc14`, `asan_gcc14` and
-  `tsan_gcc14` trees in place, runs the unit tests, then runs **every Hegel
-  property-test case separately** with many more cases than the default (the
-  profiles in `hegel.toml`), and compares each failure against
-  `known_failures.txt`. Results go to `$WS/nightly/runs/<date>/` (and the
-  `latest` symlink): `summary.txt`, one log per failing case, `results.jsonl`
-  (one JSON line per case) and `run.json`, plus a line per night in
-  `history.tsv`. It exits non-zero when there is a new failure or a build
-  fails, and it is guarded by a `flock` so overlapping runs do not collide.
+- **`run_nightly.sh`** — runs three stages:
+  1. **C++** (`cpp`): builds the `debug_gcc14`, `asan_gcc14` and
+     `tsan_gcc14` trees in place, runs the unit tests, then runs **every
+     Hegel property-test case separately** with many more cases than the
+     default (the profiles in `hegel.toml`), and compares each failure
+     against `known_failures.txt`.
+  2. **MTR** (`mtr`): the whole `binlog_streaming` suite with the debug build
+     on MySQL 8.0.45, 8.4.8 and 9.7.2 (`MTR_DISTS`), one version after the
+     other, each with `--parallel=4` (`MTR_PARALLEL`), `--build-thread=500`
+     (`MTR_BUILD_THREAD`; the `rs_*` tests also use ports 1000 above the
+     server's, so 500 keeps clear of the automatic build threads 300-399) and var directories `$WS/mtr-var-nightly-<series>`,
+     so it does not collide with manual MTR runs. Every test (and
+     combination) is a case of the build `mtr-<series>`, compared against
+     `mtr_known_failures.txt`. Skipped tests are recorded as `skipped`.
+  3. **QA harnesses** (`qa`), against MySQL 8.4 (`QA_DIST`), ports from 24470
+     (`QA_PORT`): `pull_replica_test.py` (cases `position` and `gtid`),
+     `query_race_test.py` (case `list_next_to_pull`, 500 `list` runs,
+     `QA_RUNS`), both with the debug build, and a short
+     `fetch_crash_test.py` run per mode (cases `gtid` and `position`,
+     10 examples of 8 steps, `QA_EXAMPLES` / `QA_STEPS`) with the ASan build.
+     They are cases of the build `qa-<series>` (program: the harness),
+     compared against `qa_known_failures.txt`. A failing harness keeps its
+     workdir under `qa/` in the run directory, minus the MySQL data
+     directories.
+
+  Results go to `$WS/nightly/runs/<date>/` (and the `latest` symlink):
+  `summary.txt`, one log per failing case (`<build>-<test case>.log`; for MTR
+  `mtr-<series>-<test>.log` plus the whole `mtr-<series>.log`, for QA
+  `qa-<series>-<harness>-<case>.log`), `results.jsonl` (one JSON line per
+  case of every stage: build, program, test case, status, ticket, reason,
+  seconds) and `run.json`, plus a line per night in `history.tsv` (its
+  counts include the MTR and QA cases). Statuses: `passed`, `known` (a listed
+  failure), `new` (any other failure), `known-passed` (a listed case that
+  passed: fixed, or not hit tonight), `skipped` (MTR only, not counted), and
+  `build-failed` / `no-test-cases` (counted as broken). It exits non-zero when
+  there is a new failure or something is broken, and it is guarded by a
+  `flock` so overlapping runs do not collide. The MTR stage and the debug
+  build harnesses are skipped when the debug build fails, `fetch_crash_test`
+  when the ASan build fails. Tonight's whole run takes about 40-50 min for the
+  C++ stage plus 35-50 min of MTR (9-26 min per version) and about 12 min of QA harnesses.
+
+  To try a stage without touching the nightly's own results, select stages
+  with `STAGES` (default `cpp mtr qa`; without `cpp` nothing is built) and
+  write elsewhere with `OUT_DIR` (then `history.tsv`, `latest` and old runs
+  are left alone):
+
+  ```sh
+  STAGES="mtr qa" OUT_DIR=~/ws/qa/nightly-try ~/ws/nightly/run_nightly.sh
+  ```
+- **`nightly_stages.py`** — runs one MTR suite or one QA harness for
+  `run_nightly.sh`, parses its outcome into cases, matches them against the
+  stage's known-failure list and appends the result lines.
 - **`hegel.toml`** — the Hegel settings profiles (`nightly_debug`,
   `nightly_asan`, `nightly_tsan`) selected per build via
   `HEGEL_DEFAULT_PROFILE`; each has its own failure database so a failure found
@@ -249,9 +306,28 @@ server rather than starting one.
   (`@NIGHTLY_DIR@`) and filled in for the workspace by the setup script.
 - **`known_failures.txt`** — maps property-test case names to the ticket that
   explains them; a listed failure is reported as *known*, any other as *new*.
-  Remove a line once its bug is fixed.
+  Remove a line once its bug is fixed. CI uses the same list (see below).
+- **`mtr_known_failures.txt`** — the same for the MTR stage, one line per
+  `<series> <test>  ticket N: ...`, where `<series>` is `8.0`, `8.4`, `9.7` or
+  `*` (every version) and `<test>` is a test name (every combination) or
+  `<test>/<combination>`.
+- **`qa_known_failures.txt`** — the same for the QA-harness stage:
+  `<harness> <case>  ticket N: ...` (`<case>` may be `*`), e.g.
+  `pull_replica_test gtid` (ticket 20) and
+  `query_race_test list_next_to_pull` (ticket 29).
+- **`ci_property_tests.sh`** — what the CI job *GCC 14 Debug Property Tests*
+  (`.github/workflows/cmake.yml`, configured with `-DWITH_PROPERTY_TESTS=ON`)
+  runs: every property test through `ctest` at Hegel's default settings,
+  skipping the cases `known_failures.txt` lists through a Boost.Test run
+  filter (`BOOST_TEST_RUN_FILTERS=!CaseA:!CaseB:...`) and leaving out any
+  program whose every case is listed, so a known bug keeps CI green while any
+  other failure turns it red. Run it locally with
+  `extra/qa/nightly/ci_property_tests.sh <build dir>`.
 - **`build_report_data.py`** — turns the run directories into the JSON behind
-  the nightly report page.
+  the nightly report page: the results of every stage (grouped by build
+  label: `debug_gcc14`, ..., `mtr-8.4`, `qa-8.4`), a description of every
+  build label, and the entries of all three known-failure lists (each with
+  its `kind` and `scope`).
 
 The setup script's `nightly` step installs these under `$WS/nightly` and adds a
 crontab entry (`NIGHTLY_CRON`, default `30 1 * * *`).

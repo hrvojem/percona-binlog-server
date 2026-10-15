@@ -11,8 +11,13 @@ release_gcc14, which also holds a fetch_crash_test case), a
 run's results hold the MTR stage as builds 'mtr-<series>' (program
 'binlog_streaming', one case per test or test/combination) and the QA-harness
 stage as builds 'qa-<series>' (program: the harness, one case per mode or
-harness case). Their statuses are the same, plus 'skipped' for MTR tests the
-suite skipped. Every known failure carries the 'kind' of list it comes from
+harness case; harnesses with many cases name them '<mode>/...', e.g.
+'position/PUT-binlog.index/error500/x6' of s3_fault_sweep, and
+fetch_crash_test on S3 storage records '<mode>/s3'). The heavier harnesses
+run in a weekly rotation, so a QA case is missing from most nights; each
+run's 'qa_rotation' lists the '<harness>/<mode>' entries that ran that night
+(empty for runs from before the rotation). Their statuses are the same, plus
+'skipped' for MTR tests the suite skipped. Every known failure carries the 'kind' of list it comes from
 (property, mtr, qa) and its 'scope' (the MySQL series or '*' for MTR, the
 harness for QA; for property cases the build of a '<build>:<test case>'
 line, else empty).
@@ -102,10 +107,13 @@ def run_details():
             meta = json.loads((run_dir / "run.json").read_text()) \
                 if (run_dir / "run.json").exists() else {}
             started = meta.get("started")
+            rotation = meta.get("qa_rotation", "")
         else:
             moment, results = reconstruct(run_dir)
             started = moment.strftime("%Y-%m-%d %H:%M:%S") if moment else None
+            rotation = ""
         runs.append({"day": run_dir.name, "started": started,
+                     "qa_rotation": rotation.split(),
                      "results": results})
     return runs
 
@@ -153,8 +161,14 @@ def builds(runs):
                 described[label] = (f"binlog_streaming MTR suite, debug build, "
                                     f"MySQL {label[4:]}")
             elif label.startswith("qa-"):
-                described[label] = (f"black-box QA harnesses (extra/qa), "
-                                    f"MySQL {label[3:]}")
+                described[label] = (
+                    f"black-box QA harnesses (extra/qa), MySQL {label[3:]}: "
+                    f"every night pull_replica_test, query_race_test and "
+                    f"fetch_crash_test (file and S3 storage); one heavier "
+                    f"harness by weekday (s3_fault_sweep, disk_fault_sweep, "
+                    f"network_fault_test, listener_fuzz_test, "
+                    f"source_change_test), so their cases appear about "
+                    f"once a week")
     return described
 
 

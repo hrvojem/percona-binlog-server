@@ -1,9 +1,37 @@
 # Black-box QA harness cases (extra/qa) that fail because of known, unfixed
 # bugs: <harness> <case>  <ticket>
 # <harness> is the script name without .py, <case> the case it reports (a
-# mode, or the harness's single case name), or * for all of its cases.
+# mode, or the harness's single case name), or * for all of its cases. The
+# case may be a shell-style pattern ('*' also matches '/'), and a name
+# without '/' also covers every '<name>/...' case. Multi-case harnesses name
+# their cases '<mode>/...' (see nightly_stages.py); the rotation harnesses
+# (s3_fault_sweep, disk_fault_sweep, network_fault_test, listener_fuzz_test,
+# source_change_test) run about once a week, so their known failures show up
+# on those nights only.
+# A sanitizer report is never covered by a pattern line (its reason names
+# the report) unless the ticket text mentions the sanitizer.
 # A failure listed here is reported as known; any other failure is NEW.
 # Remove a line once its bug is fixed.
 pull_replica_test gtid  ticket 20: COM_BINLOG_DUMP_GTID unsupported (GTID auto-position replica of pull)
 query_race_test list_next_to_pull  ticket 29: a query next to a writer fails stat()ing a .tmp file the writer renamed away
-fetch_crash_test gtid  ticket 14: GTID-mode resume after a rotation misses the closing ROTATE and empty binlogs (fetch, FLUSH BINARY LOGS, fetch: binlog.000001 lacks its ROTATE, binlog.000002 is skipped; debug and release alike, hit when Hypothesis generates that sequence)
+fetch_crash_test gtid  ticket 14: GTID-mode resume after a rotation misses the closing ROTATE and empty binlogs (fetch, FLUSH BINARY LOGS, fetch: binlog.000001 lacks its ROTATE, binlog.000002 is skipped; debug and release alike, file and S3 storage (case gtid/s3), hit when Hypothesis generates that sequence)
+# a failed save of a binlog's metadata (.json) makes the next fetch append
+# the data again: 'binlog.000002: the stored file (308063 bytes) differs
+# from the server's (154699 bytes)' (the S3 'binlog.0' match also hits the
+# binlog.00000N.json objects)
+disk_fault_sweep */[ofrw]*/binlog-metadata/*  ticket 18 (PBS-83): double write after a failed binlog metadata save
+# (S3: 6 consecutive failed PUTs outlast the SDK's retries; a stall or a
+# truncated response body does not fail the request)
+s3_fault_sweep */PUT-.json/error50?/x6  ticket 18 (PBS-83): double write after a failed binlog metadata save
+s3_fault_sweep */PUT-.json/reset_*/x6  ticket 18 (PBS-83): double write after a failed binlog metadata save
+s3_fault_sweep */PUT-binlog.0/error50?/x6  ticket 18 (PBS-83): double write after a failed binlog metadata save
+s3_fault_sweep */PUT-binlog.0/reset_*/x6  ticket 18 (PBS-83): double write after a failed binlog metadata save
+# (open, write, fsync or rename; truncate is never hit) an interrupted binlog index save while a new binlog is created leaves the
+# storage unopenable: 'storage contains an object that is not referenced in
+# the binlog index'
+disk_fault_sweep */[ofrw]*/binlog-index/*  ticket 15: unopenable storage after an interrupted binlog creation / index save
+s3_fault_sweep */PUT-binlog.index/error50?/x6  ticket 15: unopenable storage after an interrupted binlog creation / index save
+s3_fault_sweep */PUT-binlog.index/reset_before/x6  ticket 15: unopenable storage after an interrupted binlog creation / index save
+source_change_test */reset  ticket 25: RESET BINARY LOGS AND GTIDS on the source is not detected (the stored binlog.000001 no longer matches the source's)
+source_change_test */identity  ticket 25: a different source server (new server_uuid) on the same address is not detected
+source_change_test gtid/restart  ticket 6: pull aborts at storage.cpp:138 (incomplete_transaction_timestamps_ not empty in open_binlog) when it reconnects in GTID mode after the source restarted

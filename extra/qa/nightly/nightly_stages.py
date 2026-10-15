@@ -22,6 +22,12 @@ writes a log per failing case into --out.
        --config records the cases under another build label instead of
        'qa-<series>' (the release stage's fetch_crash_test run uses
        'release_gcc14').
+       Harnesses with several cases name them '<mode>/...', e.g.
+       s3_fault_sweep 'position/PUT-binlog.index/error500/x6' or
+       source_change_test 'gtid/reset'; fetch_crash_test with --storage s3
+       records '<mode>/s3'. A known-failure name may be a shell-style
+       pattern ('position/PUT-*/reset_after/*'), and as for MTR a name
+       without '/' also covers every '<name>/...' case.
 
 Statuses: passed, known (a listed failure), new (an unlisted failure),
 known-passed (a listed case that passed), skipped (MTR skipped the test), and
@@ -29,13 +35,18 @@ no-test-cases (the stage produced no results at all, counted as broken).
 """
 
 import argparse
+import fnmatch
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 MTR_LINE = re.compile(
@@ -69,7 +80,8 @@ def match_known(entries: list, scope: str, test_case: str) -> str:
     for entry_scope, name, ticket in entries:
         if entry_scope not in ("*", scope):
             continue
-        if name in ("*", test_case, base):
+        if name in ("*", test_case, base) or \
+                fnmatch.fnmatchcase(test_case, name):
             return ticket or "known"
     return ""
 
@@ -206,40 +218,104 @@ def run_mtr(args) -> int:
 # QA harnesses
 # ---------------------------------------------------------------------------
 
-def json_lines(text: str) -> list:
+# an ASan error in binlog_server must not look like its clean failure exit
+# code 1, which most harnesses accept (exit 0 or 1 within the time limit)
+ASAN_OPTIONS = "exitcode=134"
+
+
+def json_lines(lines: list) -> list:
+    """(object, arrival time) of every JSON line of the output, 'lines'
+    being (arrival time, text) pairs."""
     result = []
-    for line in text.splitlines():
+    for moment, line in lines:
         line = line.strip()
         if line.startswith("{"):
             try:
-                result.append(json.loads(line))
+                result.append((json.loads(line), moment))
             except ValueError:
                 pass
     return result
 
 
+def slug(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9.]+", "-", str(text)).strip("-")
+
+
+def summarize(failure: str, limit: int = 240) -> str:
+    """The first line of a harness failure text, plus the last error-like
+    line of the binlog_server log tail it carries (the one that ended the
+    run)."""
+    lines = [line.strip() for line in str(failure).splitlines()
+             if line.strip()]
+    if not lines:
+        return ""
+    head = lines[0]
+    detail = next((line for line in reversed(lines[1:])
+                   if re.search(r"\]\s*\[\s*(error|fatal)\]|Sanitizer|"
+                                r"exception|Traceback", line, re.I)), "")
+    detail = re.sub(r"^\[[0-9T:.-]+\]\s*", "", detail)
+    return (head + (" | " + detail if detail else ""))[:limit]
+
+
+def ending_error(output: str) -> str:
+    """The exception that ended a harness, else its last lines."""
+    texts = [line.strip() for line in output.splitlines() if line.strip()]
+    error = next((line for line in reversed(texts) if re.match(
+        r"[\w.]*(Error|Exception|Failure)\b", line)), "")
+    return error or " | ".join(texts[-3:])
+
+
 def harness_command(args, workdir: Path) -> list:
     qa = Path(args.qa_dir)
-    common = ["--mysql-basedir", str(args.dist), "--binsrv", str(args.binsrv),
-              "--workdir", str(workdir), "--port", str(args.port)]
+    script = [sys.executable, str(qa / f"{args.harness}.py")]
+    base = ["--mysql-basedir", str(args.dist), "--binsrv", str(args.binsrv),
+            "--workdir", str(workdir)]
+    common = base + ["--port", str(args.port)]
+    mode = ["--mode", args.mode] if args.mode else []
     if args.harness == "pull_replica_test":
-        return [sys.executable, str(qa / "pull_replica_test.py")] + common
+        return script + common
     if args.harness == "fetch_crash_test":
-        return [sys.executable, str(qa / "fetch_crash_test.py")] + common + [
+        command = script + common + [
             "--mode", args.mode, "--examples", str(args.examples),
             "--steps", str(args.steps)]
+        if args.storage == "s3":
+            command += ["--storage", "s3", "--s3-endpoint", args.s3_endpoint,
+                        "--s3-bucket-dir", str(args.s3_bucket_dir)]
+        return command
     if args.harness == "query_race_test":
-        return [sys.executable, str(qa / "query_race_test.py")] + common + [
-            "--runs", str(args.runs)]
+        return script + common + ["--runs", str(args.runs)]
+    if args.harness == "s3_fault_sweep":
+        proxy = f"127.0.0.1:{args.s3_proxy_port}"
+        return script + common + mode + [
+            "--s3-endpoint", proxy,
+            "--s3-fault-control", f"http://{proxy}/__faults__",
+            "--s3-bucket-dir", str(args.s3_bucket_dir)]
+    if args.harness == "disk_fault_sweep":
+        return script + common + mode + [
+            "--fsfault-lib", str(args.fsfault_lib)]
+    if args.harness == "network_fault_test":
+        return script + base + mode + [
+            "--mysql-port", str(args.port), "--proxy-port",
+            str(args.port + 1), "--toxiproxy-api", args.toxiproxy_api]
+    if args.harness == "listener_fuzz_test":
+        return script + common + mode + [
+            "--connections", str(args.connections), "--seed", str(args.seed)]
+    if args.harness == "source_change_test":
+        return script + common + mode
     raise SystemExit(f"unknown harness {args.harness}")
 
 
-def harness_cases(args, returncode: int, output: str) -> list:
-    """(test case, failed, reason) of every case the run reports."""
-    lines = json_lines(output)
+def harness_cases(args, returncode: int, output: str, lines: list,
+                  started: float) -> list:
+    """(test case, failed, reason, seconds or None, detail or None, window or
+    None) of every case the run reports: detail is the case's own part of
+    the output (None: the whole output is its log), window the (start, end)
+    wall-clock times of a case that has its own JSON line."""
+    objects = json_lines(lines)
+    mode = args.mode or "position"
     if args.harness == "pull_replica_test":
         cases = []
-        for result in lines:
+        for result, _ in objects:
             if "mode" not in result:
                 continue
             reason = ""
@@ -248,19 +324,22 @@ def harness_cases(args, returncode: int, output: str) -> list:
                 reason = ("replica did not catch up: " +
                           " ".join(str(part) for part in io_thread))[:200]
             cases.append((result["mode"], not result.get("replicated"),
-                          reason))
+                          reason, None, None, None))
         return cases
     if args.harness == "fetch_crash_test":
         failed = returncode != 0
         reason = ""
         if failed:
+            sanitizer = re.search(r"ERROR: (Address|Leak)Sanitizer: .{0,120}",
+                                  output)
             errors = [line for line in output.splitlines()
                       if re.search(r"(Failure|Error|Exception)\b", line)]
-            reason = (errors[-1].strip() if errors else
-                      f"exit code {returncode}")[:200]
-        return [(args.mode, failed, reason)]
+            reason = (sanitizer[0] if sanitizer else errors[-1].strip()
+                      if errors else f"exit code {returncode}")[:200]
+        case = args.mode + ("/s3" if args.storage == "s3" else "")
+        return [(case, failed, reason, None, None, None)]
     if args.harness == "query_race_test":
-        for result in lines:
+        for result, _ in objects:
             if result.get("test") == "query_race":
                 reason = ""
                 if not result.get("passed"):
@@ -271,9 +350,192 @@ def harness_cases(args, returncode: int, output: str) -> list:
                     if not result.get("pull_alive", True):
                         reason = "pull exited; " + reason
                 return [("list_next_to_pull", not result.get("passed"),
-                         reason)]
+                         reason, None, None, None)]
         return []
-    return []
+
+    # the harnesses with one JSON line per case
+    cases = []
+    for result, moment in objects:
+        detail = json.dumps(result, indent=1)
+        if args.harness == "s3_fault_sweep" and "fault" in result:
+            fault = result["fault"]
+            name = (f"{mode}/{fault['method']}-{slug(fault['match'])}/"
+                    f"{fault['action']}/x{fault['count']}")
+            cases.append((name, "failure" in result,
+                          summarize(result.get("failure", "")), moment,
+                          detail))
+        elif args.harness == "disk_fault_sweep" and "fault" in result:
+            fault = result["fault"]
+            name = (f"{mode}/{fault['op']}/{slug(fault['target'])}/"
+                    f"{fault['errno']}/x{fault['count']}")
+            cases.append((name, "failure" in result,
+                          summarize(result.get("failure", "")), moment,
+                          detail))
+        elif args.harness == "network_fault_test" and "part" in result:
+            name = f"{mode}/{result['part']}/"
+            if result["part"] == "pull":
+                name += f"r{result.get('round', 0)}-"
+            name += slug(result.get("fault", ""))
+            cases.append((name, "failure" in result,
+                          summarize(result.get("failure", "")), moment,
+                          detail))
+        elif args.harness == "listener_fuzz_test" and "crashed" in result:
+            failed = result["crashed"] or not result.get("still_serves")
+            reason = ""
+            if result["crashed"]:
+                stderr = result.get("stderr_tail", "")
+                sanitizer = re.search(r"ERROR: \w+Sanitizer: .{0,100}",
+                                      stderr)
+                reason = (f"pull exited with {result.get('exit')} at "
+                          f"connection {result.get('crashed_at')} "
+                          f"({result.get('last_scenario')})" +
+                          (f": {sanitizer[0]}" if sanitizer else ""))
+            elif failed:
+                reason = "pull no longer streams binlogs after the fuzzing"
+            cases.append((mode, failed, reason[:240], moment, detail))
+        elif args.harness == "source_change_test" and "scenario" in result:
+            reason = ""
+            if not result.get("ok"):
+                parts = [result.get("exception", "")]
+                for key in ("fetch_after_reset", "fetch_after_identity_change",
+                            "fetch_after_purge"):
+                    if key in result:
+                        parts.append(f"{key}: exit "
+                                     f"{result[key].get('exit')}")
+                for key in ("mismatch", "copy_error"):
+                    if key in result:
+                        parts.append(summarize(result[key], 160))
+                if result.get("running_after_restart") is False:
+                    parts.append("pull exited")
+                reason = "; ".join(part for part in parts if part)
+            cases.append((f"{mode}/{result['scenario']}",
+                          not result.get("ok"), reason[:240], moment,
+                          detail))
+    # each case took the time since the previous one's line
+    timed = []
+    previous = started
+    for name, failed, reason, moment, detail in cases:
+        timed.append((name, failed, reason, moment - previous, detail,
+                      (previous, moment)))
+        previous = moment
+    cases = timed
+    # a run that stopped early, or failed without a failing case
+    if returncode == 124:
+        cases.append((f"{mode}/timeout", True,
+                      f"timed out after {args.timeout} s with {len(cases)} "
+                      f"cases done", 0, None, None))
+    elif cases and returncode != 0 and not any(case[1] for case in cases):
+        cases.append((f"{mode}/run", True,
+                      f"exit {returncode}: {ending_error(output)}"[:240], 0,
+                      None, None))
+    return cases
+
+
+def run_harness(command: list, timeout: int, environment: dict) -> tuple:
+    """Runs a harness in its own process group; returns (exit code, 124 on a
+    timeout; output; (arrival time, line) pairs). Whatever it started (MySQL
+    servers, binlog_server) goes with it on a timeout."""
+    process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True,
+                               errors="replace", env=environment,
+                               start_new_session=True)
+    lines = []
+
+    def read():
+        for line in process.stdout:
+            lines.append((time.time(), line))
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        returncode = 124
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=30)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            pass
+    # anything of the group still running (killpg also works once the
+    # leader is gone)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    process.wait()
+    reader.join(timeout=10)
+    output = "".join(line for _, line in lines)
+    if returncode == 124:
+        output += f"\ntimed out after {timeout} s\n"
+    return returncode, output, lines
+
+
+def start_s3_proxy(args, environment: dict, log_path: Path):
+    """Starts s3_fault_proxy.py for s3_fault_sweep; returns the process, or
+    raises RuntimeError when it does not come up."""
+    log = log_path.open("w")
+    proxy = subprocess.Popen(
+        [sys.executable, str(Path(args.qa_dir) / "s3_fault_proxy.py"),
+         "--listen", f"127.0.0.1:{args.s3_proxy_port}",
+         "--backend", args.s3_endpoint],
+        stdout=log, stderr=subprocess.STDOUT, env=environment,
+        start_new_session=True)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{args.s3_proxy_port}/__faults__",
+                    timeout=2) as response:
+                response.read()
+            return proxy
+        except OSError:
+            if proxy.poll() is not None:
+                break
+            time.sleep(0.3)
+    proxy.kill()
+    proxy.wait()
+    raise RuntimeError(f"s3_fault_proxy.py did not come up on port "
+                       f"{args.s3_proxy_port} (see {log_path})")
+
+
+def precondition_failure(args) -> str:
+    """Why the harness cannot run at all, or ''."""
+    def reachable(url: str) -> bool:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                response.read()
+            return True
+        except urllib.error.HTTPError:
+            return True
+        except OSError:
+            return False
+    uses_s3 = args.harness == "s3_fault_sweep" or args.storage == "s3"
+    if uses_s3 and not reachable(f"http://{args.s3_endpoint}/"):
+        return f"the S3 server at {args.s3_endpoint} is not reachable"
+    if uses_s3 and not (args.s3_bucket_dir and
+                        Path(args.s3_bucket_dir).is_dir()):
+        return f"the bucket directory {args.s3_bucket_dir} does not exist"
+    if args.harness == "network_fault_test" and \
+            not reachable(f"{args.toxiproxy_api}/version"):
+        return f"Toxiproxy is not reachable at {args.toxiproxy_api}"
+    if args.harness == "disk_fault_sweep" and not (
+            args.fsfault_lib and Path(args.fsfault_lib).is_file()):
+        return f"the fsfault library {args.fsfault_lib} does not exist"
+    return ""
+
+
+def sanitizer_reports(directory: Path) -> list:
+    """(modification time, summary line, text) of every sanitizer report
+    written under 'directory' (ASAN_OPTIONS log_path)."""
+    reports = []
+    for path in sorted(directory.glob("asan.*")):
+        text = path.read_text(errors="replace")
+        found = re.search(r"SUMMARY: (\w+Sanitizer: .*)", text) or \
+            re.search(r"ERROR: (\w+Sanitizer: .*)", text)
+        summary = found[1] if found else text.strip().split("\n")[0]
+        reports.append((path.stat().st_mtime, summary[:160],
+                        f"===== {path.name} =====\n{text}"))
+    return reports
 
 
 def run_qa(args) -> int:
@@ -283,29 +545,98 @@ def run_qa(args) -> int:
     workdir = Path(args.workdir)
     shutil.rmtree(workdir, ignore_errors=True)
     workdir.mkdir(parents=True)
+    problem = precondition_failure(args)
+    if problem:
+        recorder.record("", True, "", problem, 0, status="no-test-cases")
+        return 0
+    environment = dict(os.environ)
+    # sanitizer reports go to files (a harness keeps only the end of
+    # binlog_server's stderr, which cuts a report's head off), one per
+    # process, and are attached to the case that was running
+    reports_dir = workdir / "sanitizer"
+    reports_dir.mkdir()
+    environment.setdefault(
+        "ASAN_OPTIONS", f"{ASAN_OPTIONS}:log_path={reports_dir}/asan")
+    environment.setdefault("AWS_EC2_METADATA_DISABLED", "true")
     command = harness_command(args, workdir)
-    started = time.monotonic()
+    # the S3 objects the harness creates (fetch_crash_test uses a prefix per
+    # process): removed afterwards, or moved into the workdir of a failure
+    bucket = Path(args.s3_bucket_dir) if args.s3_bucket_dir else None
+    before = set(os.listdir(bucket)) if bucket and bucket.is_dir() else None
+    proxy = None
+    if args.harness == "s3_fault_sweep":
+        try:
+            proxy = start_s3_proxy(args, environment,
+                                   workdir / "s3_fault_proxy.log")
+        except RuntimeError as error:
+            recorder.record("", True, "", str(error), 0,
+                            status="no-test-cases")
+            return 0
+    started = time.time()
     try:
-        run = subprocess.run(command, capture_output=True, text=True,
-                             timeout=args.timeout)
-        returncode, output = run.returncode, run.stdout + run.stderr
-    except subprocess.TimeoutExpired as expired:
-        returncode = 124
-        output = ((expired.stdout or b"").decode(errors="replace") +
-                  (expired.stderr or b"").decode(errors="replace") +
-                  f"\ntimed out after {args.timeout} s\n")
-    seconds = time.monotonic() - started
-    log_text = " ".join(command) + "\n\n" + output
-    cases = harness_cases(args, returncode, output)
+        returncode, output, lines = run_harness(command, args.timeout,
+                                                environment)
+    finally:
+        if proxy is not None:
+            proxy.terminate()
+            try:
+                proxy.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proxy.kill()
+                proxy.wait()
+    seconds = time.time() - started
+    reports = sanitizer_reports(reports_dir)
+    log_text = " ".join(command) + "\n\n" + output + "".join(
+        "\n" + text for _, _, text in reports)
+    cases = harness_cases(args, returncode, output, lines, started)
     if not cases:
         cases = [(args.mode or "run", True,
                   f"timed out after {args.timeout} s" if returncode == 124
-                  else f"harness reported nothing (exit {returncode})")]
-    for test_case, failed, reason in cases:
+                  else f"harness reported nothing (exit {returncode}): "
+                  f"{ending_error(output)}"[:240],
+                  None, None, None)]
+    any_failed = any(case[1] for case in cases) or bool(reports)
+    # cases without their own time share what the others did not use
+    timed = sum(case[3] for case in cases if case[3] is not None)
+    untimed = [case for case in cases if case[3] is None]
+    share = max(seconds - timed, 0) / len(untimed) if untimed else 0
+    full_log = None
+    if any_failed and any(case[4] is not None for case in cases):
+        # one log of the whole run; each failing case's log holds its own
+        # JSON line and points at it
+        full_log = (f"{recorder.config}-{args.harness}-"
+                    f"{args.mode or 'run'}-full.log")
+        (Path(args.out) / full_log).write_text(log_text)
+    for test_case, failed, reason, case_seconds, detail, window in cases:
+        # the sanitizer reports written while the case ran (before its JSON
+        # line; a case without its own window gets them all); a report
+        # fails the case even if the harness let the exit code pass
+        mine = [report for report in reports if window is None or
+                window[0] < report[0] <= window[1]]
+        if mine:
+            failed = True
+            summaries = sorted({summary for _, summary, _ in mine})
+            reason = (f"{reason} | " if reason else "") + "; ".join(summaries)
         ticket = match_known(known, args.harness, test_case)
-        recorder.record(test_case, failed, ticket, reason,
-                        seconds / len(cases), log_text)
-    if not any(failed for _, failed, _ in cases):
+        # a sanitizer report is its own bug: a name pattern does not cover
+        # it unless the ticket says so
+        if mine and "Sanitizer" not in ticket:
+            ticket = ""
+        text = log_text
+        if detail is not None:
+            text = (" ".join(command) + "\n\n" + detail + "".join(
+                "\n\n" + report for _, _, report in mine) +
+                f"\n\nthe whole run's output: {full_log}\n")
+        recorder.record(test_case, failed, ticket, reason[:300],
+                        share if case_seconds is None else case_seconds,
+                        text)
+    if bucket is not None and before is not None and bucket.is_dir():
+        for name in set(os.listdir(bucket)) - before:
+            if any_failed:
+                shutil.move(str(bucket / name), str(workdir / f"s3-{name}"))
+            else:
+                shutil.rmtree(bucket / name, ignore_errors=True)
+    if not any_failed:
         shutil.rmtree(workdir, ignore_errors=True)
     else:
         # keep the logs and the storage of a failing run, not the MySQL data
@@ -349,6 +680,22 @@ def main():
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--runs", type=int, default=500)
     parser.add_argument("--timeout", type=int, default=1800, help="seconds")
+    parser.add_argument("--storage", choices=["file", "s3"], default="file",
+                        help="fetch_crash_test's storage")
+    parser.add_argument("--s3-endpoint", default="127.0.0.1:9000",
+                        help="the S3 server (fetch_crash_test --storage s3, "
+                             "and s3_fault_sweep's proxy backend)")
+    parser.add_argument("--s3-bucket-dir", type=Path,
+                        help="the directory of the S3 server's bucket")
+    parser.add_argument("--s3-proxy-port", type=int, default=24590,
+                        help="where s3_fault_sweep's fault proxy listens")
+    parser.add_argument("--fsfault-lib", type=Path,
+                        help="disk_fault_sweep's LD_PRELOAD library")
+    parser.add_argument("--toxiproxy-api", default="http://127.0.0.1:8474")
+    parser.add_argument("--connections", type=int, default=3000,
+                        help="listener_fuzz_test connections")
+    parser.add_argument("--seed", type=int, default=1,
+                        help="listener_fuzz_test seed")
     args = parser.parse_args()
     if args.stage == "mtr":
         if not args.vardir:

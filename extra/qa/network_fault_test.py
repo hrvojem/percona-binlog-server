@@ -189,7 +189,7 @@ def run_fetch_part(proxy: Toxiproxy, results: list):
             machine.storage_holds_prefixes()
             result["recovered"] = True
         except Exception as failure:  # every case is reported
-            result["failure"] = f"{type(failure).__name__}: {failure}"[:700]
+            result["failure"] = harness.describe_failure(failure)
         print(json.dumps(result), flush=True)
         results.append(result)
 
@@ -256,8 +256,7 @@ def run_pull_part(proxy: Toxiproxy, results: list, rounds: int):
                             f"{baseline} at the start")
                 except Exception as failure:  # every case is reported
                     proxy.clear()
-                    result["failure"] = \
-                        f"{type(failure).__name__}: {failure}"[:700]
+                    result["failure"] = harness.describe_failure(failure)
                 print(json.dumps(result), flush=True)
                 results.append(result)
                 if process.poll() is not None:

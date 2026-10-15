@@ -218,8 +218,9 @@ bucket). The `--s3-*` options default to that server and bucket.
   whole-binlog re-upload at every checkpoint).
 
 The `fetch_crash_test.py` state machine also runs against S3 with
-`--storage s3`, and the crash test plus `s3_fault_sweep.py` are two of the
-nightly/coverage layers.
+`--storage s3`. The nightly runs it on S3 storage every night (5 examples
+per mode) and `s3_fault_sweep.py` on Mondays (position) and Fridays (gtid);
+see [the nightly run](#the-nightly-run).
 
 ## The `pull` replication source
 
@@ -266,11 +267,43 @@ server rather than starting one.
      `query_race_test.py` (case `list_next_to_pull`, 500 `list` runs,
      `QA_RUNS`), both with the debug build, and a short
      `fetch_crash_test.py` run per mode (cases `gtid` and `position`,
-     10 examples of 8 steps, `QA_EXAMPLES` / `QA_STEPS`) with the ASan build.
-     They are cases of the build `qa-<series>` (program: the harness),
+     10 examples of 8 steps, `QA_EXAMPLES` / `QA_STEPS`) with the ASan build,
+     and the same on **S3 storage** against the local S3 server (cases
+     `gtid/s3` and `position/s3`, 5 examples each, `QA_S3_EXAMPLES`), which
+     reaches the S3 backend's crash recovery. Then **one heavier harness by
+     day of the week** (`QA_ROTATION`, weekday from `date -u +%u`), so each
+     runs at least weekly:
+
+     | Day | Harness (mode) | Build |
+     | --- | --- | --- |
+     | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts | ASan |
+     | Tue | `disk_fault_sweep.py` (position) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first) |
+     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) | ASan |
+     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid) | ASan |
+     | Fri | `s3_fault_sweep.py` (gtid) | ASan |
+     | Sat | `disk_fault_sweep.py` (gtid) | debug |
+     | Sun | `network_fault_test.py` (gtid) | ASan |
+
+     `QA_ROTATION_DAY` overrides the day (`1`-`7`, a comma list such as
+     `2,4`, `all` or `none`), e.g. to try Tuesday's set now:
+     `QA_ROTATION_DAY=2 STAGES=qa OUT_DIR=~/ws/qa/nightly-try ~/ws/nightly/run_nightly.sh`.
+     `run.json` records the night's set as `qa_rotation`.
+     Harnesses with one JSON line per case get one nightly case each, named
+     `<mode>/...`: `position/PUT-binlog.index/error500/x6` (S3 sweep: method,
+     object, fault, consecutive requests), `position/rename/binlog-index/EIO/x1`
+     (disk sweep), `position/fetch/reset-after-50-ms` and
+     `position/pull/r1-stall` (network), `position` (listener fuzzer),
+     `gtid/reset` (source change); a run that stops early adds
+     `<mode>/timeout`. ASan runs get `ASAN_OPTIONS=exitcode=134`, so a
+     memory error is not mistaken for the clean failure exit code 1 the
+     harnesses accept.
+     All of these are cases of the build `qa-<series>` (program: the harness),
      compared against `qa_known_failures.txt`. A failing harness keeps its
      workdir under `qa/` in the run directory, minus the MySQL data
-     directories.
+     directories (and the S3 objects it created, moved out of the bucket);
+     a multi-case harness writes its whole output once
+     (`qa-<series>-<harness>-<mode>-full.log`) and one short log per failing
+     case.
   4. **Release** (`release`): the `release_gcc14` preset (RelWithDebInfo:
      `-O2 -g -DNDEBUG`, against release builds of Boost and the AWS SDK,
      `$WS/{boost,aws-sdk-cpp}-install-release_gcc14`) in its own tree
@@ -318,7 +351,7 @@ server rather than starting one.
   build harnesses are skipped when the debug build fails, `fetch_crash_test`
   when the ASan build fails, the release `fetch_crash_test` when the release
   build fails. Tonight's whole run takes about 40-50 min for the
-  C++ stage plus 35-50 min of MTR (9-26 min per version) and about 12 min of QA harnesses.
+  C++ stage plus 35-50 min of MTR (9-26 min per version) and 20-35 min of QA harnesses: about 11 min for `pull_replica_test`, `query_race_test` and `fetch_crash_test` on file storage, about 7 min for `fetch_crash_test` on S3 (mostly Hypothesis shrinking the known ticket 14 failure in `gtid/s3`), plus the night's rotation (measured on MySQL 8.4.8: `s3_fault_sweep` 15 min per mode, 84 cases; `disk_fault_sweep` 3-6 min, 80 cases; `network_fault_test` 4-5 min, 37 cases; `source_change_test` 3-4 min per mode, 4 cases; `listener_fuzz_test` about 11 min per mode at 600 connections: about 1 s per connection since the listener always does full `caching_sha2_password` authentication (PBS-10), 2-3 min for 3000 before).
 
   To try a stage without touching the nightly's own results, select stages
   with `STAGES` (default `cpp mtr qa release`; without `cpp` the debug,
@@ -347,7 +380,9 @@ server rather than starting one.
   `*` (every version) and `<test>` is a test name (every combination) or
   `<test>/<combination>`.
 - **`qa_known_failures.txt`** — the same for the QA-harness stage:
-  `<harness> <case>  ticket N: ...` (`<case>` may be `*`), e.g.
+  `<harness> <case>  ticket N: ...` (`<case>` may be `*` or a shell-style
+  pattern such as `position/PUT-*/reset_after/*`; a name without `/` also
+  covers every `<name>/...` case), e.g.
   `pull_replica_test gtid` (ticket 20),
   `query_race_test list_next_to_pull` (ticket 29) and
   `fetch_crash_test gtid` (ticket 14, when the run generates a fetch /

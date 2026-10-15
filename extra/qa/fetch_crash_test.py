@@ -442,6 +442,17 @@ disk_fault_rules = st.fixed_dictionaries({
 })
 
 
+def describe_failure(error: Exception, limit: int = 1500) -> str:
+    """A failure for a JSON result line: its first line and the end of the
+    rest (where a binlog_server log tail has its error), within 'limit'."""
+    text = f"{type(error).__name__}: {error}"
+    if len(text) <= limit:
+        return text
+    head, _, rest = text.partition("\n")
+    head = head[:limit // 3]
+    return head + "\n...\n" + rest[-(limit - len(head) - 5):]
+
+
 def fsfault_rule(fault: dict) -> str:
     match, exclude = DISK_TARGETS[fault["target"]]
     rule = (f"op={fault['op']},match={match},nth={fault['nth']},"

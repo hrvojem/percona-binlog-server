@@ -211,10 +211,14 @@ def scenario_restart(args) -> dict:
         machine.run_workload(BIG_WORKLOAD)
         binsrv.checkpoint_size = "4K"
         binsrv.write_config()
-        process = subprocess.Popen(
-            [str(binsrv.binary), "pull", str(binsrv.config_path)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=dict(os.environ, AWS_EC2_METADATA_DISABLED="true"))
+        # pull's stderr is kept: an abort (assertion, sanitizer) leaves
+        # nothing in its log file
+        stderr_path = args.workdir / "restart-pull.stderr"
+        with stderr_path.open("wb") as stderr_file:
+            process = subprocess.Popen(
+                [str(binsrv.binary), "pull", str(binsrv.config_path)],
+                stdout=subprocess.DEVNULL, stderr=stderr_file,
+                env=dict(os.environ, AWS_EC2_METADATA_DISABLED="true"))
         try:
             time.sleep(3)
             result["running_before_restart"] = process.poll() is None
@@ -234,6 +238,10 @@ def scenario_restart(args) -> dict:
                 except (harness.Failure, FileNotFoundError):
                     time.sleep(2)
             result["running_after_restart"] = process.poll() is None
+            if not result["running_after_restart"]:
+                result["pull_exit"] = process.returncode
+                result["pull_stderr"] = stderr_path.read_text(
+                    errors="replace")[-1500:]
             result["reaches_exact_copy"] = caught_up
             if not caught_up:
                 try:

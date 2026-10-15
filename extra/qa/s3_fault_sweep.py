@@ -108,7 +108,7 @@ def main():
                 machine.storage_holds_prefixes()
                 result["recovered"] = True
             except Exception as error:  # every case is reported
-                result["failure"] = f"{type(error).__name__}: {error}"[:600]
+                result["failure"] = harness.describe_failure(error)
             finally:
                 faults.set_rules([])
             print(json.dumps(result), flush=True)

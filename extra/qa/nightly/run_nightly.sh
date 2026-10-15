@@ -11,11 +11,18 @@
 # it. Failures are compared with known_failures.txt.
 #
 # After the C++ stages, the whole binlog_streaming MTR suite runs with the
-# debug build on MySQL 8.0, 8.4 and 9.7 (MTR_DISTS), and a few black-box QA
-# harnesses from extra/qa run against MySQL 8.4 (pull_replica_test.py, a
-# short fetch_crash_test.py run per mode, query_race_test.py); their failures
-# are compared with mtr_known_failures.txt and qa_known_failures.txt (see
-# nightly_stages.py, which runs those stages).
+# debug build on MySQL 8.0, 8.4 and 9.7 (MTR_DISTS), and black-box QA
+# harnesses from extra/qa run against MySQL 8.4: every night
+# pull_replica_test.py, query_race_test.py and a short fetch_crash_test.py
+# run per mode on file and on S3 storage; and one of the heavier harnesses
+# by day of the week (QA_ROTATION: the S3 and disk fault sweeps, the network
+# fault test, the listener fuzzer and the source change test). Their
+# failures are compared with mtr_known_failures.txt and qa_known_failures.txt
+# (see nightly_stages.py, which runs those stages). QA_ROTATION_DAY (1-7 for
+# Monday-Sunday, a comma list, 'all' or 'none'; default today's weekday)
+# picks the rotation's set, e.g. to try Tuesday's set now:
+#   QA_ROTATION_DAY=2 STAGES=qa OUT_DIR=~/ws/qa/nightly-try \
+#     ~/ws/nightly/run_nightly.sh
 #
 # The release stage builds release_gcc14 (the project's RelWithDebInfo preset:
 # -O2, NDEBUG, against release builds of Boost and the AWS SDK) in its own
@@ -84,6 +91,16 @@ QA_PORT=${QA_PORT:-24470}
 QA_RUNS=${QA_RUNS:-500}
 QA_EXAMPLES=${QA_EXAMPLES:-10}
 QA_STEPS=${QA_STEPS:-8}
+# the S3 variant of fetch_crash_test, every night (the local S3 server)
+QA_S3_EXAMPLES=${QA_S3_EXAMPLES:-5}
+S3_BUCKET_DIR=${S3_BUCKET_DIR:-$WS/s3/data/pbs-mtr}
+# the rotation of the heavier QA harnesses: '<weekday>:<harness>/<mode>'
+# (weekday 1-7 is Monday-Sunday, date +%u); 4-15 min a night (README.md)
+QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 2:disk_fault_sweep/position 3:network_fault_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 5:s3_fault_sweep/gtid 6:disk_fault_sweep/gtid 7:network_fault_test/gtid"}
+QA_ROTATION_DAY=${QA_ROTATION_DAY:-$(date -u +%u)}
+# each fuzz connection takes about 1 s since the listener always does full
+# caching_sha2_password authentication (PBS-10), 3000 would take 50 min
+QA_FUZZ_CONNECTIONS=${QA_FUZZ_CONNECTIONS:-600}
 # release stage: one short fetch_crash_test run with the release binary
 RELEASE_QA_EXAMPLES=${RELEASE_QA_EXAMPLES:-5}
 export PYTHONPATH=${PYTHONPATH:-$WS/qa/pylib}
@@ -439,6 +456,7 @@ if want mtr; then
   fi
 fi
 
+rotation=()
 # black-box QA harnesses from extra/qa (one MySQL version); workdirs are kept
 # short because the mysqld socket path is limited to 107 characters
 qa_series=${QA_DIST%%:*}
@@ -475,7 +493,74 @@ if want qa; then
         --port $((QA_PORT + 10)) --mode "$mode" --examples "$QA_EXAMPLES" \
         --steps "$QA_STEPS" --timeout 1800
     done
+    # the same on S3 storage (cases <mode>/s3): reaches the S3 backend's
+    # crash recovery, which nothing else exercises end to end
+    for mode in gtid position; do
+      qa_run fetch_crash_test "fetch_crash_test ($mode, S3 storage)" \
+        --binsrv "$asan_binsrv" --workdir "$out/qa/fs-$mode" \
+        --port $((QA_PORT + 60)) --mode "$mode" --examples "$QA_S3_EXAMPLES" \
+        --steps "$QA_STEPS" --storage s3 --s3-bucket-dir "$S3_BUCKET_DIR" \
+        --timeout 1200
+    done
   fi
+  # tonight's share of the heavier harnesses
+  for entry in $QA_ROTATION; do
+    entry_day=${entry%%:*}
+    case ",$QA_ROTATION_DAY," in
+      *,all,*|*",$entry_day,"*) rotation+=("${entry#*:}") ;;
+    esac
+  done
+  log "QA rotation for day $QA_ROTATION_DAY: ${rotation[*]:-nothing}"
+  for entry in "${rotation[@]}"; do
+    harness=${entry%%/*}
+    mode=${entry#*/}
+    # the build each one uses: ASan to catch memory errors, but the debug
+    # build under the fsfault LD_PRELOAD shim (ASan must come first in the
+    # library list)
+    build=asan_gcc14
+    binsrv=$asan_binsrv
+    if [ "$harness" = disk_fault_sweep ]; then
+      build=debug_gcc14
+      binsrv=$debug_binsrv
+    fi
+    if [ -n "${build_failed[$build]:-}" ]; then
+      log "$harness ($mode) skipped: the $build build failed"
+      continue
+    fi
+    stage_started=$(date +%s)
+    common=(--binsrv "$binsrv" --mode "$mode")
+    case $harness in
+      s3_fault_sweep)
+        qa_run s3_fault_sweep "s3_fault_sweep ($mode)" "${common[@]}" \
+          --workdir "$out/qa/s3s-$mode" --port $((QA_PORT + 70)) \
+          --s3-proxy-port $((QA_PORT + 75)) --s3-bucket-dir "$S3_BUCKET_DIR" \
+          --timeout 3000 ;;
+      disk_fault_sweep)
+        qa_run disk_fault_sweep "disk_fault_sweep ($mode)" "${common[@]}" \
+          --workdir "$out/qa/ds-$mode" --port $((QA_PORT + 80)) \
+          --fsfault-lib "$WS/qa/fsfault/libfsfault.so" --timeout 3000 ;;
+      network_fault_test)
+        # Toxiproxy outlives the nightly: it must not hold the run lock
+        [ -x "$WS/qa/start_toxiproxy.sh" ] &&
+          "$WS/qa/start_toxiproxy.sh" 9>&- >> "$out/nightly.log" 2>&1
+        qa_run network_fault_test "network_fault_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/net-$mode" \
+          --port $((QA_PORT + 90)) --timeout 3000 ;;
+      listener_fuzz_test)
+        # a new seed every day of the year; the command in a failure's log
+        # replays it
+        qa_run listener_fuzz_test "listener_fuzz_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/lf-$mode" \
+          --port $((QA_PORT + 100)) --connections "$QA_FUZZ_CONNECTIONS" \
+          --seed "$((10#$(date -u +%j)))" --timeout 1500 ;;
+      source_change_test)
+        qa_run source_change_test "source_change_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/sc-$mode" \
+          --port $((QA_PORT + 110)) --timeout 1500 ;;
+      *) log "unknown QA_ROTATION harness $harness" ;;
+    esac
+    log "$harness ($mode) done in $(( ($(date +%s) - stage_started) / 60 )) min"
+  done
 fi
 # the release stage's crash/resume run: release-only misbehaviour of the
 # resume path (wrong state where debug would assert) under the same oracle
@@ -504,8 +589,8 @@ duration=$(( ($(date +%s) - started) / 60 ))
   echo "Replay an MTR failure: cd $WS/dist/<distribution>/mysql-test && BINSRV=$debug_binsrv ./mtr --build-thread=$MTR_BUILD_THREAD binlog_streaming.<test> (log: mtr-<series>-<test>.log)"
   echo "Replay a QA failure: see the command at the top of qa-<series>-<case>.log"
 } >> "$summary"
-python3 -c 'import json,sys; print(json.dumps(dict(zip(["day","started","revision","new","broken","known","known_passed","passed","skipped","minutes"], sys.argv[1:4]+[int(v) for v in sys.argv[4:]])), indent=1))' \
-  "$day" "$started_utc" "$revision" "$new" "$broken" "$known_failed" \
+python3 -c 'import json,sys; print(json.dumps(dict(zip(["day","started","revision","qa_rotation","new","broken","known","known_passed","passed","skipped","minutes"], sys.argv[1:5]+[int(v) for v in sys.argv[5:]])), indent=1))' \
+  "$day" "$started_utc" "$revision" "${rotation[*]:-}" "$new" "$broken" "$known_failed" \
   "$unexpected_pass" "$passed" "$skipped" "$duration" > "$out/run.json"
 if [ -n "${OUT_DIR:-}" ]; then
   log "done (OUT_DIR run, history not updated): $new new, $broken build failures, $known_failed known"

@@ -206,16 +206,27 @@ class Listener:
         self.send(frame(1, greeting_payload(
             BASE_CAPABILITIES, PULL_USER.encode(), response,
             b"caching_sha2_password")))
-        # fast-auth packet (0x01 0x03) then OK, or more; read until an OK/ERR
-        for _ in range(4):
+        # fast auth (0x01 0x03) then OK; or, as the listener does since
+        # PBS-10 (it has no auth cache), "perform full authentication"
+        # (0x01 0x04): request the public key (0x02), then send the password
+        # XOR the salt, RSA-OAEP encrypted with it; read until an OK/ERR
+        for _ in range(6):
             read = self.read_frame()
             if read is None:
                 return False
-            body = read[1]
+            sequence, body = read
             if body[:1] == b"\x00":   # OK
                 return True
             if body[:1] == b"\xff":   # ERR
                 return False
+            if body == b"\x01\x04":  # perform full authentication
+                self.send(frame(sequence + 1, b"\x02"))
+            elif body[:1] == b"\x01" and b"PUBLIC KEY" in body:
+                encrypted = rsa_oaep_encrypt(
+                    body[1:], xor_with_salt(PULL_PASSWORD, salt))
+                if encrypted is None:
+                    return False
+                self.send(frame(sequence + 1, encrypted))
         return False
 
     def close(self):
@@ -223,6 +234,30 @@ class Listener:
             self.sock.close()
         except OSError:
             pass
+
+
+def xor_with_salt(password: str, salt: bytes) -> bytes:
+    """The null-terminated password XOR the salt (repeated), the plaintext
+    caching_sha2_password encrypts for the full authentication."""
+    plain = password.encode() + b"\0"
+    return bytes(byte ^ salt[i % len(salt)] for i, byte in enumerate(plain))
+
+
+def rsa_oaep_encrypt(public_key_pem: bytes, data: bytes) -> "bytes | None":
+    """RSA-OAEP encryption with the server's public key, through the openssl
+    command line tool (no Python crypto library is needed)."""
+    import tempfile  # pylint: disable=import-outside-toplevel
+    with tempfile.NamedTemporaryFile(suffix=".pem") as key_file:
+        key_file.write(public_key_pem.rstrip(b"\0"))
+        key_file.flush()
+        try:
+            completed = subprocess.run(
+                ["openssl", "pkeyutl", "-encrypt", "-pubin", "-inkey",
+                 key_file.name, "-pkeyopt", "rsa_padding_mode:oaep"],
+                input=data, capture_output=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    return completed.stdout if completed.returncode == 0 else None
 
 
 def random_bytes(rng: random.Random, low: int, high: int) -> bytes:

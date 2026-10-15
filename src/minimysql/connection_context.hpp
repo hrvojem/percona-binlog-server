@@ -27,6 +27,8 @@
 
 #include "minimysql/network_io_operations_fwd.hpp"
 
+#include "opensslpp/evp_pkey_fwd.hpp"
+
 #include "util/byte_span_fwd.hpp"
 #include "util/dynamic_byte_buffer_fwd.hpp"
 
@@ -53,7 +55,14 @@ public:
   [[nodiscard]] const std::string &get_server_password() const noexcept {
     return server_password_;
   }
-  [[nodiscard]] bool check_client_authentication() const;
+  [[nodiscard]] bool check_client_fast_authentication() const;
+  // 'private_key' is used to decrypt the password the client sent in response
+  // to the "perform full authentication" packet
+  [[nodiscard]] bool check_client_full_authentication(
+      const opensslpp::evp_pkey &private_key) const;
+  // returns true if the client responded to the "perform full authentication"
+  // packet with a request for the server's RSA public key
+  [[nodiscard]] bool check_client_requested_public_key() const noexcept;
 
   [[nodiscard]] std::uint32_t get_connection_id() const noexcept {
     return connection_id_;
@@ -139,6 +148,12 @@ public:
 
   [[nodiscard]] network_buffer_type generate_encoded_fast_auth();
   [[nodiscard]] network_buffer_type generate_encoded_full_auth();
+  // 'public_key_pem' is the server's RSA public key in PEM format sent in
+  // response to the client's "request public key" packet
+  [[nodiscard]] network_buffer_type
+  generate_encoded_public_key(std::string_view public_key_pem);
+  void parse_client_full_auth_response(const network_buffer_type &payload);
+
   [[nodiscard]] network_buffer_type generate_encoded_ok();
   [[nodiscard]] network_buffer_type generate_encoded_eof();
   [[nodiscard]] network_buffer_type
@@ -205,6 +220,8 @@ private:
   static std::atomic_uint32_t next_connection_id_;
 
   std::string server_username_;
+  // TODO: rework authentication model to store double-hashed password here
+  //       instead of a plain-text one
   std::string server_password_;
 
   std::uint32_t connection_id_;
@@ -241,7 +258,9 @@ private:
   void validate_and_update_sequence_number(std::uint8_t sequence_number);
 
   [[nodiscard]] network_buffer_type
-  generate_encoded_generic_auth_internal(char packet_code);
+  generate_encoded_generic_auth_internal(std::string_view auth_method_data);
+  void
+  parse_client_auth_method_data_internal(const network_buffer_type &payload);
 
   void encode_resultset_number_of_columns_internal(
       network_buffer_container &result_buffers, std::size_t number_of_columns);

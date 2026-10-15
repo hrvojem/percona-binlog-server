@@ -227,7 +227,10 @@ changed=$(git -C "$SRC" status --short -- src tests CMakeLists.txt 2>/dev/null |
 # credentials. If the server cannot be reached, leave PBS_TEST_S3_* unset so
 # those variants skip rather than fail against a dead endpoint.
 if [ -x "$WS/s3/start_s3.sh" ]; then
-  "$WS/s3/start_s3.sh" > "$out/s3-start.log" 2>&1 || true
+  # fd 9 (the run lock) is closed for it: the S3 server it may start keeps
+  # running after the nightly, and would otherwise hold the lock and make
+  # every later run exit with "another nightly run is in progress"
+  "$WS/s3/start_s3.sh" 9>&- > "$out/s3-start.log" 2>&1 || true
 fi
 if curl -s -o /dev/null --max-time 5 http://127.0.0.1:9000/; then
   export PBS_TEST_S3_ENDPOINT=127.0.0.1:9000

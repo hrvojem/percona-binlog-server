@@ -238,6 +238,9 @@ DROP TABLE t1;
 --echo *** Sending SIGTERM signal to the Binlog Server Utility and waiting
 --echo *** for the process to terminate.
 --let $proc_pid = $binsrv_pid
+# the utility's final flush can take longer than the default 60 s on a loaded
+# host (the nightly runs MTR in parallel, and ASan builds are slow)
+--let $proc_termination_timeout = 180
 --source ../include/terminate_proc.inc
 
 # cleaning up

@@ -40,6 +40,10 @@
 // - a keyring file is accepted exactly when it has the supported version,
 //   unique key IDs, supported ciphers and keys of the right length, and then
 //   holds exactly the keys written to it;
+// - a keyring URI (the "keyring.uri" configuration value) is accepted
+//   exactly when it is an absolute "file://<path>" URI without host, port,
+//   userinfo, query or fragment naming a regular file that holds a valid
+//   keyring, and the keyring then holds exactly the keys of that file;
 // - a configuration file is accepted exactly when its sections pass the
 //   documented checks, and then holds exactly the values written to it;
 // - damaged keyring and configuration files (truncated, a byte changed, a
@@ -87,7 +91,9 @@
 
 #include "property_test_helpers.hpp"
 
+#include "binsrv/basic_keyring.hpp"
 #include "binsrv/filesystem_storage_backend.hpp"
+#include "binsrv/keyring_factory.hpp"
 #include "binsrv/keyring_record.hpp"
 #include "binsrv/keyring_record_collection.hpp"
 #include "binsrv/log_severity.hpp"
@@ -1523,6 +1529,82 @@ BOOST_AUTO_TEST_CASE(KeyringFileMatchesModel) {
       absent_rejected = true;
     }
     require(absent_rejected, "getting an absent key did not throw");
+    [[maybe_unused]] const auto description{keyring->get_description()};
+  });
+}
+
+BOOST_AUTO_TEST_CASE(KeyringUriMatchesModel) {
+  run_property([](hegel::TestCase &tc) {
+    const scratch_directory scratch;
+    // a directory whose name needs percent-encoding in a URI
+    const auto directory_name{tc.draw(
+        "directory", gs::from_regex("[A-Za-z0-9 %#?@:;=&+,!$'()._~-]{1,12}",
+                                    true)
+                         .filter([](const std::string &value) {
+                           return value != "." && value != "..";
+                         }))};
+    const auto directory{scratch.path() / directory_name};
+    std::filesystem::create_directories(directory);
+    const auto spec{tc.draw("keyring", keyring_specs())};
+    // at most one defect of the URI, so that every check is exercised on its
+    // own: a part a file URI must not have, another scheme, no scheme, or a
+    // path naming a missing file or a directory
+    const auto defect{tc.draw(
+        "uri_defect",
+        gs::sampled_from<std::string>(
+            {"none", "none", "none", "host", "port", "userinfo", "query",
+             "fragment", "scheme FILE", "scheme s3", "scheme http",
+             "no scheme", "missing file", "directory"}))};
+    const auto path{directory / "keyring.json"};
+    if (defect == "directory") {
+      std::filesystem::create_directories(path);
+    } else if (defect != "missing file") {
+      write_file(path, keyring_json(spec));
+    }
+
+    boost::urls::url uri;
+    if (defect.starts_with("scheme ")) {
+      uri.set_scheme(defect.substr(std::size(std::string_view{"scheme "})));
+    } else if (defect != "no scheme") {
+      uri.set_scheme("file");
+    }
+    uri.set_encoded_authority("");
+    if (defect == "host") {
+      uri.set_host("localhost");
+    }
+    if (defect == "port") {
+      uri.set_port_number(8080U);
+    }
+    if (defect == "userinfo") {
+      uri.set_userinfo("user:secret");
+    }
+    uri.set_path(path.generic_string());
+    if (defect == "query") {
+      uri.set_query("version=1");
+    }
+    if (defect == "fragment") {
+      uri.set_fragment("part");
+    }
+    const std::string uri_text{uri.c_str()};
+    const bool expected{defect == "none" && model_keyring(spec)};
+
+    binsrv::basic_keyring_ptr keyring;
+    const auto error{load_cleanly(
+        [&] { keyring = binsrv::keyring_factory::create(uri_text); })};
+    require((keyring != nullptr) == expected,
+            "'" + uri_text + "' (" + defect + ") was " +
+                (expected ? "rejected: " + error.value_or("") : "accepted"));
+    if (keyring == nullptr) {
+      return;
+    }
+    for (const auto &key : spec.keys) {
+      require(keyring->contains(key.id), "key '" + key.id + "' is missing");
+      require(keyring->get_key(key.id).get<"data_hex">().to_hex_string() ==
+                  to_hex(key.data, false),
+              "key '" + key.id + "' has other data");
+    }
+    require(!keyring->contains("no such key \x01"),
+            "an absent key was found");
     [[maybe_unused]] const auto description{keyring->get_description()};
   });
 }

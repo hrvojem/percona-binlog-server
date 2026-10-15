@@ -1,0 +1,119 @@
+#
+# An encrypted storage opened with a configuration that can no longer reach
+# the key encryption key (COVERAGE_GAPS row 6): the keyring no longer holds
+# the KEK that the binlog metadata names, the keyring section is gone, or
+# the encryption section names a KEK the keyring does not hold.
+#
+# 'fetch' (streaming mode) must stop with a non-zero exit code and a clear
+# error, and no attempt may change the storage. 'list' (querying-only mode)
+# fails the same way (status "error" naming the missing KEK / keyring) and
+# does not change the storage either.
+#
+--source ../include/have_binsrv.inc
+
+--source ../include/v80_v84_compatibility_defines.inc
+
+# the storage is compared byte for byte on the filesystem
+--source ../include/identify_storage_backend.inc
+if ($storage_backend != file)
+{
+  --skip This test compares the storage directory byte for byte (filesystem backend only)
+}
+
+# in case of --repeat=N, we need to start from a fresh binary log to make
+# this test deterministic
+--echo *** Resetting replication at the very beginning of the test.
+--disable_query_log
+eval $stmt_reset_binary_logs_and_gtids;
+--enable_query_log
+
+--let $binsrv_keyring_data_file_path = $MYSQL_TMP_DIR/keyring_data.json
+--source ../include/generate_keyring_data_file.inc
+
+--let $binsrv_connect_timeout = 20
+--let $binsrv_read_timeout = 60
+--let $binsrv_idle_time = 10
+--let $binsrv_verify_checksum = TRUE
+--let $binsrv_replication_mode = position
+--let $binsrv_encryption_cipher = AES-256-CTR
+--let $binsrv_encryption_kek_id = gamma32
+--source ../include/set_up_binsrv_environment.inc
+
+--echo
+--echo *** Creating a simple table and fetching it into an encrypted storage.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(DEFAULT);
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES(DEFAULT);
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null
+
+--echo
+--echo *** Taking a snapshot of the storage.
+--let $storage_snapshot_path = $MYSQL_TMP_DIR/storage_snapshot
+--exec cp -a $binsrv_storage_path $storage_snapshot_path
+--let $binsrv_output_path = $MYSQL_TMP_DIR/binsrv_output.txt
+
+--echo
+--echo *** 1. The keyring no longer holds the KEK (no encryption section).
+--let $write_var = {"version": 1, "keys": [{"id": "other32", "cipher": "AES-256-CTR", "data_hex": "404142434445464748494A4B4C4D4E4F404142434445464748494A4B4C4D4E4F"}]}
+--let $write_to_file = $binsrv_keyring_data_file_path
+--source include/write_var_to_file.inc
+--let $binsrv_encryption_cipher =
+--let $binsrv_encryption_kek_id =
+--source ../include/generate_binsrv_config.inc
+--remove_file $binsrv_log_path
+--error 1
+--exec $BINSRV fetch $binsrv_config_file_path > $binsrv_output_path 2>&1
+--exec grep --silent "keyring does not contain the specified KEK ID" $binsrv_log_path
+--exec diff -r $storage_snapshot_path $binsrv_storage_path
+--error 1
+--exec $BINSRV list $binsrv_config_file_path > $binsrv_output_path 2>&1
+--exec grep --silent '"status":"error","message":"found encryption record in the binlog metadata but keyring does not contain the specified KEK ID"' $binsrv_output_path
+--exec diff -r $storage_snapshot_path $binsrv_storage_path
+
+--echo
+--echo *** 2. The encryption section names a KEK the keyring does not hold.
+--let $binsrv_encryption_cipher = AES-256-CTR
+--let $binsrv_encryption_kek_id = gamma32
+--source ../include/generate_binsrv_config.inc
+--remove_file $binsrv_log_path
+--error 1
+--exec $BINSRV fetch $binsrv_config_file_path > $binsrv_output_path 2>&1
+--exec grep --silent "keyring does not contain the specified KEK ID" $binsrv_log_path
+--exec diff -r $storage_snapshot_path $binsrv_storage_path
+
+--echo
+--echo *** 3. No keyring section at all.
+--let $binsrv_encryption_cipher =
+--let $binsrv_encryption_kek_id =
+--let $saved_keyring_data_file_path = $binsrv_keyring_data_file_path
+--let $binsrv_keyring_data_file_path =
+--source ../include/generate_binsrv_config.inc
+--let $binsrv_keyring_data_file_path = $saved_keyring_data_file_path
+--remove_file $binsrv_log_path
+--error 1
+--exec $BINSRV fetch $binsrv_config_file_path > $binsrv_output_path 2>&1
+--exec grep --silent "keyring is not initialized" $binsrv_log_path
+--exec diff -r $storage_snapshot_path $binsrv_storage_path
+--error 1
+--exec $BINSRV list $binsrv_config_file_path > $binsrv_output_path 2>&1
+--exec grep --silent '"status":"error","message":"found encryption record in the binlog metadata but keyring is not initialized"' $binsrv_output_path
+--exec diff -r $storage_snapshot_path $binsrv_storage_path
+
+--echo
+--echo *** 4. With the original keyring back, fetch resumes.
+--let $binsrv_encryption_keyring_content =
+--source ../include/generate_keyring_data_file.inc
+--let $binsrv_encryption_cipher = AES-256-CTR
+--let $binsrv_encryption_kek_id = gamma32
+--source ../include/generate_binsrv_config.inc
+INSERT INTO t1 VALUES(DEFAULT);
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null
+--exec $BINSRV list $binsrv_config_file_path > $binsrv_output_path
+
+# cleaning up
+--remove_file $binsrv_output_path
+DROP TABLE t1;
+--force-rmdir $storage_snapshot_path
+--source ../include/tear_down_binsrv_environment.inc
+--source ../include/delete_keyring_data_file.inc

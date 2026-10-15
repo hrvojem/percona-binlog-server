@@ -1,0 +1,51 @@
+*** Resetting replication at the very beginning of the test.
+
+*** Generating keyring data file in JSON format.
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+
+*** Determining binlog file directory from the server.
+
+*** Creating a temporary directory <BINSRV_STORAGE_PATH> for storing
+*** binlog files downloaded via the Binlog Server utility.
+
+*** Creating a simple table and fetching it into an encrypted storage.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(DEFAULT);
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES(DEFAULT);
+
+*** Taking a snapshot of the storage.
+
+*** 1. The keyring no longer holds the KEK (no encryption section).
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+
+*** 2. The encryption section names a KEK the keyring does not hold.
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+
+*** 3. No keyring section at all.
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+
+*** 4. With the original keyring back, fetch resumes.
+
+*** Generating keyring data file in JSON format.
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+INSERT INTO t1 VALUES(DEFAULT);
+DROP TABLE t1;
+
+*** Removing the Binlog Server utility storage directory.
+
+*** Removing the Binlog Server utility log file.
+
+*** Removing the Binlog Server utility configuration file.
+
+*** Deleting keyring data file in JSON format.

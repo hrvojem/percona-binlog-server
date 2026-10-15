@@ -65,6 +65,11 @@
 //   a storage that opens again, holds every binlog but the last completely
 //   and the last one up to a transaction boundary, never holds data twice,
 //   and resumes right after the data on disk;
+// - a fault (a kill or a storage error) injected only while the stopped
+//   storage is purged (stop -> purge_binlogs -> restart, the supported
+//   retention procedure) leaves a storage that opens again and holds either
+//   the binlogs from before the purge or those after it, every one matching
+//   the model exactly, and resumes right after the data of the last one;
 // - with an encrypted storage, a writer killed right after appending data
 //   that its metadata does not cover yet, recovered by the next start (which
 //   truncates that tail) and then writing different events, never encrypts
@@ -1472,6 +1477,23 @@ public:
   });
 }
 
+// a fault for the purge-only property: the purge of a stopped storage and
+// the restart after it make only a handful of mutating backend calls (the
+// binlog index, two removals per purged binlog, reopening the last binlog)
+[[nodiscard]] gs::Generator<fault_plan> purge_fault_plans() {
+  return gs::compose([](const hegel::TestCase &tc) {
+    static constexpr std::size_t max_target_call{12U};
+    fault_plan result{};
+    result.target_call = tc.draw(gs::integers<std::size_t>(
+        {.min_value = 1U, .max_value = max_target_call}));
+    result.kind = tc.draw(gs::booleans()) ? fault_kind::crash
+                                          : fault_kind::failure;
+    result.after_call =
+        result.kind == fault_kind::crash && tc.draw(gs::booleans());
+    return result;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // running a sequence of operations
 // ---------------------------------------------------------------------------
@@ -1485,7 +1507,8 @@ enum class checked_properties : std::uint8_t {
   query_read_only,
   close_mid_transaction,
   concurrent_queries,
-  injected_fault
+  injected_fault,
+  purge_fault
 };
 
 [[nodiscard]] bool reads_back(checked_properties properties) noexcept {
@@ -1708,7 +1731,8 @@ public:
       break;
     case operation_kind::crash:
       // with injected faults the crash happens at a chosen backend call
-      if (properties_ != checked_properties::injected_fault) {
+      if (properties_ != checked_properties::injected_fault &&
+          properties_ != checked_properties::purge_fault) {
         crash();
       }
       break;
@@ -2216,6 +2240,118 @@ private:
   }
 
 public:
+  // the purge-only fault property: stops the writer cleanly, then runs the
+  // supported retention procedure (purge_binlogs on the stopped storage, then
+  // a restart) with 'plan' armed for exactly those backend calls, so that
+  // faults while writing or rotating (tickets 15/18) cannot mask it
+  void purge_with_fault(std::size_t requested_count, fault_plan &plan) {
+    while (std::size(model_.get_binlogs()) < 2U) {
+      apply(operation{.kind = operation_kind::rotate,
+                      .event_size = 0U,
+                      .at_transaction_boundary = false,
+                      .timestamp = 0U,
+                      .purge_count = 0U});
+    }
+    const auto &binlogs{model_.get_binlogs()};
+    const auto count{std::min(requested_count, std::size(binlogs) - 1U)};
+    const auto target{binlogs[count - 1U].name};
+    std::vector<std::string> before_names;
+    for (const auto &binlog : binlogs) {
+      before_names.push_back(binlog.name.str());
+    }
+    const std::vector<std::string> after_names(
+        std::next(std::cbegin(before_names),
+                  static_cast<std::ptrdiff_t>(count)),
+        std::cend(before_names));
+
+    tailing_reader_.reset();
+    storage_.reset();
+    model_.drop_incomplete_transaction();
+    arm(plan);
+    std::string warning;
+    try {
+      {
+        const auto purger{make_storage(
+            config_path_, binsrv::storage_construction_mode_type::purging)};
+        warning = purger->purge_binlogs(target).second;
+      }
+      if (warning.empty()) {
+        storage_ = make_storage(config_path_);
+        reopen_current_binlog(*storage_, "restart after the purge");
+      }
+    } catch (const std::exception &) {
+      if (!plan.triggered) {
+        throw;
+      }
+    }
+    storage_.reset();
+    plan.armed = false;
+    plan.dead = false;
+
+    const bool crashed{plan.triggered && plan.kind == fault_kind::crash};
+    storage_location &leftover{crashed ? *fault_snapshot_ : *location_};
+    const auto config{crashed ? write_config(root_.path(),
+                                             leftover.config_members(),
+                                             settings_)
+                              : config_path_};
+    std::ostringstream label_stream;
+    label_stream << "purging " << count << " of " << std::size(before_names)
+                 << " binlog(s) up to '" << target.str() << "'";
+    if (plan.triggered) {
+      label_stream << (crashed ? ", crash " : ", failure ")
+                   << (crashed && plan.after_call ? "right after " : "at ")
+                   << plan.triggered_at;
+    }
+    if (!warning.empty()) {
+      label_stream << " (purge_binlogs warning: " << warning << ')';
+    }
+    const auto label{label_stream.str()};
+
+    binsrv::storage_ptr reopened;
+    try {
+      reopened = make_storage(config);
+    } catch (const std::exception &e) {
+      require(false,
+              label + ": the storage cannot be opened again: " + e.what());
+    }
+    const auto records{reopened->get_binlog_records()};
+    std::vector<std::string> names;
+    for (const auto &record : records) {
+      names.push_back(record.name.str());
+    }
+    const auto join{[](const std::vector<std::string> &values) {
+      std::string result;
+      for (const auto &value : values) {
+        result += (result.empty() ? "" : ", ") + value;
+      }
+      return "[" + result + "]";
+    }};
+    require(names == before_names || names == after_names,
+            label + ": the storage holds " + join(names) +
+                " instead of the binlogs before the purge " +
+                join(before_names) + " or after it " + join(after_names));
+    if (names == after_names) {
+      model_.purge(count);
+    }
+    static_cast<void>(require_disk_matches_model(leftover, records, model_,
+                                                 settings_));
+    const auto &last{records.back()};
+    binsrv::open_binlog_status status{};
+    try {
+      status = reopened->open_binlog(last.name);
+    } catch (const std::exception &e) {
+      require(false, label + ": cannot resume in '" + last.name.str() +
+                         "': " + e.what());
+    }
+    require(status != binsrv::open_binlog_status::created,
+            label + ": resuming created '" + last.name.str() + "' anew");
+    require(reopened->get_current_position() == last.size,
+            label + ": resuming at position " +
+                std::to_string(reopened->get_current_position()) +
+                " instead of right after the data of '" + last.name.str() +
+                "' (" + std::to_string(last.size) + ")");
+  }
+
   // installs the crash snapshot for 'plan' and starts counting its calls
   void arm(fault_plan &plan) {
     plan.on_crash = [this] {
@@ -2358,7 +2494,8 @@ private:
     if (properties_ == checked_properties::model_agreement ||
         properties_ == checked_properties::damaged_files ||
         properties_ == checked_properties::close_mid_transaction ||
-        properties_ == checked_properties::injected_fault) {
+        properties_ == checked_properties::injected_fault ||
+        properties_ == checked_properties::purge_fault) {
       const auto expected_position{state.file_size + unflushed +
                                    model_.get_incomplete_size()};
       require(storage_->get_current_position() == expected_position,
@@ -2425,6 +2562,20 @@ void run_storage_property(hegel::TestCase &tc, checked_properties properties,
       query_settings->encryption =
           encryption_settings{.kek_id = "gamma32", .data_cipher = "AES-256-CTR"};
     }
+  }
+  if (properties == checked_properties::purge_fault) {
+    static constexpr std::size_t max_purge_count{3U};
+    const auto purge_count{tc.draw(
+        "purge_count", gs::integers<std::size_t>(
+                           {.min_value = 1U, .max_value = max_purge_count}))};
+    auto plan{tc.draw("fault", purge_fault_plans())};
+    const fault_injection_scope scope{plan};
+    storage_harness harness{settings, properties};
+    for (const auto &op : ops) {
+      harness.apply(op);
+    }
+    harness.purge_with_fault(purge_count, plan);
+    return;
   }
   if (properties == checked_properties::injected_fault) {
     auto plan{tc.draw("fault", fault_plans())};
@@ -2798,6 +2949,18 @@ BOOST_AUTO_TEST_CASE(StorageSurvivesAFaultAtAnyBackendCall) {
   });
 }
 
+// a writer stopped cleanly and purged as the README asks (stop ->
+// purge_binlogs -> restart), with a kill or a storage error injected only
+// during that purge and restart, leaves a storage that opens again and holds
+// either the binlogs from before the purge or those after it (COVERAGE_GAPS
+// row 5 / lead N3: storage_core.cpp purge_binlogs commits the index first,
+// so a fault in the removals leaves files the next start refuses)
+BOOST_AUTO_TEST_CASE(StoragePurgeSurvivesAFault) {
+  run_property([](hegel::TestCase &tc) {
+    run_storage_property(tc, checked_properties::purge_fault);
+  });
+}
+
 BOOST_AUTO_TEST_CASE(StorageMatchesModelOnS3) {
   run_s3_storage_property(checked_properties::model_agreement);
 }
@@ -2824,6 +2987,10 @@ BOOST_AUTO_TEST_CASE(StorageQueryingLeavesItUnchangedOnS3) {
 
 BOOST_AUTO_TEST_CASE(StorageSurvivesAFaultAtAnyBackendCallOnS3) {
   run_s3_storage_property(checked_properties::injected_fault);
+}
+
+BOOST_AUTO_TEST_CASE(StoragePurgeSurvivesAFaultOnS3) {
+  run_s3_storage_property(checked_properties::purge_fault);
 }
 
 // no offset of an encrypted binlog is encrypted twice with the same AES-CTR

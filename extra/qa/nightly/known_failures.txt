@@ -27,6 +27,8 @@ StorageClosingMidTransactionDropsIt  ticket 6: closing a binlog mid-transaction 
 StorageConcurrentQueriesSucceed  ticket 29: a query next to a writer fails stat()ing a .tmp file the writer renamed away
 StorageSurvivesAFaultAtAnyBackendCall  tickets 15/18 (PBS-83): crash while creating a binlog leaves an unopenable storage; a failed metadata save makes the final flush write the data twice
 StorageSurvivesAFaultAtAnyBackendCallOnS3  tickets 15/18 (PBS-83): crash while creating a binlog leaves an unopenable storage; a failed metadata save makes the final flush write the data twice (S3 backend variant)
+StoragePurgeSurvivesAFault  no ticket yet: a failed/interrupted removal in purge_binlogs (index already committed, storage_core.cpp:387-430) leaves files the next start refuses ('found metadata for a non-existing binlog'), lead N3
+StoragePurgeSurvivesAFaultOnS3  no ticket yet: a failed/interrupted removal in purge_binlogs leaves files the next start refuses, lead N3 (S3 backend variant)
 StorageNeverReusesKeystreamAfterCrashRecovery  ticket 32: CTR keystream reuse after crash truncation (recovery truncates the unrecorded tail and the next write reuses the file's key/IV at the same offsets)
 ReplicationSourceMatchesStatementsExactlyOrByPrefix  ticket 31: listener prefix match ignores the delimiter ('SET @source_heartbeat_period', 'SET @slave_uuidx = 1' answered OK, network_service.cpp known_prefix_queries)
 # Release build (release_gcc14, assertions compiled out): how a known bug

@@ -1,0 +1,154 @@
+#
+# 'pull' (and 'fetch') resuming from a binlog the source has purged in the
+# meantime (COVERAGE_GAPS row 1: easymysql/connection.cpp fetch_binlog_event
+# gets ER 1236 "Could not find first log file name in binary log index file"
+# instead of CR_SERVER_LOST, raises, and pull_operation.cpp rethrows it from
+# the operation thread).
+#
+# The utility must stop with a non-zero exit code and a clear error, must
+# leave its storage unchanged byte for byte and openable ('list'), and a
+# second start must behave the same way (no damage from a crash loop under a
+# supervisor that keeps restarting it).
+#
+# Position-based mode only: in GTID mode the server sends whatever the
+# storage's GTID set lacks, so purging binlogs the storage already holds is
+# not an error there.
+#
+--source ../include/have_binsrv.inc
+
+--source ../include/v80_v84_compatibility_defines.inc
+
+--source include/count_sessions.inc
+
+# the storage is compared byte for byte on the filesystem
+--source ../include/identify_storage_backend.inc
+if ($storage_backend != file)
+{
+  --skip This test compares the storage directory byte for byte (filesystem backend only)
+}
+
+# in case of --repeat=N, we need to start from a fresh binary log to make
+# this test deterministic
+--echo *** Resetting replication at the very beginning of the test.
+--disable_query_log
+eval $stmt_reset_binary_logs_and_gtids;
+--enable_query_log
+
+--let $binsrv_connect_timeout = 20
+--let $binsrv_read_timeout = 5
+--let $binsrv_idle_time = 1
+--let $binsrv_verify_checksum = TRUE
+--let $binsrv_replication_mode = position
+--source ../include/set_up_binsrv_environment.inc
+
+--echo
+--echo *** Creating a simple table and filling it with some data.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(DEFAULT);
+
+--echo
+--echo *** Starting Binlog Server Utility in background in pull mode
+--let $proc_command_line = $BINSRV pull $binsrv_config_file_path > /dev/null 2>&1
+--source ../include/start_proc_in_background.inc
+
+--echo
+--echo *** Rotating the binary log and adding a transaction to the second one.
+FLUSH BINARY LOGS;
+--let $second_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+INSERT INTO t1 VALUES(DEFAULT);
+
+--echo
+--echo *** Waiting till Binlog Server Utility starts processing the second
+--echo *** binary log.
+--let $max_number_of_attempts = 120
+--let $iteration = 0
+while($iteration < $max_number_of_attempts)
+{
+  --error 0, 1
+  --exec grep --silent $second_binlog $binsrv_log_path
+  --let $grep_status = $__error
+  if ($grep_status == 0)
+  {
+    --let $iteration = $max_number_of_attempts
+  }
+  if ($grep_status != 0)
+  {
+    --sleep 1
+    --inc $iteration
+  }
+}
+if ($grep_status != 0)
+{
+  --die The Binlog Server Utility did not start processing the second binary log.
+}
+# the INSERT of the second binlog is a transaction of its own: give the
+# utility a moment to store it as well
+--sleep 2
+
+--echo
+--echo *** Stopping the Binlog Server Utility (SIGTERM).
+--source ../include/terminate_proc.inc
+--source ../include/kill_binlog_dump_connection.inc
+
+--echo
+--echo *** Writing more, rotating twice and purging every binary log the
+--echo *** storage could resume from.
+INSERT INTO t1 VALUES(DEFAULT);
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES(DEFAULT);
+FLUSH BINARY LOGS;
+--let $current_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+--disable_query_log
+eval PURGE BINARY LOGS TO '$current_binlog';
+--enable_query_log
+--let $oldest_binlog = query_get_value(SHOW BINARY LOGS, Log_name, 1)
+--assert($oldest_binlog == $current_binlog)
+
+--echo
+--echo *** Taking a snapshot of the storage.
+--let $storage_snapshot_path = $MYSQL_TMP_DIR/storage_snapshot
+--exec cp -a $binsrv_storage_path $storage_snapshot_path
+
+--let $binsrv_output_path = $MYSQL_TMP_DIR/binsrv_output.txt
+
+--let $attempt = 1
+while ($attempt <= 2)
+{
+  --echo
+  --echo *** Restarting pull ($attempt): it must fail with a clear error.
+  --remove_file $binsrv_log_path
+  # 'timeout' turns a utility that keeps running (retrying forever) into
+  # exit code 124, which fails the test
+  --error 1
+  --exec timeout 60 $BINSRV pull $binsrv_config_file_path > $binsrv_output_path 2>&1
+  --exec grep --silent "Could not find first log file name in binary log index file" $binsrv_log_path
+  --remove_file $binsrv_output_path
+
+  --echo *** The storage is unchanged.
+  --exec diff -r $storage_snapshot_path $binsrv_storage_path
+  --source ../include/kill_binlog_dump_connection.inc
+  --inc $attempt
+}
+
+--echo
+--echo *** fetch fails the same way.
+--remove_file $binsrv_log_path
+--error 1
+--exec timeout 60 $BINSRV fetch $binsrv_config_file_path > $binsrv_output_path 2>&1
+--exec grep --silent "Could not find first log file name in binary log index file" $binsrv_log_path
+--remove_file $binsrv_output_path
+--exec diff -r $storage_snapshot_path $binsrv_storage_path
+
+--echo
+--echo *** The storage still opens: list succeeds and shows both binlogs.
+--exec $BINSRV list $binsrv_config_file_path > $binsrv_output_path
+--exec grep --silent $second_binlog $binsrv_output_path
+--remove_file $binsrv_output_path
+--exec diff -r $storage_snapshot_path $binsrv_storage_path
+
+# cleaning up
+DROP TABLE t1;
+--force-rmdir $storage_snapshot_path
+--source ../include/tear_down_binsrv_environment.inc
+--source ../include/kill_binlog_dump_connection.inc
+--source include/wait_until_count_sessions.inc

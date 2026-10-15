@@ -1,0 +1,50 @@
+*** Resetting replication at the very beginning of the test.
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+
+*** Determining binlog file directory from the server.
+
+*** Creating a temporary directory <BINSRV_STORAGE_PATH> for storing
+*** binlog files downloaded via the Binlog Server utility.
+
+*** Creating a simple table and filling it with some data.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL AUTO_INCREMENT, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(DEFAULT);
+
+*** Starting Binlog Server Utility in background in pull mode
+
+*** Rotating the binary log and adding a transaction to the second one.
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES(DEFAULT);
+
+*** Waiting till Binlog Server Utility starts processing the second
+*** binary log.
+
+*** Stopping the Binlog Server Utility (SIGTERM).
+
+*** Writing more, rotating twice and purging every binary log the
+*** storage could resume from.
+INSERT INTO t1 VALUES(DEFAULT);
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES(DEFAULT);
+FLUSH BINARY LOGS;
+
+*** Taking a snapshot of the storage.
+
+*** Restarting pull (1): it must fail with a clear error.
+*** The storage is unchanged.
+
+*** Restarting pull (2): it must fail with a clear error.
+*** The storage is unchanged.
+
+*** fetch fails the same way.
+
+*** The storage still opens: list succeeds and shows both binlogs.
+DROP TABLE t1;
+
+*** Removing the Binlog Server utility storage directory.
+
+*** Removing the Binlog Server utility log file.
+
+*** Removing the Binlog Server utility configuration file.

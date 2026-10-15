@@ -35,6 +35,17 @@
 //   with the exceptions the state machine uses, and every transaction
 //   reported complete before that starts with exactly one GTID event and has
 //   exactly its declared length;
+// - a valid stream with one targeted defect in one event (an artificial
+//   ROTATE with a timestamp, a next event position or a wrong position, an
+//   artificial FORMAT_DESCRIPTION / PREVIOUS_GTIDS_LOG / ordinary event /
+//   closing STOP, a wrong binlog version or common header length in the
+//   FORMAT_DESCRIPTION, a FORMAT_DESCRIPTION newer than the connection's
+//   server, an event before the FORMAT_DESCRIPTION, a second
+//   FORMAT_DESCRIPTION or PREVIOUS_GTIDS_LOG in a binlog, a closing ROTATE
+//   with a position other than 4, an anonymous GTID event in GTID mode, a
+//   GTID event without a GTID, a zero or wrong next event position) is
+//   rejected exactly at that event with a std::logic_error naming that
+//   defect, never accepted and never crashing;
 // - resuming from a stored binlog name and position (as after a restart)
 //   accepts the continuation the server sends, with its preamble reported as
 //   info-only.
@@ -681,6 +692,307 @@ void repair_positions(std::vector<stream_event> &stream_events) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// targeted single-event defects
+// ---------------------------------------------------------------------------
+
+enum class defect_kind : std::uint8_t {
+  artificial_rotate_timestamp,
+  artificial_rotate_next_position,
+  artificial_rotate_position,
+  artificial_format_description,
+  binlog_version,
+  common_header_length,
+  newer_server_version,
+  event_before_format_description,
+  artificial_previous_gtids,
+  artificial_other_event,
+  artificial_stop,
+  closing_rotate_position,
+  second_format_description,
+  second_previous_gtids,
+  anonymous_gtid_in_gtid_mode,
+  gtid_event_without_gtid,
+  zero_next_position,
+  wrong_next_position
+};
+
+constexpr std::array defect_names{
+    std::string_view{"artificial_rotate_timestamp"},
+    std::string_view{"artificial_rotate_next_position"},
+    std::string_view{"artificial_rotate_position"},
+    std::string_view{"artificial_format_description"},
+    std::string_view{"binlog_version"},
+    std::string_view{"common_header_length"},
+    std::string_view{"newer_server_version"},
+    std::string_view{"event_before_format_description"},
+    std::string_view{"artificial_previous_gtids"},
+    std::string_view{"artificial_other_event"},
+    std::string_view{"artificial_stop"},
+    std::string_view{"closing_rotate_position"},
+    std::string_view{"second_format_description"},
+    std::string_view{"second_previous_gtids"},
+    std::string_view{"anonymous_gtid_in_gtid_mode"},
+    std::string_view{"gtid_event_without_gtid"},
+    std::string_view{"zero_next_position"},
+    std::string_view{"wrong_next_position"}};
+
+struct defect {
+  defect_kind kind;
+  // which of the events the defect can apply to
+  std::size_t choice;
+};
+
+std::ostream &operator<<(std::ostream &output, const defect &value) {
+  return output << defect_names.at(static_cast<std::size_t>(value.kind))
+                << " (candidate " << value.choice << ')';
+}
+
+[[nodiscard]] gs::Generator<defect> defects() {
+  return gs::compose([](const hegel::TestCase &tc) {
+    return defect{
+        .kind = static_cast<defect_kind>(tc.draw(gs::integers<std::size_t>(
+            {.min_value = 0U, .max_value = std::size(defect_names) - 1U}))),
+        .choice = tc.draw(gs::integers<std::size_t>(
+            {.min_value = 0U, .max_value = 15U}))};
+  });
+}
+
+[[nodiscard]] event_role role_of_defect_target(defect_kind kind) {
+  switch (kind) {
+  case defect_kind::artificial_rotate_timestamp:
+  case defect_kind::artificial_rotate_next_position:
+  case defect_kind::artificial_rotate_position:
+    return event_role::artificial_rotate;
+  case defect_kind::artificial_format_description:
+  case defect_kind::binlog_version:
+  case defect_kind::common_header_length:
+  case defect_kind::newer_server_version:
+  case defect_kind::event_before_format_description:
+    return event_role::format_description;
+  case defect_kind::artificial_previous_gtids:
+    return event_role::previous_gtids;
+  case defect_kind::artificial_other_event:
+  case defect_kind::second_format_description:
+  case defect_kind::second_previous_gtids:
+  case defect_kind::zero_next_position:
+  case defect_kind::wrong_next_position:
+    return event_role::other;
+  case defect_kind::artificial_stop:
+    return event_role::stop;
+  case defect_kind::closing_rotate_position:
+    return event_role::rotate;
+  case defect_kind::anonymous_gtid_in_gtid_mode:
+  case defect_kind::gtid_event_without_gtid:
+    return event_role::gtid;
+  }
+  return event_role::other;
+}
+
+[[nodiscard]] std::uint8_t read_type_code(const events::event_storage &bytes) {
+  return std::to_integer<std::uint8_t>(bytes[header::type_code_offset]);
+}
+
+void add_flags(events::event_storage &bytes, std::uint16_t added) {
+  util::const_byte_span field{util::const_byte_span{bytes}.subspan(
+      header::flags_offset, sizeof(std::uint16_t))};
+  std::uint16_t flags{};
+  util::extract_fixed_int_from_byte_span(field, flags);
+  write_header_field(bytes, header::flags_offset,
+                     static_cast<std::uint16_t>(flags | added));
+}
+
+[[nodiscard]] std::uint32_t
+read_next_position(const events::event_storage &bytes) {
+  util::const_byte_span field{util::const_byte_span{bytes}.subspan(
+      header::next_event_position_offset, sizeof(std::uint32_t))};
+  std::uint32_t result{};
+  util::extract_fixed_int_from_byte_span(field, result);
+  return result;
+}
+
+// applies 'value' to a valid stream; returns the index of the event that
+// must be rejected and a part of the message it must be rejected with, or
+// nothing when the stream has no event the defect applies to
+[[nodiscard]] std::optional<std::pair<std::size_t, std::string_view>>
+apply_defect(encoded_stream &stream, const defect &value) {
+  auto &stream_events{stream.events};
+  const auto target_role{role_of_defect_target(value.kind)};
+  std::vector<std::size_t> candidates;
+  for (std::size_t index{0U}; index < std::size(stream_events); ++index) {
+    const auto &event{stream_events[index]};
+    if (event.role != target_role) {
+      continue;
+    }
+    const auto code{static_cast<code_type>(read_type_code(event.bytes))};
+    if (value.kind == defect_kind::anonymous_gtid_in_gtid_mode &&
+        (stream.mode != binsrv::replication_mode_type::gtid ||
+         code != code_type::gtid_log)) {
+      continue;
+    }
+    if (value.kind == defect_kind::gtid_event_without_gtid &&
+        code != code_type::anonymous_gtid_log) {
+      continue;
+    }
+    candidates.push_back(index);
+  }
+  if (candidates.empty()) {
+    return std::nullopt;
+  }
+  // a FORMAT_DESCRIPTION newer than the connection's server is rejected at
+  // the first one
+  const auto index{value.kind == defect_kind::newer_server_version
+                       ? candidates.front()
+                       : candidates[value.choice % std::size(candidates)]};
+  auto &bytes{stream_events[index].bytes};
+  // the FORMAT_DESCRIPTION always carries a checksum footer, every other
+  // event only when checksums are on
+  const bool has_footer{stream_events[index].role ==
+                            event_role::format_description ||
+                        stream.with_checksum};
+  const auto post_header_offset{header::size_in_bytes};
+  const auto artificial{static_cast<std::uint16_t>(
+      events::common_header_flag_type::artificial)};
+  const std::size_t rejected_at{index};
+  std::string_view message;
+
+  switch (value.kind) {
+  case defect_kind::artificial_rotate_timestamp:
+    write_header_field(bytes, header::timestamp_offset,
+                       std::uint32_t{1700000000U});
+    message = "non-zero timestamp found in an artificial rotate event";
+    break;
+  case defect_kind::artificial_rotate_next_position:
+    write_header_field(bytes, header::next_event_position_offset,
+                       std::uint32_t{1234U});
+    message = "non-zero next event position found in an artificial rotate";
+    break;
+  case defect_kind::artificial_rotate_position:
+    write_header_field(bytes, post_header_offset, std::uint64_t{5U});
+    message = "unexpected position found in an artificial rotate event";
+    break;
+  case defect_kind::artificial_format_description:
+    add_flags(bytes, artificial);
+    message = "format description event is not expected to be artificial";
+    break;
+  case defect_kind::binlog_version:
+    write_header_field(bytes, post_header_offset, std::uint16_t{3U});
+    message = "unexpected binlog version number in format description event";
+    break;
+  case defect_kind::common_header_length: {
+    // binlog version (2), server version (50), create timestamp (4)
+    static constexpr std::size_t header_length_offset{2U + 50U + 4U};
+    write_header_field(bytes, post_header_offset + header_length_offset,
+                       std::uint8_t{header::size_in_bytes + 4U});
+    message = "unexpected common header length in format description event";
+  } break;
+  case defect_kind::newer_server_version:
+    // the connection reports an older server than the FORMAT_DESCRIPTION
+    --stream.encoded_server_version;
+    message = "unexpected server version in format description event";
+    break;
+  case defect_kind::event_before_format_description: {
+    // before the FORMAT_DESCRIPTION only ROTATE events can be decoded (the
+    // post header lengths come from it), so the intruder is a copy of the
+    // artificial ROTATE in front of it with the artificial flag cleared
+    auto intruder{stream_events[index - 1U].bytes};
+    write_header_field(intruder, header::flags_offset, std::uint16_t{0U});
+    if (stream.with_checksum) {
+      write_crc(intruder);
+    }
+    stream_events.insert(
+        std::next(std::begin(stream_events),
+                  static_cast<std::ptrdiff_t>(index)),
+        stream_event{.bytes = std::move(intruder),
+                     .role = event_role::rotate,
+                     .transaction = std::nullopt,
+                     .last_of_transaction = false});
+    return std::pair{index,
+                     std::string_view{"format description event must follow "
+                                      "an artificial rotate event"}};
+  }
+  case defect_kind::artificial_previous_gtids:
+    add_flags(bytes, artificial);
+    message = "previous gtids log event is not expected to be artificial";
+    break;
+  case defect_kind::artificial_other_event:
+    add_flags(bytes, artificial);
+    message = "unexpected artificial event";
+    break;
+  case defect_kind::artificial_stop:
+    add_flags(bytes, artificial);
+    message = "the very last event in the binlog is not expected to be "
+              "artificial";
+    break;
+  case defect_kind::closing_rotate_position:
+    write_header_field(bytes, post_header_offset, std::uint64_t{5U});
+    message = "unexpected position in an non-artificial rotate event";
+    break;
+  case defect_kind::second_format_description:
+  case defect_kind::second_previous_gtids: {
+    // a copy of this binlog's preamble event in place of an ordinary event,
+    // at the ordinary event's position
+    const auto wanted{value.kind == defect_kind::second_format_description
+                          ? event_role::format_description
+                          : event_role::previous_gtids};
+    std::size_t source{index};
+    while (stream_events[source].role != wanted) {
+      if (source == 0U) {
+        return std::nullopt;
+      }
+      --source;
+    }
+    const auto next_position{read_next_position(bytes)};
+    auto copy{stream_events[source].bytes};
+    const bool copy_has_footer{wanted == event_role::format_description ||
+                               stream.with_checksum};
+    const auto start{next_position - read_event_size(bytes)};
+    write_header_field(copy, header::next_event_position_offset,
+                       static_cast<std::uint32_t>(start + std::size(copy)));
+    if (copy_has_footer) {
+      write_crc(copy);
+    }
+    // the transaction this event belonged to is cut short there
+    stream_events.erase(std::next(std::begin(stream_events),
+                                  static_cast<std::ptrdiff_t>(index) + 1),
+                        std::end(stream_events));
+    bytes = std::move(copy);
+    stream_events[index].role = wanted;
+    return std::pair{index,
+                     wanted == event_role::format_description
+                         ? std::string_view{"encountered second format "
+                                            "description event"}
+                         : std::string_view{"encountered second previous "
+                                            "gtids log event"}};
+  }
+  case defect_kind::anonymous_gtid_in_gtid_mode:
+    // the anonymous GTID event has the layout of the GTID event
+    bytes[header::type_code_offset] = static_cast<std::byte>(
+        static_cast<std::uint8_t>(code_type::anonymous_gtid_log));
+    message = "unexpected anonymous gtid log event in gtid mode";
+    break;
+  case defect_kind::gtid_event_without_gtid:
+    bytes[header::type_code_offset] = static_cast<std::byte>(
+        static_cast<std::uint8_t>(code_type::gtid_log));
+    message = "encountered an empty gtid in the gtid log event";
+    break;
+  case defect_kind::zero_next_position:
+    write_header_field(bytes, header::next_event_position_offset,
+                       std::uint32_t{0U});
+    message = "next event position in the event common header cannot be zero";
+    break;
+  case defect_kind::wrong_next_position:
+    write_header_field(bytes, header::next_event_position_offset,
+                       read_next_position(bytes) + 1U);
+    message = "unexpected next event position in the event common header";
+    break;
+  }
+  if (has_footer) {
+    write_crc(bytes);
+  }
+  return std::pair{rejected_at, message};
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -828,5 +1140,45 @@ BOOST_AUTO_TEST_CASE(ReaderContextRejectsBrokenStreamsCleanly) {
       }
       pending.clear();
     }
+  });
+}
+
+// one targeted defect in an otherwise valid stream is rejected exactly at
+// the defective event, with a std::logic_error that names the defect
+BOOST_AUTO_TEST_CASE(ReaderContextRejectsTargetedDefectsCleanly) {
+  run_property([](hegel::TestCase &tc) {
+    const auto spec{tc.draw("stream", stream_specs())};
+    auto stream{encode_stream(spec)};
+    const auto value{tc.draw("defect", defects())};
+    const auto expected{apply_defect(stream, value)};
+    tc.assume(expected.has_value());
+    const auto [rejected_at, message]{*expected};
+
+    auto context{make_context(stream)};
+    for (std::size_t index{0U}; index < std::size(stream.events); ++index) {
+      const auto label{"event " + std::to_string(index + 1U) + ": "};
+      try {
+        const events::event_view event_v{
+            *context, util::const_byte_span{stream.events[index].bytes}};
+        [[maybe_unused]] const auto info_only{
+            context->process_event_view(event_v)};
+      } catch (const std::logic_error &e) {
+        const std::string what{e.what()};
+        require(index == rejected_at,
+                label + "rejected instead of event " +
+                    std::to_string(rejected_at + 1U) + ": " + what);
+        require(what.find(message) != std::string::npos,
+                label + "rejected with '" + what + "' instead of '" +
+                    std::string{message} + "'");
+        return;
+      } catch (const std::exception &e) {
+        require(false, label + "rejected with an exception that is not a "
+                               "std::logic_error: " +
+                           e.what());
+      }
+      require(index != rejected_at,
+              label + "the defective event was accepted");
+    }
+    require(false, "the defective stream was accepted");
   });
 }

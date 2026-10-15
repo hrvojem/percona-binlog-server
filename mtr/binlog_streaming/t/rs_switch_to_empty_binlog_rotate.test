@@ -55,6 +55,7 @@ eval $stmt_reset_binary_logs_and_gtids;
 --let $binsrv_idle_time = 1
 --let $binsrv_verify_checksum = TRUE
 --let $binsrv_replication_mode = position
+--source ../include/set_up_auth_rsa_keys.inc
 --source ../include/set_up_binsrv_environment.inc
 
 --echo
@@ -82,6 +83,7 @@ INSERT INTO t1 VALUES(DEFAULT);
 --echo *** Waiting for the replication source listener port ready to accept
 --echo *** connections.
 --let $listening_port = $binsrv_replication_source_port
+--let $listening_host = 127.0.0.1
 --source ../include/wait_for_listening_port.inc
 
 --echo
@@ -89,7 +91,7 @@ INSERT INTO t1 VALUES(DEFAULT);
 --echo *** against PBS.
 --let $raw_directory = $MYSQL_TMP_DIR/rs_switch_to_empty_binlog_rotate
 --mkdir $raw_directory
---let $proc_command_line = $MYSQL_BINLOG --read-from-remote-server --raw --stop-never --host=127.0.0.1 --port=$binsrv_replication_source_port --user=$binsrv_auth_user --password=$binsrv_auth_password --default-auth=caching_sha2_password --result-file=$raw_directory/ $first_binlog > /dev/null 2>&1
+--let $proc_command_line = $MYSQL_BINLOG --read-from-remote-server --raw --stop-never --host=127.0.0.1 --port=$binsrv_replication_source_port --user=$binsrv_auth_user --password=$binsrv_auth_password --default-auth=caching_sha2_password --get-server-public-key --result-file=$raw_directory/ $first_binlog > /dev/null 2>&1
 --source ../include/start_proc_in_background.inc
 --let $client_pid = $proc_pid
 

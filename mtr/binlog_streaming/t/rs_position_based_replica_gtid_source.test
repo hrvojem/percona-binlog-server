@@ -49,6 +49,7 @@ eval $stmt_reset_binary_logs_and_gtids;
 --let $binsrv_verify_checksum = TRUE
 --let $binsrv_replication_mode = position
 --let $binsrv_checkpoint_interval = 1s
+--source ../include/set_up_auth_rsa_keys.inc
 --source ../include/set_up_binsrv_environment.inc
 
 --echo
@@ -76,6 +77,7 @@ INSERT INTO source_db.tbl VALUES (1, 'one'), (2, 'two'), (3, 'three');
 --echo *** Waiting for the replication source listener port ready to accept
 --echo *** connections.
 --let $listening_port = $binsrv_replication_source_port
+--let $listening_host = 127.0.0.1
 --source ../include/wait_for_listening_port.inc
 
 --echo
@@ -98,6 +100,7 @@ eval CHANGE REPLICATION SOURCE TO
        SOURCE_LOG_FILE='$first_binlog_file',
        SOURCE_LOG_POS=4,
        SOURCE_AUTO_POSITION=0,
+       GET_SOURCE_PUBLIC_KEY=1,
        SOURCE_SSL=0,
        SOURCE_CONNECT_RETRY=1,
        SOURCE_RETRY_COUNT=1;

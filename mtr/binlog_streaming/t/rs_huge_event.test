@@ -26,6 +26,7 @@ eval $stmt_reset_binary_logs_and_gtids;
 --let $binsrv_idle_time = 1
 --let $binsrv_verify_checksum = TRUE
 --let $binsrv_replication_mode = position
+--source ../include/set_up_auth_rsa_keys.inc
 --source ../include/set_up_binsrv_environment.inc
 
 --echo
@@ -60,6 +61,7 @@ INSERT INTO source_db.tbl VALUES (1, REPEAT('X', 20000000));
 --echo *** Waiting for the replication source listener port ready to
 --echo *** accept connections.
 --let $listening_port = $binsrv_replication_source_port
+--let $listening_host = 127.0.0.1
 --source ../include/wait_for_listening_port.inc
 
 --echo
@@ -68,7 +70,7 @@ INSERT INTO source_db.tbl VALUES (1, REPEAT('X', 20000000));
 --echo *** once it has streamed everything in storage.
 --let $large_event_dump = $MYSQL_TMP_DIR/rs_huge_event.sql
 --let $large_event_dump_errors = $MYSQL_TMP_DIR/rs_huge_event.err
---exec $MYSQL_BINLOG --read-from-remote-server --host=127.0.0.1 --port=$binsrv_replication_source_port --user=$binsrv_auth_user --password=$binsrv_auth_password --default-auth=caching_sha2_password $first_binlog > $large_event_dump 2> $large_event_dump_errors
+--exec $MYSQL_BINLOG --read-from-remote-server --host=127.0.0.1 --port=$binsrv_replication_source_port --user=$binsrv_auth_user --password=$binsrv_auth_password --default-auth=caching_sha2_password --get-server-public-key $first_binlog > $large_event_dump 2> $large_event_dump_errors
 
 --echo
 --echo *** Waiting for the exact-size-retry log entry in the PBS log.

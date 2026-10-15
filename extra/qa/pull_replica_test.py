@@ -46,6 +46,10 @@ import fetch_crash_test as harness  # noqa: E402
 
 PULL_USER = "rpl"
 PULL_PASSWORD = "password"
+# the sample key of the MTR suite
+AUTH_RSA_PRIVATE_KEY = (Path(__file__).resolve().parents[2] / "mtr" /
+                        "binlog_streaming" / "std_data" /
+                        "caching_sha2_rsa_priv.pem")
 WORKLOAD = [{"rows": [3000, 150_000], "ddl": False},
             {"rows": [500], "ddl": True}]
 CATCH_UP_SECONDS = 60
@@ -86,6 +90,10 @@ def run_case(args, gtid_mode: bool) -> dict:
             "port": pull_port, "server_id": 142,
             "server_uuid": "00000000-0000-0000-0000-00000000008e",
             "read_timeout": 60, "write_timeout": 60,
+            # the listener always does caching_sha2_password full
+            # authentication, which over a non-TLS connection needs its RSA
+            # key (PBS-33 / PBS-34); the replica uses GET_SOURCE_PUBLIC_KEY
+            "auth_rsa_private_key": str(AUTH_RSA_PRIVATE_KEY),
             "authentication": {"user": PULL_USER, "password": PULL_PASSWORD,
                                "plugin": "caching_sha2_password"}}
         binsrv.config_path.write_text(json.dumps(config, indent=2))

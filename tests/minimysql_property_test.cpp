@@ -231,7 +231,7 @@ std::ostream &operator<<(std::ostream &output, const credentials &value) {
   require(context.get_client_auth_method() == auth_method,
           "the server parsed auth method '" +
               context.get_client_auth_method() + "'");
-  return context.check_client_authentication();
+  return context.check_client_fast_authentication();
 }
 
 // a connection_context that has completed the handshake and is waiting for
@@ -261,7 +261,7 @@ struct authenticated_session {
       ""};
   result.context.parse_client_greeting(
       encode_client_frame(1U, client_greeting, result.capabilities));
-  require(result.context.check_client_authentication(),
+  require(result.context.check_client_fast_authentication(),
           "the test session could not authenticate");
   result.context.enter_command_loop_iteration();
   return result;
@@ -520,7 +520,7 @@ BOOST_AUTO_TEST_CASE(MinimysqlRejectsCorruptedPacketsCleanly) {
       if (corrupt_greeting) {
         context.parse_client_greeting(packet);
         [[maybe_unused]] const auto accepted{
-            context.check_client_authentication()};
+            context.check_client_fast_authentication()};
       } else {
         context.parse_client_command(packet);
       }

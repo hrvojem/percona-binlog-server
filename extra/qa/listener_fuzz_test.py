@@ -66,6 +66,13 @@ import fetch_crash_test as harness  # noqa: E402
 
 PULL_USER = "fuzz"
 PULL_PASSWORD = "fuzz_password"
+# the sample key of the MTR suite: the listener always does
+# caching_sha2_password full authentication, which over a non-TLS connection
+# needs its RSA key (PBS-33 / PBS-34)
+AUTH_RSA_PRIVATE_KEY = (Path(__file__).resolve().parents[2] / "mtr" /
+                        "binlog_streaming" / "std_data" /
+                        "caching_sha2_rsa_priv.pem")
+MYSQLBINLOG = Path("mysqlbinlog")  # set from --mysql-basedir in main()
 WORKLOAD = [{"rows": [2000, 40_000], "ddl": False},
             {"rows": [300], "ddl": True}]
 
@@ -333,38 +340,22 @@ def scenario(rng: random.Random, client: Listener) -> str:
 
 
 def streams_binlogs(host: str, port: int) -> bool:
-    """A clean handshake plus a non-blocking COM_BINLOG_DUMP; returns True if
-    the listener streams at least one binlog event back."""
-    client = Listener(host, port, timeout=5.0)
+    """A clean login plus a non-blocking dump of binlog.000001 with the real
+    mysqlbinlog (full caching_sha2_password authentication with
+    --get-server-public-key, @source_binlog_checksum declared); returns True
+    if the listener streamed at least one binlog event."""
     try:
-        if not client.handshake():
-            return False
-        # since PBS-90 the listener refuses a dump from a client that has not
-        # declared @source_binlog_checksum, so declare it as mysqlbinlog does
-        client.send(frame(0, bytes([COM_QUERY]) +
-                          b"SET @master_binlog_checksum = 'NONE', "
-                          b"@source_binlog_checksum = 'NONE'"))
-        reply = client.read_frame()
-        if reply is None or reply[1][:1] != b"\x00":
-            return False
-        # flags = 1 (BINLOG_DUMP_NON_BLOCK), from binlog.000001 position 4
-        client.send(frame(0, bytes([COM_BINLOG_DUMP]) + struct.pack("<I", 4) +
-                          struct.pack("<H", 1) + struct.pack("<I", 4242) +
-                          b"binlog.000001"))
-        got_event = False
-        for _ in range(50):
-            read = client.read_frame()
-            if read is None:
-                break
-            body = read[1]
-            if body[:1] == b"\xfe" and len(body) < 9:  # EOF
-                break
-            if body[:1] == b"\x00" and len(body) > 20:  # a binlog event
-                got_event = True
-        return got_event
-    finally:
-        client.close()
-
+        completed = subprocess.run(
+            [str(MYSQLBINLOG), "--no-defaults", "--read-from-remote-server",
+             f"--host={host}", f"--port={port}", f"--user={PULL_USER}",
+             f"--password={PULL_PASSWORD}",
+             "--default-auth=caching_sha2_password", "--get-server-public-key",
+             "binlog.000001"],
+            capture_output=True, timeout=30, check=False)
+    except subprocess.TimeoutExpired:
+        return False
+    # the decoded dump of a binlog starts with its FORMAT_DESCRIPTION event
+    return completed.returncode == 0 and b"Start: binlog" in completed.stdout
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -378,6 +369,8 @@ def main():
     parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
     args.mysql_basedir = args.mysql_basedir.expanduser()
+    global MYSQLBINLOG  # pylint: disable=global-statement
+    MYSQLBINLOG = args.mysql_basedir / "bin" / "mysqlbinlog"
     args.binsrv = args.binsrv.expanduser()
     args.workdir.mkdir(parents=True, exist_ok=True)
 
@@ -406,6 +399,7 @@ def main():
             "port": pull_port, "server_id": 142,
             "server_uuid": "00000000-0000-0000-0000-00000000008e",
             "read_timeout": 3, "write_timeout": 3,
+            "auth_rsa_private_key": str(AUTH_RSA_PRIVATE_KEY),
             "authentication": {"user": PULL_USER, "password": PULL_PASSWORD,
                                "plugin": "caching_sha2_password"}}
         binsrv.config_path.write_text(json.dumps(config, indent=2))

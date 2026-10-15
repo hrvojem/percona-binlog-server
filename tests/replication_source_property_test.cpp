@@ -128,6 +128,8 @@
 #include "operations/event_generation_helpers.hpp"
 
 #include "opensslpp/digest_context.hpp"
+#include "opensslpp/encryption_padding.hpp"
+#include "opensslpp/evp_pkey.hpp"
 #include "opensslpp/digest_context_fwd.hpp"
 
 #include "util/byte_span.hpp"
@@ -223,6 +225,30 @@ std::ostream &operator<<(std::ostream &output, const source_settings &value) {
   return acceptor.local_endpoint().port();
 }
 
+// an RSA key for the listener's full authentication, generated once per
+// process (generating one takes tens of milliseconds)
+[[nodiscard]] const std::string &test_rsa_private_key_pem() {
+  static constexpr std::size_t key_bits{2048U};
+  static const std::string pem{opensslpp::evp_pkey::export_private_pem(
+      opensslpp::evp_pkey::generate(
+          opensslpp::evp_pkey::get_rsa_algorithm_name(), key_bits))};
+  return pem;
+}
+
+// a frame with a raw payload, for the caching_sha2_password exchange after the
+// client greeting (single-byte requests and the encrypted password)
+[[nodiscard]] network_buffer_type raw_client_frame(std::uint8_t sequence_number,
+                                                   std::string_view payload) {
+  network_buffer_type result;
+  const auto size{std::size(payload)};
+  result.push_back(static_cast<char>(size & 0xFFU));
+  result.push_back(static_cast<char>((size >> 8U) & 0xFFU));
+  result.push_back(static_cast<char>((size >> 16U) & 0xFFU));
+  result.push_back(static_cast<char>(sequence_number));
+  result.append(payload);
+  return result;
+}
+
 // the replication source of 'pull': a streaming storage holding one binlog
 // (a FORMAT_DESCRIPTION event, so that a dump has something to stream) and
 // the listener serving it, with its io_context running on its own thread as
@@ -246,6 +272,15 @@ public:
     source_config_.get<"authentication">().get<"password">() =
         replica_password;
     source_config_.get<"authentication">().get<"plugin">() = auth_method;
+    // full caching_sha2_password authentication over an unencrypted
+    // connection needs the listener's RSA key (PBS-33 / PBS-34): every login
+    // takes the full path, as the listener has no authentication cache yet
+    const auto key_path{root_.path() / "auth_rsa_private_key.pem"};
+    {
+      std::ofstream key_file{key_path};
+      key_file << test_rsa_private_key_pem();
+    }
+    source_config_.get<"auth_rsa_private_key">() = key_path.string();
 
     static constexpr int max_bind_attempts{20};
     for (int attempt{1}; !service_.has_value(); ++attempt) {
@@ -567,7 +602,10 @@ public:
   }
 
   // server greeting, client greeting with the caching_sha2_password scramble,
-  // then the fast-auth result and OK
+  // then the full authentication over an unencrypted connection, as a MySQL
+  // client with --get-server-public-key does it: "perform full
+  // authentication", a request for the server's RSA public key, the password
+  // XOR the scramble encrypted with that key (RSA-OAEP), and OK
   void authenticate(std::string_view user, std::string_view password) {
     const auto greeting{read_frame()};
     require(greeting.has_value(), "no server greeting");
@@ -598,17 +636,40 @@ public:
         ""};
     write_frame(encode_client_frame(1U, client_greeting, capabilities_));
 
-    // fast auth success (0x01 0x03), then OK
-    const auto fast_auth{read_frame()};
-    require(fast_auth.has_value() &&
-                std::size(*fast_auth) == frame_header_size + 2U &&
-                (*fast_auth)[frame_header_size] == '\x01' &&
-                (*fast_auth)[frame_header_size + 1U] == '\x03',
-            "no fast-auth success after the client greeting");
+    // "perform full authentication" (0x01 0x04)
+    const auto full_auth{read_frame()};
+    require(full_auth.has_value() &&
+                std::size(*full_auth) == frame_header_size + 2U &&
+                (*full_auth)[frame_header_size] == '\x01' &&
+                (*full_auth)[frame_header_size + 1U] == '\x04',
+            "no 'perform full authentication' after the client greeting");
+    // request the public key (0x02); the reply is 0x01 followed by its PEM
+    write_frame(raw_client_frame(3U, std::string_view{"\x02", 1U}));
+    const auto public_key{read_frame()};
+    require(public_key.has_value() &&
+                std::size(*public_key) > frame_header_size + 1U &&
+                (*public_key)[frame_header_size] == '\x01',
+            "no public key after the public key request");
+    const auto key{opensslpp::evp_pkey::import_public_pem(
+        std::string_view{*public_key}.substr(frame_header_size + 1U))};
+    // the null-terminated password, XOR the scramble (repeated)
+    std::string plain{password};
+    plain.push_back('\0');
+    for (std::size_t index{0U}; index < std::size(plain); ++index) {
+      plain[index] = static_cast<char>(
+          plain[index] ^ challenge[index % std::size(challenge)]);
+    }
+    const auto encrypted{opensslpp::evp_key_encrypt(
+        util::as_const_byte_span(plain), key,
+        opensslpp::encryption_padding::pkcs1_oaep)};
+    write_frame(raw_client_frame(
+        5U, std::string_view{reinterpret_cast<const char *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+                                 std::data(encrypted)),
+                             std::size(encrypted)}));
     const auto ok{read_frame()};
     require(ok.has_value() && std::size(*ok) > frame_header_size &&
                 (*ok)[frame_header_size] == '\0',
-            "no OK after the fast-auth success");
+            "no OK after the encrypted password");
   }
 
   // reads the reply to a statement, COM_PING or COM_REGISTER_SLAVE

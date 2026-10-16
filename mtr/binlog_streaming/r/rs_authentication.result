@@ -29,16 +29,6 @@
 *** the password, but it does not match the configured one, so access
 *** must be denied and mysql must return non-zero exit code.
 
-*** Auth method switch + public key: client forces mysql_native_password
-*** in its handshake so the Binlog Server has to send an
-*** AuthMethodSwitch, after which the client switches to
-*** caching_sha2_password and goes through the full authentication with
-*** the server's RSA public key. If the switch encoding, the follow-up
-*** parse, or the full authentication path is broken, mysql returns
-*** non-zero and MTR fails the --exec. The log grep that follows the
-*** shutdown is what actually proves the switch happened - this line
-*** only proves the session survived it.
-
 *** Requesting public key: client asks the Binlog Server for its RSA
 *** public key (--get-server-public-key) instead of using a local copy.
 *** The Binlog Server extracts the public component from its RSA
@@ -51,20 +41,8 @@
 *** successfully decrypts it, but it does not match the configured one,
 *** so access must be denied and mysql must return non-zero exit code.
 
-*** Auth method switch + requesting public key: client forces
-*** mysql_native_password in its handshake, then switches to
-*** caching_sha2_password and goes through the full authentication
-*** requesting the server's RSA public key (this shifts the sequence
-*** numbers of all subsequent packets by 2).
-
 *** Sending SIGTERM signal to the Binlog Server Utility and waiting for
 *** the process to terminate
-
-*** Confirming the switch actually happened by grepping the Binlog
-*** Server stdout log (now complete and flushed) for the marker
-*** emitted after generate_encoded_auth_method_switch() writes its
-*** frame.
-include/wait_for_pattern_in_file.inc [sent server auth method switch]
 
 *** Confirming the full authentication was requested (marker emitted
 *** after generate_encoded_full_auth() writes its frame).

@@ -160,7 +160,10 @@ failed `binlog.index` save during a rotation leaves the new binlog's files
 behind, the next `fetch` (whose start removes them) fails to delete one of
 them (`op=unlink`, which covers `unlink`, `unlinkat` and `remove`), and a
 third `fetch` without a failure must still recover (ticket 37: it does not
-when the metadata file was the one left):
+when the metadata file was the one left). `s3_fault_sweep.py` ends with the
+same two cases on S3 (failing `binlog.index` uploads, then a `DELETE` of the
+metadata object failing for the whole start: the S3 CRT client retries a
+`DELETE` about 10 times):
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/disk_fault_sweep.py \

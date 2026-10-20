@@ -24,6 +24,7 @@ disk_fault_sweep */[ofrw]*/binlog-metadata/*/x*  ticket 18 (PBS-83): double writ
 # .json behind; the next start fails to delete the .json but removes the data
 # file, and every later start refuses: 'found metadata for a non-existing binlog'
 disk_fault_sweep */binlog-index/*/then/unlink/binlog-metadata/*  ticket 37: a failed delete during the startup recovery removes the data file but keeps its metadata
+s3_fault_sweep */PUT-binlog.index/*/then/DELETE-.json/*  ticket 37: a failed delete during the startup recovery removes the data file but keeps its metadata
 # (S3: 6 consecutive failed PUTs outlast the SDK's retries; a stall or a
 # truncated response body does not fail the request)
 s3_fault_sweep */PUT-.json/error50?/x6  ticket 18 (PBS-83): double write after a failed binlog metadata save

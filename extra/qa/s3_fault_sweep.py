@@ -27,6 +27,13 @@ For each fault (action) x request kind (method and object) x repetition
    transaction boundaries (the checks of fetch_crash_test.py);
 4. with the fault cleared, 'fetch' must exit with 0 and leave exact copies.
 
+Then two recovery cases: failing uploads of the binlog index leave the
+objects of an interrupted binlog creation behind, the next 'fetch' (whose
+start removes them, PBS-59) fails to delete the binlog metadata object, and
+a third 'fetch' without a fault must still recover and leave exact copies
+(ticket 37). Only the metadata delete is failed: a 'binlog.0' match would
+hit both objects.
+
 The result of every case (whether the fault was hit, the exit code of the
 faulty fetch, and any failure) is printed as one JSON line and collected in
 '<workdir>/sweep.json'. Uses the helpers of fetch_crash_test.py.
@@ -50,6 +57,43 @@ TARGETS = [("PUT", "binlog.0"), ("PUT", "binlog.index"), ("PUT", ".json"),
 COUNTS = [1, 6]
 WORKLOAD = [{"rows": [3000, 150_000], "ddl": False},
             {"rows": [500], "ddl": True}]
+RECOVERY_FIRST = [{"action": action, "method": "PUT", "match": "binlog.index",
+                   "nth": 1, "count": 6, "seconds": 3}
+                  for action in ["error500", "reset_before"]]
+# the S3 CRT client retries a DELETE more often than the 6 times that make a
+# PUT fail, so the delete fails for the whole start
+RECOVERY_SECOND = {"action": "error500", "method": "DELETE", "match": ".json",
+                   "nth": 1, "count": 50, "seconds": 3}
+
+
+def run_recovery_case(first: dict, faults, fault_log: Path) -> dict:
+    """One recovery case: 'first' during a rotation, RECOVERY_SECOND during
+    the start after it, then a start without a fault."""
+    machine = harness.FetchCrashMachine()
+    result = {"fault": first, "recovery_fault": RECOVERY_SECOND}
+    try:
+        machine.start_from_scratch()
+        machine.run_workload(WORKLOAD)
+        machine.fetch_to_the_end()
+        harness.FAULTS = faults
+        harness.FAULT_LOG = fault_log
+        machine.fetch_with_fault(first, WORKLOAD)
+        outcome = json.loads(fault_log.read_text().splitlines()[-1])
+        result["hit"] = outcome["applied"] > 0
+        result["exit"] = outcome["exit"]
+        machine.fetch_with_fault(RECOVERY_SECOND, [])
+        outcome = json.loads(fault_log.read_text().splitlines()[-1])
+        result["recovery_hit"] = outcome["applied"] > 0
+        result["recovery_exit"] = outcome["exit"]
+        machine.storage_holds_prefixes()
+        machine.fetch_to_the_end()
+        machine.storage_holds_prefixes()
+        result["recovered"] = True
+    except Exception as error:  # every case is reported
+        result["failure"] = harness.describe_failure(error)
+    finally:
+        faults.set_rules([])
+    return result
 
 
 def main():
@@ -111,6 +155,11 @@ def main():
                 result["failure"] = harness.describe_failure(error)
             finally:
                 faults.set_rules([])
+            print(json.dumps(result), flush=True)
+            results.append(result)
+        for first in RECOVERY_FIRST:
+            result = run_recovery_case(first, faults,
+                                       args.workdir / "fault_outcomes.jsonl")
             print(json.dumps(result), flush=True)
             results.append(result)
     finally:

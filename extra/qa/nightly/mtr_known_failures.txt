@@ -12,8 +12,7 @@
 9.7 previous_gtids_log_oversized_tag  ticket 5: oversized GTID tag in a PREVIOUS_GTIDS_LOG event
 * rs_huge_event  ticket 10: binlog events of 16 MB or more in pull mode
 * search_by_timestamp_invalid_time  ticket 11: out-of-range time of day accepted (search_by_timestamp)
-* storage_empty_binlog_index  ticket 13: empty binlog list after opening dereferences binlog_records_.front()
 * gtid_resume_after_rotation  ticket 14: GTID-mode resume after a rotation misses the closing ROTATE and empty binlogs
-* storage_interrupted_binlog_creation  ticket 15: crash while creating a binlog leaves an unopenable storage
 * rs_source_killed_after_rotation  ticket 6: closing a binlog mid-transaction keeps the dropped events' timestamps (pull aborts at storage.cpp:138 after the source is killed right after a rotation)
 * rs_position_based_replica_gtid_source  ticket 30 (PBS-102): a position-mode PBS of a GTID source reports GTID_MODE = OFF, so no replica can follow it
+* encryption_keyring_removed  ticket 35: list / search_by_* report success with no binlogs when the keyring no longer holds the KEK

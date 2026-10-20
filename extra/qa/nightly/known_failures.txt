@@ -15,8 +15,8 @@ CipherContextSplitEncryptionMatchesWhole  ticket 8: CTR counter carry (split enc
 MinimysqlBinlogEventFramesRoundTrip  ticket 10: binlog events of 16 MB or more in pull mode
 TimestampParsingMatchesModel  ticket 11: out-of-range time of day accepted (search_by_timestamp)
 FilesystemStorageUriMatchesModel  ticket 12: file URI with %00 opens the directory before it
-StorageOpeningOfDamagedFilesFailsCleanly  ticket 13: empty binlog list after opening dereferences binlog_records_.front() (segfault)
-StorageOpeningOfDamagedFilesFailsCleanlyOnS3  ticket 13: empty binlog list after opening dereferences binlog_records_.front() (segfault) (S3 backend variant)
+StorageOpeningOfDamagedFilesFailsCleanly  ticket 36: startup deletes a complete binlog as interrupted-creation garbage when binlog.index is missing or lost its last entry
+StorageOpeningOfDamagedFilesFailsCleanlyOnS3  ticket 36: startup deletes a complete binlog as interrupted-creation garbage when binlog.index is missing or lost its last entry (S3 backend variant)
 EmptyStorageIsPolledUntilTheBinlogArrivesFromPosition  ticket 26 (PBS-96): resuming from a position on an empty storage disconnects the client
 MagicOnlyBinlogIsPolledUntilItsEventsArrive  ticket 26 (PBS-96) follow-up: resuming from a position in a binlog holding only the magic disconnects the client
 MisalignedDumpPositionNeverStreamsGarbage  ticket 7: event size below the common header size at a misaligned dump position aborts / loops
@@ -24,10 +24,8 @@ StorageQueryingLeavesItUnchanged  ticket 28: querying_only open rewrites metadat
 StorageQueryingLeavesItUnchangedOnS3  ticket 28: querying_only open rewrites metadata.json when the config adds encryption (S3 backend variant)
 StorageClosingMidTransactionDropsIt  ticket 6: closing a binlog mid-transaction keeps the dropped events' timestamps (assert at storage.cpp:138)
 StorageConcurrentQueriesSucceed  ticket 29: a query next to a writer fails stat()ing a .tmp file the writer renamed away
-StorageSurvivesAFaultAtAnyBackendCall  tickets 15/18 (PBS-83): crash while creating a binlog leaves an unopenable storage; a failed metadata save makes the final flush write the data twice
-StorageSurvivesAFaultAtAnyBackendCallOnS3  tickets 15/18 (PBS-83): crash while creating a binlog leaves an unopenable storage; a failed metadata save makes the final flush write the data twice (S3 backend variant)
-StoragePurgeSurvivesAFault  ticket 33: a failed/interrupted removal in purge_binlogs (index already committed, storage_core.cpp:387-430) leaves files the next start refuses ('found metadata for a non-existing binlog'), lead N3
-StoragePurgeSurvivesAFaultOnS3  ticket 33: a failed/interrupted removal in purge_binlogs leaves files the next start refuses, lead N3 (S3 backend variant)
+StorageSurvivesAFaultAtAnyBackendCall  ticket 18 (PBS-83): a failed metadata save makes the final flush write the data twice
+StorageSurvivesAFaultAtAnyBackendCallOnS3  ticket 18 (PBS-83): a failed metadata save makes the final flush write the data twice (S3 backend variant)
 StorageNeverReusesKeystreamAfterCrashRecovery  ticket 32: CTR keystream reuse after crash truncation (recovery truncates the unrecorded tail and the next write reuses the file's key/IV at the same offsets)
 ReplicationSourceMatchesStatementsExactlyOrByPrefix  ticket 31: listener prefix match ignores the delimiter ('SET @source_heartbeat_period', 'SET @slave_uuidx = 1' answered OK, network_service.cpp known_prefix_queries)
 # Release build (release_gcc14, assertions compiled out): how a known bug

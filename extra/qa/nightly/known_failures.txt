@@ -35,3 +35,4 @@ release_gcc14:MisalignedDumpPositionNeverStreamsGarbage  ticket 7 (release): str
 release_gcc14:StorageClosingMidTransactionDropsIt  ticket 6 (release): no assert, the binlog record keeps the dropped events' timestamps ('timestamps do not match the events on disk'), debug aborts at storage.cpp:138
 StorageRestartSurvivesAFault  ticket 37: a failed delete during the startup recovery removes the data file but keeps its metadata, which no later start accepts ('found metadata for a non-existing binlog')
 StorageRestartSurvivesAFaultOnS3  ticket 37: a failed delete during the startup recovery removes the data file but keeps its metadata (S3 backend variant; the shared remove_objects batch, not hit in every run)
+StorageQueryingReportsKeyringErrors  ticket 35: querying_only skips every encrypted binlog when the keyring lacks the KEK or is not configured, and reports success with no binlogs

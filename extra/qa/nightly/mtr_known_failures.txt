@@ -15,6 +15,5 @@
 * storage_empty_binlog_index  ticket 13: empty binlog list after opening dereferences binlog_records_.front()
 * gtid_resume_after_rotation  ticket 14: GTID-mode resume after a rotation misses the closing ROTATE and empty binlogs
 * storage_interrupted_binlog_creation  ticket 15: crash while creating a binlog leaves an unopenable storage
-* rs_switch_to_empty_binlog_rotate  ticket 27: no artificial ROTATE when switching into a binlog that holds only the magic; mysqlbinlog --raw overwrites its copy of the previous binlog
 * rs_source_killed_after_rotation  ticket 6: closing a binlog mid-transaction keeps the dropped events' timestamps (pull aborts at storage.cpp:138 after the source is killed right after a rotation)
 * rs_position_based_replica_gtid_source  ticket 30 (PBS-102): a position-mode PBS of a GTID source reports GTID_MODE = OFF, so no replica can follow it

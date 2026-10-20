@@ -28,7 +28,9 @@
 # ==== References ====
 #
 # Ticket 27: the replication source skips the artificial ROTATE when it
-#            switches to a binary log that holds only the magic.
+#            switches to a binary log that holds only the magic. Fixed
+#            upstream by PBS-99 (4512b38), which also added
+#            rs_rotate_into_empty_binlog.
 
 --source ../include/have_binsrv.inc
 

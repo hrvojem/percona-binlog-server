@@ -30,6 +30,12 @@ into one 'fetch' run:
    transaction boundaries (the checks of fetch_crash_test.py);
 4. without the failure, 'fetch' must exit with 0 and leave exact copies.
 
+Then a few recovery cases: a failure of the binlog index save leaves the
+files of an interrupted binlog creation behind, the next 'fetch' (whose start
+removes them, PBS-59) fails to delete one of them ('unlink'), and a third
+'fetch' without a failure must still recover and leave exact copies
+(ticket 37).
+
 The result of every case is printed as one JSON line and collected in
 '<workdir>/sweep.json'. Uses the helpers of fetch_crash_test.py.
 """
@@ -49,6 +55,40 @@ ERRORS = ["ENOSPC", "EIO"]
 COUNTS = [1, 1000]
 WORKLOAD = [{"rows": [3000, 150_000], "ddl": False},
             {"rows": [500], "ddl": True}]
+# the first failure leaves an interrupted binlog creation behind, the second
+# hits the start that removes its files
+RECOVERY_FIRST = [{"op": operation, "target": "binlog index", "nth": 1,
+                   "count": 1000, "errno": "ENOSPC"}
+                  for operation in ["open", "write", "rename"]]
+RECOVERY_SECOND = [{"op": "unlink", "target": target, "nth": 1, "count": 1,
+                    "errno": "EIO"}
+                   for target in ["binlog metadata", "binlog data"]]
+
+
+def run_recovery_case(first: dict, second: dict, log: Path) -> dict:
+    """One recovery case: 'first' during a rotation, 'second' during the
+    start after it, then a start without a failure."""
+    machine = harness.FetchCrashMachine()
+    result = {"fault": first, "recovery_fault": second}
+    try:
+        machine.start_from_scratch()
+        machine.run_workload(WORKLOAD)
+        machine.fetch_to_the_end()
+        for statement in harness.workload_sql(WORKLOAD):
+            harness.SERVER.sql(statement)
+        result["exit"], injected = harness.fetch_with_disk_fault_once(
+            first, log)
+        result["hit"] = injected > 0
+        result["recovery_exit"], injected = harness.fetch_with_disk_fault_once(
+            second, log)
+        result["recovery_hit"] = injected > 0
+        machine.storage_holds_prefixes()
+        machine.fetch_to_the_end()
+        machine.storage_holds_prefixes()
+        result["recovered"] = True
+    except Exception as failure:  # every case is reported
+        result["failure"] = harness.describe_failure(failure)
+    return result
 
 
 def main():
@@ -99,6 +139,11 @@ def main():
                 result["recovered"] = True
             except Exception as failure:  # every case is reported
                 result["failure"] = harness.describe_failure(failure)
+            print(json.dumps(result), flush=True)
+            results.append(result)
+        for first, second in itertools.product(RECOVERY_FIRST,
+                                               RECOVERY_SECOND):
+            result = run_recovery_case(first, second, log)
             print(json.dumps(result), flush=True)
             results.append(result)
     finally:

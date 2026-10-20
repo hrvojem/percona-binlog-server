@@ -155,7 +155,12 @@ variables:
 
 `disk_fault_sweep.py` uses it to fail every kind of file-system call `fetch`
 makes in its storage directory, one at a time, and checks that the utility
-fails cleanly and the storage stays openable:
+fails cleanly and the storage stays openable. Six recovery cases follow: a
+failed `binlog.index` save during a rotation leaves the new binlog's files
+behind, the next `fetch` (whose start removes them) fails to delete one of
+them (`op=unlink`, which covers `unlink`, `unlinkat` and `remove`), and a
+third `fetch` without a failure must still recover (ticket 37: it does not
+when the metadata file was the one left):
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/disk_fault_sweep.py \
@@ -351,7 +356,7 @@ server rather than starting one.
   build harnesses are skipped when the debug build fails, `fetch_crash_test`
   when the ASan build fails, the release `fetch_crash_test` when the release
   build fails. Tonight's whole run takes about 40-50 min for the
-  C++ stage plus 35-50 min of MTR (9-26 min per version) and 20-35 min of QA harnesses: about 11 min for `pull_replica_test`, `query_race_test` and `fetch_crash_test` on file storage, about 7 min for `fetch_crash_test` on S3 (mostly Hypothesis shrinking the known ticket 14 failure in `gtid/s3`), plus the night's rotation (measured on MySQL 8.4.8: `s3_fault_sweep` 15 min per mode, 84 cases; `disk_fault_sweep` 3-6 min, 80 cases; `network_fault_test` 4-5 min, 37 cases; `source_change_test` 3-4 min per mode, 4 cases; `listener_fuzz_test` about 11 min per mode at 600 connections: about 1 s per connection since the listener always does full `caching_sha2_password` authentication (PBS-10), 2-3 min for 3000 before).
+  C++ stage plus 35-50 min of MTR (9-26 min per version) and 20-35 min of QA harnesses: about 11 min for `pull_replica_test`, `query_race_test` and `fetch_crash_test` on file storage, about 7 min for `fetch_crash_test` on S3 (mostly Hypothesis shrinking the known ticket 14 failure in `gtid/s3`), plus the night's rotation (measured on MySQL 8.4.8: `s3_fault_sweep` 15 min per mode, 84 cases; `disk_fault_sweep` 3-6 min, 80 cases (plus 6 recovery cases, about 1.5 min); `network_fault_test` 4-5 min, 37 cases; `source_change_test` 3-4 min per mode, 4 cases; `listener_fuzz_test` about 11 min per mode at 600 connections: about 1 s per connection since the listener always does full `caching_sha2_password` authentication (PBS-10), 2-3 min for 3000 before).
 
   To try a stage without touching the nightly's own results, select stages
   with `STAGES` (default `cpp mtr qa release`; without `cpp` the debug,

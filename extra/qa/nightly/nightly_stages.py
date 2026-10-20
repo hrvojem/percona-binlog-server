@@ -368,6 +368,10 @@ def harness_cases(args, returncode: int, output: str, lines: list,
             fault = result["fault"]
             name = (f"{mode}/{fault['op']}/{slug(fault['target'])}/"
                     f"{fault['errno']}/x{fault['count']}")
+            if "recovery_fault" in result:
+                second = result["recovery_fault"]
+                name += (f"/then/{second['op']}/{slug(second['target'])}/"
+                         f"{second['errno']}")
             cases.append((name, "failure" in result,
                           summarize(result.get("failure", "")), moment,
                           detail))

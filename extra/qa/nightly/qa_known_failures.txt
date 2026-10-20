@@ -19,7 +19,11 @@ fetch_crash_test gtid  ticket 14: GTID-mode resume after a rotation misses the c
 # the data again: 'binlog.000002: the stored file (308063 bytes) differs
 # from the server's (154699 bytes)' (the S3 'binlog.0' match also hits the
 # binlog.00000N.json objects)
-disk_fault_sweep */[ofrw]*/binlog-metadata/*  ticket 18 (PBS-83): double write after a failed binlog metadata save
+disk_fault_sweep */[ofrw]*/binlog-metadata/*/x*  ticket 18 (PBS-83): double write after a failed binlog metadata save
+# the recovery cases: a failed binlog index save leaves binlog.00000N and its
+# .json behind; the next start fails to delete the .json but removes the data
+# file, and every later start refuses: 'found metadata for a non-existing binlog'
+disk_fault_sweep */binlog-index/*/then/unlink/binlog-metadata/*  ticket 37: a failed delete during the startup recovery removes the data file but keeps its metadata
 # (S3: 6 consecutive failed PUTs outlast the SDK's retries; a stall or a
 # truncated response body does not fail the request)
 s3_fault_sweep */PUT-.json/error50?/x6  ticket 18 (PBS-83): double write after a failed binlog metadata save

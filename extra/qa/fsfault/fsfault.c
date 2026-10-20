@@ -21,7 +21,7 @@
 //   FSFAULT_ROOT   only paths starting with this prefix are affected
 //   FSFAULT_RULES  rules separated by ';', each a list of key=value pairs
 //                  separated by ',':
-//                    op=open|write|fsync|rename|truncate   (required)
+//                    op=open|write|fsync|rename|truncate|unlink (required)
 //                    match=<substring of the path>          (default: any)
 //                    exclude=<substring the path must not contain>
 //                    nth=<n>      skip the first n-1 matching calls (1)
@@ -32,7 +32,8 @@
 //
 // "open" fails opening a file for writing (O_WRONLY / O_RDWR / "w" / "a"),
 // "write" covers write / writev / pwrite, "fsync" covers fsync / fdatasync,
-// "truncate" covers truncate / ftruncate. Build:
+// "truncate" covers truncate / ftruncate, "unlink" covers unlink / unlinkat /
+// remove (std::filesystem::remove calls remove). Build:
 //   gcc -O2 -shared -fPIC -o libfsfault.so fsfault.c -ldl -lpthread
 
 #define _GNU_SOURCE
@@ -52,7 +53,15 @@
 #define MAX_FDS 4096
 #define MAX_PATH_LENGTH 1024
 
-enum op_type { OP_OPEN, OP_WRITE, OP_FSYNC, OP_RENAME, OP_TRUNCATE, OP_NONE };
+enum op_type {
+  OP_OPEN,
+  OP_WRITE,
+  OP_FSYNC,
+  OP_RENAME,
+  OP_TRUNCATE,
+  OP_UNLINK,
+  OP_NONE
+};
 
 struct rule {
   enum op_type op;
@@ -89,6 +98,9 @@ static int (*real_truncate)(const char *, off_t);
 static int (*real_truncate64)(const char *, off_t);
 static int (*real_ftruncate)(int, off_t);
 static int (*real_ftruncate64)(int, off_t);
+static int (*real_unlink)(const char *);
+static int (*real_unlinkat)(int, const char *, int);
+static int (*real_remove)(const char *);
 
 static enum op_type parse_op(const char *name) {
   if (strcmp(name, "open") == 0) return OP_OPEN;
@@ -96,6 +108,7 @@ static enum op_type parse_op(const char *name) {
   if (strcmp(name, "fsync") == 0) return OP_FSYNC;
   if (strcmp(name, "rename") == 0) return OP_RENAME;
   if (strcmp(name, "truncate") == 0) return OP_TRUNCATE;
+  if (strcmp(name, "unlink") == 0) return OP_UNLINK;
   return OP_NONE;
 }
 
@@ -124,6 +137,9 @@ static void initialize(void) {
   real_truncate64 = dlsym(RTLD_NEXT, "truncate64");
   real_ftruncate = dlsym(RTLD_NEXT, "ftruncate");
   real_ftruncate64 = dlsym(RTLD_NEXT, "ftruncate64");
+  real_unlink = dlsym(RTLD_NEXT, "unlink");
+  real_unlinkat = dlsym(RTLD_NEXT, "unlinkat");
+  real_remove = dlsym(RTLD_NEXT, "remove");
 
   const char *root_value = getenv("FSFAULT_ROOT");
   if (root_value != NULL) snprintf(root, sizeof root, "%s", root_value);
@@ -160,8 +176,8 @@ static void initialize(void) {
 }
 
 static void log_failure(enum op_type op, const char *path, int error) {
-  static const char *names[] = {"open", "write", "fsync", "rename",
-                                "truncate"};
+  static const char *names[] = {"open",     "write", "fsync", "rename",
+                                "truncate", "unlink"};
   if (log_path[0] == '\0') return;
   // the real calls, so that logging is never itself a fault
   int fd = real_open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -374,4 +390,26 @@ int ftruncate64(int fd, off_t length) {
   if (error != 0) { errno = error; return -1; }
   return (real_ftruncate64 != NULL ? real_ftruncate64 : real_ftruncate)(
       fd, length);
+}
+
+int unlink(const char *path) {
+  pthread_once(&once, initialize);
+  int error = injected_error(OP_UNLINK, path);
+  if (error != 0) { errno = error; return -1; }
+  return real_unlink(path);
+}
+
+int unlinkat(int dirfd, const char *path, int flags) {
+  pthread_once(&once, initialize);
+  int error = injected_error(OP_UNLINK, path);
+  if (error != 0) { errno = error; return -1; }
+  return real_unlinkat(dirfd, path, flags);
+}
+
+// glibc's remove() calls unlink() internally, not through the PLT
+int remove(const char *path) {
+  pthread_once(&once, initialize);
+  int error = injected_error(OP_UNLINK, path);
+  if (error != 0) { errno = error; return -1; }
+  return real_remove(path);
 }

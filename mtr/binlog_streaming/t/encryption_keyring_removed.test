@@ -7,7 +7,10 @@
 # 'fetch' (streaming mode) must stop with a non-zero exit code and a clear
 # error, and no attempt may change the storage. 'list' (querying-only mode)
 # fails the same way (status "error" naming the missing KEK / keyring) and
-# does not change the storage either.
+# does not change the storage either; in case 1 so do 'search_by_timestamp'
+# and 'search_by_gtid_set'. Since PBS-59 the querying-only mode skips such
+# binlogs instead: 'list' reports success with no binlogs, the searches
+# "Binlog storage is empty" (ticket 35).
 #
 --source ../include/have_binsrv.inc
 
@@ -68,6 +71,16 @@ INSERT INTO t1 VALUES(DEFAULT);
 --exec diff -r $storage_snapshot_path $binsrv_storage_path
 --error 1
 --exec $BINSRV list $binsrv_config_file_path > $binsrv_output_path 2>&1
+--exec grep --silent '"status":"error","message":"found encryption record in the binlog metadata but keyring does not contain the specified KEK ID"' $binsrv_output_path
+--exec diff -r $storage_snapshot_path $binsrv_storage_path
+# the searches name the missing KEK too, instead of reporting an empty
+# storage (ticket 35)
+--error 1
+--exec $BINSRV search_by_timestamp $binsrv_config_file_path 2099-01-01T00:00:00 > $binsrv_output_path 2>&1
+--exec grep --silent '"status":"error","message":"found encryption record in the binlog metadata but keyring does not contain the specified KEK ID"' $binsrv_output_path
+--let $search_server_uuid = `SELECT @@global.server_uuid`
+--error 1
+--exec $BINSRV search_by_gtid_set $binsrv_config_file_path $search_server_uuid:1 > $binsrv_output_path 2>&1
 --exec grep --silent '"status":"error","message":"found encryption record in the binlog metadata but keyring does not contain the specified KEK ID"' $binsrv_output_path
 --exec diff -r $storage_snapshot_path $binsrv_storage_path
 

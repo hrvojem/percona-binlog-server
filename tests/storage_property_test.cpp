@@ -1753,15 +1753,31 @@ void query_concurrently(const std::stop_token &stop,
 
 class storage_harness {
 public:
+  // with 'early_plan', the fault plan is armed before the storage and its
+  // first binlog are created, so that a fault can hit their creation too;
+  // a fault there ends the start (see start_faulted())
   storage_harness(const storage_settings &settings,
-                  checked_properties properties)
+                  checked_properties properties,
+                  fault_plan *early_plan = nullptr)
       : settings_{settings}, properties_{properties},
         location_{make_location()}, config_path_{prepare_config()} {
-    storage_ = make_storage(config_path_);
-    const auto status{storage_->open_binlog(model_.get_current_binlog().name)};
-    require(status == binsrv::open_binlog_status::created,
-            "the first binlog was not reported as created");
-    write_first_binlog_event();
+    if (early_plan != nullptr) {
+      arm(*early_plan);
+    }
+    try {
+      storage_ = make_storage(config_path_);
+      const auto status{
+          storage_->open_binlog(model_.get_current_binlog().name)};
+      require(status == binsrv::open_binlog_status::created,
+              "the first binlog was not reported as created");
+      write_first_binlog_event();
+    } catch (const simulated_crash &) {
+      start_faulted_ = true;
+      return;
+    } catch (const injected_failure &) {
+      start_faulted_ = true;
+      return;
+    }
     restart_tailing_reader();
     if (properties_ == checked_properties::concurrent_read_back) {
       concurrent_reader_ = std::make_unique<operations::sender_context>(
@@ -1780,6 +1796,8 @@ public:
     }
     check();
   }
+
+  [[nodiscard]] bool start_faulted() const noexcept { return start_faulted_; }
 
   // called after the last operation: for the concurrent property, stops the
   // reader and compares what it received with what is on disk
@@ -2209,6 +2227,8 @@ private:
   std::unique_ptr<storage_location> fault_snapshot_{};
   // the plan installed by arm(), to notice a failure a destructor swallowed
   const fault_plan *armed_plan_{nullptr};
+  // an early fault plan hit the creation of the storage or its first binlog
+  bool start_faulted_{false};
   binsrv::storage_ptr storage_{};
   storage_model model_{};
   std::uint64_t event_counter_{0ULL};
@@ -2865,15 +2885,23 @@ void run_storage_property(hegel::TestCase &tc, checked_properties properties,
     if (properties == checked_properties::restart_fault) {
       second = tc.draw("restart_fault", restart_fault_plans());
     }
+    // whether the fault may also hit the creation of the storage and its
+    // first binlog (the interrupted-first-binlog recovery)
+    const bool fault_from_start{tc.draw("fault_from_start", gs::booleans())};
     const fault_injection_scope scope{plan};
-    storage_harness harness{settings, properties};
-    harness.arm(plan);
-    try {
-      for (const auto &op : ops) {
-        harness.apply(op);
+    storage_harness harness{settings, properties,
+                            fault_from_start ? &plan : nullptr};
+    if (!fault_from_start) {
+      harness.arm(plan);
+    }
+    if (!harness.start_faulted()) {
+      try {
+        for (const auto &op : ops) {
+          harness.apply(op);
+        }
+      } catch (const simulated_crash &) {
+      } catch (const injected_failure &) {
       }
-    } catch (const simulated_crash &) {
-    } catch (const injected_failure &) {
     }
     if (!plan.triggered) {
       plan.armed = false;

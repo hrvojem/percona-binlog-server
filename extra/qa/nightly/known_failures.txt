@@ -33,3 +33,5 @@ ReplicationSourceMatchesStatementsExactlyOrByPrefix  ticket 31: listener prefix 
 release_gcc14:IndexedEventBlockIndexesOnlyCompleteEvents  ticket 7 (release): no assert, an event size of 0 never advances the offset and index_ grows until std::bad_alloc (8+ GB RSS; capped by RELEASE_CASE_MEMORY_MB), debug aborts at indexed_event_block.cpp:43
 release_gcc14:MisalignedDumpPositionNeverStreamsGarbage  ticket 7 (release): streams an event cut out of the middle of the stored data, debug throws 'invalid event code in event header'
 release_gcc14:StorageClosingMidTransactionDropsIt  ticket 6 (release): no assert, the binlog record keeps the dropped events' timestamps ('timestamps do not match the events on disk'), debug aborts at storage.cpp:138
+StorageRestartSurvivesAFault  ticket 37: a failed delete during the startup recovery removes the data file but keeps its metadata, which no later start accepts ('found metadata for a non-existing binlog')
+StorageRestartSurvivesAFaultOnS3  ticket 37: a failed delete during the startup recovery removes the data file but keeps its metadata (S3 backend variant; the shared remove_objects batch, not hit in every run)

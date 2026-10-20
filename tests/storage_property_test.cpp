@@ -96,6 +96,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -1494,6 +1495,125 @@ public:
   });
 }
 
+// a fault for the start that follows a first fault: opening the storage
+// (removing temporary objects and the leftovers of an interrupted rotation or
+// purge, truncating the last binlog) and resuming in its last binlog make
+// only a handful of mutating backend calls
+[[nodiscard]] gs::Generator<fault_plan> restart_fault_plans() {
+  return gs::compose([](const hegel::TestCase &tc) {
+    static constexpr std::size_t max_target_call{6U};
+    fault_plan result{};
+    result.target_call = tc.draw(gs::integers<std::size_t>(
+        {.min_value = 1U, .max_value = max_target_call}));
+    result.kind = tc.draw(gs::booleans()) ? fault_kind::crash
+                                          : fault_kind::failure;
+    result.after_call =
+        result.kind == fault_kind::crash && tc.draw(gs::booleans());
+    return result;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// what a storage has recorded
+// ---------------------------------------------------------------------------
+
+// a binlog the storage has recorded: listed in 'binlog.index', with a
+// metadata file whose 'size' its data file holds at least, and that data up
+// to that size. These are the two sources of truth the startup checks rely
+// on (README, "Storage consistency checks"), read here from the objects
+// themselves rather than through storage_core.
+struct recorded_binlog {
+  std::string name;
+  std::uint64_t size;
+  object_bytes data;
+};
+using recorded_binlog_list = std::vector<recorded_binlog>;
+
+// the 'size' member of a binlog metadata file
+[[nodiscard]] std::optional<std::uint64_t>
+recorded_binlog_size(std::string_view metadata) {
+  static constexpr std::string_view key{"\"size\""};
+  auto position{metadata.find(key)};
+  if (position == std::string_view::npos) {
+    return std::nullopt;
+  }
+  position = metadata.find_first_not_of(" \t\r\n:", position + std::size(key));
+  if (position == std::string_view::npos) {
+    return std::nullopt;
+  }
+  std::uint64_t value{0ULL};
+  const auto *const first{std::next(std::data(metadata),
+                                    static_cast<std::ptrdiff_t>(position))};
+  const auto *const last{std::data(metadata) + std::size(metadata)};
+  const auto [end, error]{std::from_chars(first, last, value)};
+  if (error != std::errc{} || end == first) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+[[nodiscard]] recorded_binlog_list
+read_recorded_binlogs(storage_location &location) {
+  recorded_binlog_list result;
+  const auto names{location.object_names()};
+  const auto present{[&names](std::string_view name) {
+    return std::ranges::find(names, name) != std::cend(names);
+  }};
+  const std::string index_name{binsrv::storage_core::default_binlog_index_name};
+  if (!present(index_name)) {
+    return result;
+  }
+  for (const auto &line : split_lines(read_text(location, index_name))) {
+    const auto name{std::filesystem::path{line}.filename().string()};
+    const auto metadata_name{name + ".json"};
+    if (!present(name) || !present(metadata_name)) {
+      continue;
+    }
+    const auto size{recorded_binlog_size(read_text(location, metadata_name))};
+    if (!size.has_value()) {
+      continue;
+    }
+    auto data{location.read(name)};
+    if (std::size(data) < *size) {
+      continue;
+    }
+    data.resize(*size);
+    result.push_back({.name = name, .size = *size, .data = std::move(data)});
+  }
+  return result;
+}
+
+// every binlog recorded before a start is still there after it, holding at
+// least the recorded size, with the recorded data unchanged
+void require_recorded_binlogs_kept(
+    const recorded_binlog_list &recorded, storage_location &location,
+    const binsrv::binlog_record_container &records, const std::string &label) {
+  for (const auto &binlog : recorded) {
+    const auto record_it{std::ranges::find_if(
+        records, [&binlog](const binsrv::binlog_record &record) {
+          return record.name.str() == binlog.name;
+        })};
+    require(record_it != std::cend(records),
+            label + ": the start dropped '" + binlog.name +
+                "', which binlog.index listed with " +
+                std::to_string(binlog.size) + " recorded byte(s)");
+    require(record_it->size >= binlog.size,
+            label + ": the start left " + std::to_string(record_it->size) +
+                " byte(s) of '" + binlog.name + "' instead of the " +
+                std::to_string(binlog.size) + " recorded");
+    const auto names{location.object_names()};
+    require(std::ranges::find(names, binlog.name) != std::cend(names),
+            label + ": the start removed the data file of '" + binlog.name +
+                "'");
+    const auto data{location.read(binlog.name)};
+    require(std::size(data) >= binlog.size &&
+                std::equal(std::cbegin(binlog.data), std::cend(binlog.data),
+                           std::cbegin(data)),
+            label + ": the start changed the recorded data of '" +
+                binlog.name + "'");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // running a sequence of operations
 // ---------------------------------------------------------------------------
@@ -1508,8 +1628,18 @@ enum class checked_properties : std::uint8_t {
   close_mid_transaction,
   concurrent_queries,
   injected_fault,
-  purge_fault
+  purge_fault,
+  recorded_data_kept,
+  restart_fault
 };
+
+// the properties whose writer is hit by an injected fault at a chosen backend
+// call (and so neither crashes by operation nor purges while running)
+[[nodiscard]] bool injects_faults(checked_properties properties) noexcept {
+  return properties == checked_properties::injected_fault ||
+         properties == checked_properties::recorded_data_kept ||
+         properties == checked_properties::restart_fault;
+}
 
 [[nodiscard]] bool reads_back(checked_properties properties) noexcept {
   return properties == checked_properties::read_back ||
@@ -1731,7 +1861,7 @@ public:
       break;
     case operation_kind::crash:
       // with injected faults the crash happens at a chosen backend call
-      if (properties_ != checked_properties::injected_fault &&
+      if (!injects_faults(properties_) &&
           properties_ != checked_properties::purge_fault) {
         crash();
       }
@@ -1749,6 +1879,16 @@ public:
               "the next binlog was not reported as created");
       write_first_binlog_event();
       break;
+    }
+    // an injected failure in the final flush of a storage destructor (a
+    // restart or a purge stops the writer) is swallowed by the destructor:
+    // report it here, so that it is judged by what the next start finds like
+    // any other failure, instead of comparing the reopened storage with a
+    // model that assumed a clean stop
+    if (armed_plan_ != nullptr && armed_plan_->triggered &&
+        armed_plan_->kind == fault_kind::failure) {
+      throw injected_failure{"swallowed by the storage destructor: " +
+                             armed_plan_->triggered_at};
     }
     check();
   }
@@ -2067,6 +2207,8 @@ private:
   std::filesystem::path config_path_;
   // what a process killed by an injected crash left behind
   std::unique_ptr<storage_location> fault_snapshot_{};
+  // the plan installed by arm(), to notice a failure a destructor swallowed
+  const fault_plan *armed_plan_{nullptr};
   binsrv::storage_ptr storage_{};
   storage_model model_{};
   std::uint64_t event_counter_{0ULL};
@@ -2207,8 +2349,7 @@ private:
   // is unsupported: PBS-75)
   void purge(std::size_t requested_count) {
     const auto &binlogs{model_.get_binlogs()};
-    if (properties_ != checked_properties::injected_fault ||
-        std::size(binlogs) < 2U) {
+    if (!injects_faults(properties_) || std::size(binlogs) < 2U) {
       return;
     }
     purge_stopped(requested_count);
@@ -2352,13 +2493,96 @@ public:
                 "' (" + std::to_string(last.size) + ")");
   }
 
-  // installs the crash snapshot for 'plan' and starts counting its calls
-  void arm(fault_plan &plan) {
-    plan.on_crash = [this] {
+  // installs the crash snapshot for 'plan' and starts counting its calls; the
+  // snapshot is a copy of 'source' (by default the writer's storage)
+  void arm(fault_plan &plan, storage_location *source = nullptr) {
+    storage_location &copied{source != nullptr ? *source : *location_};
+    plan.on_crash = [this, &copied] {
       fault_snapshot_ = location_->make_sibling("fault");
-      location_->copy_to(*fault_snapshot_);
+      copied.copy_to(*fault_snapshot_);
     };
     plan.armed = true;
+    armed_plan_ = &plan;
+  }
+
+  // the restart after a fault keeps everything the storage had recorded
+  // (README, "Storage consistency checks": binlog.index and the binlog
+  // metadata are the sources of truth): the next start may remove the
+  // leftovers of an interrupted operation and truncate data the metadata
+  // does not cover, but never drops a recorded binlog or recorded data
+  void check_recorded_data_after_fault(fault_plan &plan) {
+    tailing_reader_.reset();
+    storage_.reset();
+    plan.armed = false;
+    plan.dead = false;
+    const bool crashed{plan.kind == fault_kind::crash};
+    storage_location &leftover{crashed ? *fault_snapshot_ : *location_};
+    const auto config{crashed ? write_config(root_.path(),
+                                             leftover.config_members(),
+                                             settings_)
+                              : config_path_};
+    const auto label{describe_fault(plan, "after a ")};
+    const auto recorded{read_recorded_binlogs(leftover)};
+    require_restart_keeps(recorded, leftover, config, label);
+  }
+
+  // a second fault, during the start that follows the first one (while it
+  // removes leftovers, truncates the last binlog or resumes in it), still
+  // leaves a storage that the start after it opens, with everything that
+  // was recorded before the first restart
+  void check_fault_during_restart(fault_plan &plan,
+                                  const fault_plan &second) {
+    tailing_reader_.reset();
+    storage_.reset();
+    plan.armed = false;
+    plan.dead = false;
+    const auto first_label{describe_fault(plan, "after a ")};
+
+    // the storage the restart finds, copied so that a second crash can be
+    // snapshotted from it
+    const auto restarted{location_->make_sibling("restart")};
+    (plan.kind == fault_kind::crash ? *fault_snapshot_ : *location_)
+        .copy_to(*restarted);
+    const auto restart_config{write_config(
+        root_.path(), restarted->config_members(), settings_)};
+    const auto recorded{read_recorded_binlogs(*restarted)};
+
+    plan.target_call = second.target_call;
+    plan.kind = second.kind;
+    plan.after_call = second.after_call;
+    plan.calls = 0U;
+    plan.triggered = false;
+    plan.triggered_at.clear();
+    arm(plan, restarted.get());
+    try {
+      const auto storage{make_storage(restart_config)};
+      const auto records{storage->get_binlog_records()};
+      if (!records.empty()) {
+        static_cast<void>(storage->open_binlog(records.back().name));
+      }
+    } catch (const std::exception &e) {
+      if (!plan.triggered) {
+        require(false, first_label + ": the restart failed without a "
+                                     "second fault: " + e.what());
+      }
+    }
+    plan.armed = false;
+    plan.dead = false;
+
+    const bool second_crashed{plan.triggered &&
+                              plan.kind == fault_kind::crash};
+    storage_location &leftover{second_crashed ? *fault_snapshot_
+                                              : *restarted};
+    const auto config{second_crashed
+                          ? write_config(root_.path(),
+                                         leftover.config_members(), settings_)
+                          : restart_config};
+    const auto label{
+        first_label +
+        (plan.triggered ? describe_fault(plan, ", then a ") +
+                              " during the restart"
+                        : std::string{", then a restart without a fault"})};
+    require_restart_keeps(recorded, leftover, config, label);
   }
 
   // what the next start finds after the fault: a crashed process leaves the
@@ -2413,6 +2637,44 @@ public:
   }
 
 private:
+  [[nodiscard]] static std::string describe_fault(const fault_plan &plan,
+                                                  std::string_view prefix) {
+    const bool crashed{plan.kind == fault_kind::crash};
+    return std::string{prefix} + (crashed ? "crash " : "failure ") +
+           (crashed && plan.after_call ? "right after " : "at ") +
+           plan.triggered_at;
+  }
+
+  // opens what a fault left behind ('location', through 'config') and
+  // resumes in its last binlog, requiring that every binlog in 'recorded'
+  // is still there with its recorded data, after opening and after resuming
+  void require_restart_keeps(const recorded_binlog_list &recorded,
+                             storage_location &location,
+                             const std::filesystem::path &config,
+                             const std::string &label) {
+    binsrv::storage_ptr reopened;
+    try {
+      reopened = make_storage(config);
+    } catch (const std::exception &e) {
+      require(false,
+              label + ": the storage cannot be opened again: " + e.what());
+    }
+    const auto records{reopened->get_binlog_records()};
+    require_recorded_binlogs_kept(recorded, location, records, label);
+    if (records.empty()) {
+      return;
+    }
+    try {
+      static_cast<void>(reopened->open_binlog(records.back().name));
+    } catch (const std::exception &e) {
+      require(false, label + ": cannot resume in '" +
+                         records.back().name.str() + "': " + e.what());
+    }
+    require_recorded_binlogs_kept(recorded, location,
+                                  reopened->get_binlog_records(),
+                                  label + " (after resuming)");
+  }
+
   // the stored binlogs are consecutive binlogs of the model (a purge stopped
   // by the fault may already have removed some of the oldest); every one
   // but the last holds all of its transactions, the last a prefix of them,
@@ -2494,7 +2756,7 @@ private:
     if (properties_ == checked_properties::model_agreement ||
         properties_ == checked_properties::damaged_files ||
         properties_ == checked_properties::close_mid_transaction ||
-        properties_ == checked_properties::injected_fault ||
+        injects_faults(properties_) ||
         properties_ == checked_properties::purge_fault) {
       const auto expected_position{state.file_size + unflushed +
                                    model_.get_incomplete_size()};
@@ -2594,6 +2856,34 @@ void run_storage_property(hegel::TestCase &tc, checked_properties properties,
       return;
     }
     plan.armed = false;
+    return;
+  }
+  if (properties == checked_properties::recorded_data_kept ||
+      properties == checked_properties::restart_fault) {
+    auto plan{tc.draw("fault", fault_plans())};
+    std::optional<fault_plan> second;
+    if (properties == checked_properties::restart_fault) {
+      second = tc.draw("restart_fault", restart_fault_plans());
+    }
+    const fault_injection_scope scope{plan};
+    storage_harness harness{settings, properties};
+    harness.arm(plan);
+    try {
+      for (const auto &op : ops) {
+        harness.apply(op);
+      }
+    } catch (const simulated_crash &) {
+    } catch (const injected_failure &) {
+    }
+    if (!plan.triggered) {
+      plan.armed = false;
+      return;
+    }
+    if (second.has_value()) {
+      harness.check_fault_during_restart(plan, *second);
+    } else {
+      harness.check_recorded_data_after_fault(plan);
+    }
     return;
   }
   storage_harness harness{settings, properties};
@@ -2961,6 +3251,25 @@ BOOST_AUTO_TEST_CASE(StoragePurgeSurvivesAFault) {
   });
 }
 
+// the start after a kill or a storage error at any backend call never drops
+// a binlog that binlog.index lists, nor data its metadata records, although
+// it may remove leftovers of the interrupted operation and truncate data the
+// metadata does not cover (the startup recovery of PBS-59)
+BOOST_AUTO_TEST_CASE(StorageRestartKeepsRecordedData) {
+  run_property([](hegel::TestCase &tc) {
+    run_storage_property(tc, checked_properties::recorded_data_kept);
+  });
+}
+
+// a second kill or storage error, during the start that recovers from the
+// first one, still leaves a storage that the next start opens with every
+// binlog and all the data recorded before the first fault
+BOOST_AUTO_TEST_CASE(StorageRestartSurvivesAFault) {
+  run_property([](hegel::TestCase &tc) {
+    run_storage_property(tc, checked_properties::restart_fault);
+  });
+}
+
 BOOST_AUTO_TEST_CASE(StorageMatchesModelOnS3) {
   run_s3_storage_property(checked_properties::model_agreement);
 }
@@ -2991,6 +3300,14 @@ BOOST_AUTO_TEST_CASE(StorageSurvivesAFaultAtAnyBackendCallOnS3) {
 
 BOOST_AUTO_TEST_CASE(StoragePurgeSurvivesAFaultOnS3) {
   run_s3_storage_property(checked_properties::purge_fault);
+}
+
+BOOST_AUTO_TEST_CASE(StorageRestartKeepsRecordedDataOnS3) {
+  run_s3_storage_property(checked_properties::recorded_data_kept);
+}
+
+BOOST_AUTO_TEST_CASE(StorageRestartSurvivesAFaultOnS3) {
+  run_s3_storage_property(checked_properties::restart_fault);
 }
 
 // no offset of an encrypted binlog is encrypted twice with the same AES-CTR

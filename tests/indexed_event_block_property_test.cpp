@@ -184,7 +184,7 @@ BOOST_AUTO_TEST_CASE(IndexedEventBlockIndexesOnlyCompleteEvents) {
       return; // clean rejection
     }
 
-    require(block->get_actual_size() <= std::size(original),
+    require(block->get_parsed_size() <= std::size(original),
             "the block is larger than the input");
     std::size_t offset{0U};
     for (std::size_t index{0U}; index < block->get_number_of_events();
@@ -203,7 +203,7 @@ BOOST_AUTO_TEST_CASE(IndexedEventBlockIndexesOnlyCompleteEvents) {
               label + "bytes differ from the input");
       offset += std::size(event);
     }
-    require(offset == block->get_actual_size(),
+    require(offset == block->get_parsed_size(),
             "the indexed events do not add up to the block size");
 
     const auto remaining{std::size(original) - offset};

@@ -8,7 +8,7 @@ GtidSetParseRejectsOutOfRangeGno  ticket 3: gtid_set GNO bounds
 GtidSetAddIntervalRejectsOutOfRangeUpperBound  ticket 3: gtid_set GNO bounds
 GtidSetSubtractIntervalBeyondMaxGnoRemovesTail  ticket 3: gtid_set GNO bounds
 GtidSetDecodedFromBinaryIsPrintable  ticket 3: gtid_set GNO bounds
-IndexedEventBlockIndexesOnlyCompleteEvents  ticket 7: indexed_event_block loops on small event size
+IndexedEventBlockIndexesOnlyCompleteEvents  tickets 7/39: since PBS-29 an invalid type code in the unparsed tail terminates (noexcept extract_event_size_internal); before, a small event size looped
 CipherContextOffsetMatchesCounterReference  ticket 8: CTR counter carry in create_with_offset
 CipherContextDecryptionAtOffsetsRoundTrips  ticket 8: CTR counter carry in create_with_offset
 CipherContextSplitEncryptionMatchesWhole  ticket 8: CTR counter carry (split encryption variant)
@@ -18,8 +18,7 @@ FilesystemStorageUriMatchesModel  ticket 12: file URI with %00 opens the directo
 StorageOpeningOfDamagedFilesFailsCleanly  ticket 36: startup deletes a complete binlog as interrupted-creation garbage when binlog.index is missing or lost its last entry
 StorageOpeningOfDamagedFilesFailsCleanlyOnS3  ticket 36: startup deletes a complete binlog as interrupted-creation garbage when binlog.index is missing or lost its last entry (S3 backend variant)
 EmptyStorageIsPolledUntilTheBinlogArrivesFromPosition  ticket 26 (PBS-96): resuming from a position on an empty storage disconnects the client
-MagicOnlyBinlogIsPolledUntilItsEventsArrive  ticket 26 (PBS-96) follow-up: resuming from a position in a binlog holding only the magic disconnects the client
-MisalignedDumpPositionNeverStreamsGarbage  ticket 7: event size below the common header size at a misaligned dump position aborts / loops
+MisalignedDumpPositionNeverStreamsGarbage  tickets 7/39: since PBS-29 a dump at a misaligned position terminates the process (std::terminate from a noexcept indexed_event_block accessor)
 StorageQueryingLeavesItUnchanged  ticket 28: querying_only open rewrites metadata.json when the config adds encryption (storage_core.cpp:174-178)
 StorageQueryingLeavesItUnchangedOnS3  ticket 28: querying_only open rewrites metadata.json when the config adds encryption (S3 backend variant)
 StorageClosingMidTransactionDropsIt  ticket 6: closing a binlog mid-transaction keeps the dropped events' timestamps (assert at storage.cpp:138)
@@ -30,9 +29,10 @@ StorageNeverReusesKeystreamAfterCrashRecovery  ticket 32: CTR keystream reuse af
 ReplicationSourceMatchesStatementsExactlyOrByPrefix  ticket 31: listener prefix match ignores the delimiter ('SET @source_heartbeat_period', 'SET @slave_uuidx = 1' answered OK, network_service.cpp known_prefix_queries)
 # Release build (release_gcc14, assertions compiled out): how a known bug
 # fails differently there. '<build>:<test case>' lines win for that build.
-release_gcc14:IndexedEventBlockIndexesOnlyCompleteEvents  ticket 7 (release): no assert, an event size of 0 never advances the offset and index_ grows until std::bad_alloc (8+ GB RSS; capped by RELEASE_CASE_MEMORY_MB), debug aborts at indexed_event_block.cpp:43
-release_gcc14:MisalignedDumpPositionNeverStreamsGarbage  ticket 7 (release): streams an event cut out of the middle of the stored data, debug throws 'invalid event code in event header'
+release_gcc14:IndexedEventBlockIndexesOnlyCompleteEvents  tickets 7/39 (release): before PBS-29 an event size of 0 looped until std::bad_alloc; since, std::terminate as in debug (not yet seen in a release run), debug aborts at indexed_event_block.cpp:43
+release_gcc14:MisalignedDumpPositionNeverStreamsGarbage  tickets 7/39 (release): before PBS-29 streamed an event cut out of the stored data; since, std::terminate as in debug (not yet seen in a release run)
 release_gcc14:StorageClosingMidTransactionDropsIt  ticket 6 (release): no assert, the binlog record keeps the dropped events' timestamps ('timestamps do not match the events on disk'), debug aborts at storage.cpp:138
 StorageRestartSurvivesAFault  ticket 37: a failed delete during the startup recovery removes the data file but keeps its metadata, which no later start accepts ('found metadata for a non-existing binlog')
 StorageRestartSurvivesAFaultOnS3  ticket 37: a failed delete during the startup recovery removes the data file but keeps its metadata (S3 backend variant; the shared remove_objects batch, not hit in every run)
 StorageQueryingReportsKeyringErrors  ticket 35: querying_only skips every encrypted binlog when the keyring lacks the KEK or is not configured, and reports success with no binlogs
+EmptyStorageIsPolledUntilTheBinlogArrives  ticket 38: since PBS-29 a dump naming a binlog on an empty storage is refused instead of polled, which reopens the PBS-91 startup race

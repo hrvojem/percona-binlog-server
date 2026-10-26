@@ -140,7 +140,7 @@ FLUSH BINARY LOGS;
 while ($iteration < $max_number_of_attempts)
 {
   --error 0, 1
-  --exec kill -0 $binsrv_pid 2>/dev/null
+  --exec kill -0 `cat $binsrv_pid_file` 2>/dev/null
   --let $binsrv_kill_status = $__error
   if ($binsrv_kill_status != 0)
   {

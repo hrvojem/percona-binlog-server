@@ -65,7 +65,11 @@
 #include "property_test_helpers.hpp"
 
 #include "operations/event_generation_helpers.hpp"
+#include "binsrv/basic_storage_backend.hpp"
+#include "binsrv/storage_backend_factory.hpp"
+
 #include "operations/sender_context.hpp"
+#include "operations/sender_single_file_context.hpp"
 
 #include "binsrv/basic_logger.hpp"
 #include "binsrv/log_severity.hpp"
@@ -76,6 +80,10 @@
 
 #include "binsrv/gtids/gtid.hpp"
 
+#include "binsrv/events/event.hpp"
+#include "binsrv/events/generic_body.hpp"
+#include "binsrv/events/generic_post_header.hpp"
+#include "binsrv/gtids/gtid_set.hpp"
 #include "binsrv/events/code_type.hpp"
 #include "binsrv/events/common_header_flag_type.hpp"
 #include "binsrv/events/common_header_view.hpp"
@@ -191,6 +199,27 @@ make_storage(const std::filesystem::path &config_path) {
   return byte_vector{std::cbegin(buffer), std::cend(buffer)};
 }
 
+// the PREVIOUS_GTIDS_LOG event a server writes right after the
+// FORMAT_DESCRIPTION (empty GTID set, CRC32 like that FORMAT_DESCRIPTION);
+// the sender requires both at the start of every binlog (PBS-29)
+[[nodiscard]] std::vector<std::byte>
+make_previous_gtids_log(std::uint64_t offset, std::uint32_t event_server_id) {
+  binsrv::events::event_storage buffer;
+  [[maybe_unused]] const auto event{
+      binsrv::events::event::create_event<
+          binsrv::events::code_type::previous_gtids_log>(
+          static_cast<std::uint32_t>(offset),
+          util::ctime_timestamp{std::time_t{1}}, event_server_id,
+          binsrv::events::common_header_flag_set{},
+          binsrv::events::generic_post_header<
+              binsrv::events::code_type::previous_gtids_log>{},
+          binsrv::events::generic_body<
+              binsrv::events::code_type::previous_gtids_log>{
+              binsrv::gtids::gtid_set{}},
+          /*include_checksum=*/true, buffer)};
+  return {std::cbegin(buffer), std::cend(buffer)};
+}
+
 // a synthetic event with a valid common header (type code and event size,
 // which is all the streaming side relies on) and distinct content
 [[nodiscard]] byte_vector make_event(std::size_t size, std::uint32_t id) {
@@ -214,13 +243,14 @@ make_storage(const std::filesystem::path &config_path) {
 
 struct seeded_storage {
   binsrv::storage_ptr storage;
-  // [FDE, event_1, event_2, ...] exactly as written to disk
+  // [FDE, PREVIOUS_GTIDS_LOG, event_1, ...] exactly as written to disk
   std::vector<byte_vector> events;
   // the start offset of each entry in 'events'
   std::vector<std::uint64_t> offsets;
 };
 
-// writes a real FDE followed by synthetic events of the given sizes to the
+// writes a real FDE and PREVIOUS_GTIDS_LOG followed by synthetic events of
+// the given sizes to the
 // binlog already open in 'storage', flushed to disk
 [[nodiscard]] seeded_storage
 fill_open_binlog(binsrv::storage_ptr storage,
@@ -240,6 +270,7 @@ fill_open_binlog(binsrv::storage_ptr storage,
   }};
 
   store(make_fde());
+  store(make_previous_gtids_log(offset, server_id));
   std::uint32_t id{first_id};
   for (const auto size : event_sizes) {
     store(make_event(size, id++));
@@ -265,11 +296,14 @@ write_binlog(binsrv::storage_ptr storage,
 }
 
 // the offset of each event 'write_binlog()' will store for 'event_sizes', FDE
-// first, so a test can pick a position before anything is written
+// and PREVIOUS_GTIDS_LOG first, so a test can pick a position before anything
+// is written
 [[nodiscard]] std::vector<std::uint64_t>
 planned_offsets(const std::vector<std::size_t> &event_sizes) {
   std::vector<std::uint64_t> result{events::magic_binlog_offset};
   result.push_back(result.back() + std::size(make_fde()));
+  result.push_back(result.back() +
+                   std::size(make_previous_gtids_log(result.back(), server_id)));
   for (const auto size : event_sizes) {
     result.push_back(result.back() + size);
   }
@@ -289,18 +323,25 @@ void append_flushed(binsrv::storage &storage, util::const_byte_span bytes) {
 
 struct stream_outcome {
   std::vector<byte_vector> events;
-  // get_event() returned false (as opposed to reaching EOF)
+  // get_event() threw (as opposed to reaching the end of the data)
   bool failed;
 };
 
-// reads a sender_context's stream up to EOF or the first error (get_event
-// returns true and an empty span at EOF, false on error)
+// reads a sender_context's stream up to the end of the stored data or the
+// first error (get_event() returns 'waiting' at the end, throws on an error)
 [[nodiscard]] stream_outcome stream_until_end(operations::sender_context &reader,
                                               std::size_t limit) {
   stream_outcome result{.events = {}, .failed = false};
   util::const_byte_span event;
   for (std::size_t guard{0U}; guard != limit + 1U; ++guard) {
-    if (!reader.get_event(event)) {
+    // an error is an exception; 'waiting' (and an empty event) once no
+    // more data is stored
+    try {
+      if (reader.get_event(event) !=
+          operations::event_fetching_result_type::success) {
+        event = {};
+      }
+    } catch (const std::exception &) {
       result.failed = true;
       return result;
     }
@@ -320,40 +361,95 @@ drain(operations::sender_context &reader, std::size_t limit) {
   return std::move(outcome.events);
 }
 
-// keeps every message, so that a test can see what sender_context reports
-// about its storage fetches
-class recording_logger final : public binsrv::basic_logger {
-public:
-  recording_logger() noexcept : basic_logger{binsrv::log_severity::info} {}
+// the byte ranges read from one storage object, recorded by
+// 'read_recording_backend' (the storage offers no other way to observe the
+// sender's reads)
+struct object_reads {
+  std::string name;
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+};
 
-  [[nodiscard]] const std::vector<std::string> &get_messages() const noexcept {
-    return messages_;
-  }
+// forwards to the real backend and records every read of 'reads.name'
+class read_recording_backend final : public binsrv::basic_storage_backend {
+public:
+  read_recording_backend(binsrv::basic_storage_backend_ptr inner,
+                         object_reads &reads)
+      : inner_{std::move(inner)}, reads_{&reads} {}
 
 private:
-  std::vector<std::string> messages_;
+  binsrv::basic_storage_backend_ptr inner_;
+  object_reads *reads_;
 
-  void do_log(std::string_view message) override {
-    messages_.emplace_back(message);
+  [[nodiscard]] binsrv::storage_object_name_container
+  do_list_objects() override {
+    return inner_->list_objects();
+  }
+  [[nodiscard]] util::dynamic_byte_buffer
+  do_get_object(std::string_view name, const util::byte_range &range) override {
+    auto result{inner_->get_object(name, range)};
+    if (name == reads_->name) {
+      reads_->ranges.emplace_back(range.get_offset(), std::size(result));
+    }
+    return result;
+  }
+  void do_put_object(std::string_view name,
+                     util::const_byte_span content) override {
+    inner_->put_object(name, content);
+  }
+  void do_resize_object(std::string_view name,
+                        std::uint64_t new_size) override {
+    inner_->resize_object(name, new_size);
+  }
+  void do_remove_object(std::string_view name) override {
+    inner_->remove_object(name);
+  }
+  void do_fsync() override {}
+  [[nodiscard]] std::uint64_t
+  do_open_stream(std::string_view name,
+                 binsrv::storage_backend_open_stream_mode mode) override {
+    return inner_->open_stream(name, mode);
+  }
+  void do_write_data_to_stream(util::const_byte_span data) override {
+    inner_->write_data_to_stream(data);
+  }
+  void do_close_stream() override { inner_->close_stream(); }
+  [[nodiscard]] std::string do_get_description() const override {
+    return inner_->get_description();
+  }
+  [[nodiscard]] std::string
+  do_get_object_uri(std::string_view name) const override {
+    return inner_->get_object_uri(name);
   }
 };
 
-// the total number of bytes sender_context fetched as event blocks, from its
-// "fetched event block of size N" log messages (the storage offers no other
-// way to observe its reads; a missing message makes the total come up short,
-// so a reworded log line fails the property rather than passing it vacuously)
-[[nodiscard]] std::uint64_t
-total_fetched_block_bytes(const recording_logger &logger) {
-  static constexpr std::string_view marker{
-      "sender : fetched event block of size "};
-  std::uint64_t result{0ULL};
-  for (const auto &message : logger.get_messages()) {
-    const auto position{message.find(marker)};
-    if (position != std::string::npos) {
-      result += std::stoull(message.substr(position + std::size(marker)));
-    }
+// installs a 'read_recording_backend' for every backend the factory creates
+// while it lives
+class read_recording_scope {
+public:
+  explicit read_recording_scope(object_reads &reads) {
+    binsrv::storage_backend_factory::set_test_decorator(
+        [&reads](binsrv::basic_storage_backend_ptr inner)
+            -> binsrv::basic_storage_backend_ptr {
+          return std::make_unique<read_recording_backend>(std::move(inner),
+                                                          reads);
+        });
   }
-  return result;
+  read_recording_scope(const read_recording_scope &) = delete;
+  read_recording_scope &operator=(const read_recording_scope &) = delete;
+  read_recording_scope(read_recording_scope &&) = delete;
+  read_recording_scope &operator=(read_recording_scope &&) = delete;
+  ~read_recording_scope() {
+    binsrv::storage_backend_factory::set_test_decorator({});
+  }
+};
+
+[[nodiscard]] std::string describe_reads(const object_reads &reads) {
+  std::string result;
+  for (const auto &[offset, length] : reads.ranges) {
+    result += (result.empty() ? "" : ", ") + std::to_string(offset) + "+" +
+              std::to_string(length);
+  }
+  return "[" + result + "]";
 }
 
 [[nodiscard]] events::common_header_view header_of(const byte_vector &bytes) {
@@ -407,10 +503,18 @@ is_artificial_rotate_to(const byte_vector &bytes,
          rotate_position(bytes) == position && stored_name == name;
 }
 
+// mostly small events, some larger than any block (block_sizes()), which
+// the sender has to fetch again with the event's size
 [[nodiscard]] gs::Generator<std::vector<std::size_t>> event_size_lists() {
-  return gs::vectors(gs::integers<std::size_t>(
-      {.min_value = events::common_header_view_base::size_in_bytes,
-       .max_value = 200U}));
+  static constexpr std::size_t max_large_event_size{
+      3U * operations::sender_single_file_context::min_allowed_block_size};
+  return gs::vectors(gs::one_of(
+      {gs::integers<std::size_t>(
+           {.min_value = events::common_header_view_base::size_in_bytes,
+            .max_value = 200U}),
+       gs::integers<std::size_t>(
+           {.min_value = events::common_header_view_base::size_in_bytes,
+            .max_value = max_large_event_size})}));
 }
 
 // the size of a single event that can be split into a non-empty prefix and a
@@ -422,10 +526,12 @@ is_artificial_rotate_to(const byte_vector &bytes,
 }
 
 [[nodiscard]] gs::Generator<std::size_t> block_sizes() {
-  // the reader needs at least a full common header per block
+  // the sender requires blocks of at least min_allowed_block_size (PBS-29;
+  // the listener uses 1 MiB)
+  static constexpr auto min_block_size{
+      operations::sender_single_file_context::min_allowed_block_size};
   return gs::integers<std::size_t>(
-      {.min_value = events::common_header_view_base::size_in_bytes,
-       .max_value = 512U});
+      {.min_value = min_block_size, .max_value = 2U * min_block_size});
 }
 
 BOOST_AUTO_TEST_CASE(FromBeginningStreamsPreambleAndEvents) {
@@ -541,6 +647,8 @@ BOOST_AUTO_TEST_CASE(EveryStoredByteIsFetchedOnce) {
     const auto sizes{tc.draw("sizes", event_size_lists())};
     const auto block_size{tc.draw("block", block_sizes())};
 
+    object_reads reads{.name = the_binlog.str(), .ranges = {}};
+    const read_recording_scope scope{reads};
     const auto seeded{seed(directory.path(), sizes)};
     // 0 streams from the beginning, any other index resumes at that event
     const auto start_index{tc.draw(
@@ -552,8 +660,8 @@ BOOST_AUTO_TEST_CASE(EveryStoredByteIsFetchedOnce) {
     const std::string binlog_name{from_beginning ? std::string{}
                                                  : the_binlog.str()};
 
-    const auto logger{std::make_shared<recording_logger>()};
-    operations::sender_context reader{logger,
+    reads.ranges.clear();
+    operations::sender_context reader{std::make_shared<binsrv::null_logger>(),
                                       seeded.storage,
                                       block_size,
                                       binlog_name,
@@ -569,39 +677,55 @@ BOOST_AUTO_TEST_CASE(EveryStoredByteIsFetchedOnce) {
 
     const auto file_size{seeded.offsets.back() +
                          std::size(seeded.events.back())};
-    const auto fetched{total_fetched_block_bytes(*logger)};
-    require(fetched == file_size - start_position,
-            "fetched " + std::to_string(fetched) +
-                " byte(s) as event blocks to stream the " +
-                std::to_string(file_size - start_position) +
-                " byte(s) stored from position " +
-                std::to_string(start_position));
+    // the first read takes the preamble (FORMAT_DESCRIPTION and
+    // PREVIOUS_GTIDS_LOG, PBS-29) and may cover events after it, which the
+    // event loop can read once more; the event loop itself reads every byte
+    // from the starting position on exactly once, unless the preamble read
+    // already covered it
+    require(!reads.ranges.empty(), "the binlog was never read");
+    const auto [preamble_offset, preamble_length]{reads.ranges.front()};
+    std::vector<std::size_t> times_read(file_size, 0U);
+    for (std::size_t index{1U}; index < std::size(reads.ranges); ++index) {
+      const auto [offset, length]{reads.ranges[index]};
+      for (auto position{offset};
+           position < offset + length && position < file_size; ++position) {
+        ++times_read[position];
+      }
+    }
+    for (auto position{start_position}; position < file_size; ++position) {
+      const bool in_preamble_read{position >= preamble_offset &&
+                                  position <
+                                      preamble_offset + preamble_length};
+      require(times_read[position] == 1U ||
+                  (times_read[position] == 0U && in_preamble_read),
+              "byte " + std::to_string(position) + " of " +
+                  std::to_string(file_size) + " was read " +
+                  std::to_string(times_read[position]) +
+                  " time(s) by the event loop to stream from position " +
+                  std::to_string(start_position) + "; reads " +
+                  describe_reads(reads));
+    }
   });
 }
 
-// a partially written last event is not streamed: the reader reports EOF
-// (also after further, still incomplete, pieces arrive) and, once the rest of
-// the event lands, carries on with it and what follows byte for byte
-BOOST_AUTO_TEST_CASE(PartialEventAtEofIsStreamedOnceCompleted) {
+// a binlog whose last event is incomplete is corrupt: the collector only
+// stores complete events (whole transactions), and the reader of the active
+// binlog sees only what the storage has recorded, so since PBS-29 the reader
+// streams the complete events, then fails rather than streaming part of the
+// last one or waiting for the rest (the reader of PBS-65 waited instead)
+BOOST_AUTO_TEST_CASE(PartialEventAtEofFailsCleanly) {
   run_property([](hegel::TestCase &tc) {
     const temp_dir directory;
     const auto sizes{tc.draw("sizes", event_size_lists())};
     const auto block_size{tc.draw("block", block_sizes())};
     const auto pending_size{tc.draw("pending_size", splittable_event_sizes())};
-    // where the pending event is split into the pieces written one by one
-    auto cuts{tc.draw(
-        "cuts", gs::vectors(gs::integers<std::size_t>(
-                                {.min_value = 1U, .max_value = pending_size - 1U}),
-                            {.min_size = 1U, .max_size = 3U}))};
-    std::ranges::sort(cuts);
-    cuts.erase(std::ranges::unique(cuts).begin(), std::end(cuts));
-    const auto later_sizes{tc.draw("later_sizes", event_size_lists())};
+    const auto kept{tc.draw(
+        "kept", gs::integers<std::size_t>(
+                    {.min_value = 1U, .max_value = pending_size - 1U}))};
 
     const auto seeded{seed(directory.path(), sizes)};
     const auto pending{make_event(pending_size, 1'000'000U)};
-    const util::const_byte_span pending_span{pending};
-
-    append_flushed(*seeded.storage, pending_span.first(cuts.front()));
+    append_flushed(*seeded.storage, util::const_byte_span{pending}.first(kept));
     operations::sender_context reader{
         std::make_shared<binsrv::null_logger>(),
         seeded.storage,
@@ -610,46 +734,22 @@ BOOST_AUTO_TEST_CASE(PartialEventAtEofIsStreamedOnceCompleted) {
         events::magic_binlog_offset,
         /*session_source_binlog_checksum=*/true};
 
-    const auto before{drain(reader, std::size(seeded.events) + 1U)};
-    require(std::size(before) == std::size(seeded.events) + 1U,
-            "with the last event incomplete, expected the artificial ROTATE "
-            "and the complete stored events only");
+    // the limit leaves room for the partial event, so a reader that streams
+    // it ends at the end of the data instead of tripping the guard
+    const auto outcome{stream_until_end(reader, std::size(seeded.events) + 3U)};
+    require(outcome.failed,
+            "the binlog ending in a partial event was streamed without a "
+            "failure (" +
+                std::to_string(std::size(outcome.events)) +
+                " event(s) emitted)");
+    require(std::size(outcome.events) == std::size(seeded.events) + 1U,
+            "expected the artificial ROTATE and the complete stored events "
+            "before the failure, got " +
+                std::to_string(std::size(outcome.events)) + " event(s)");
     for (std::size_t index{0U}; index != std::size(seeded.events); ++index) {
-      require(before[index + 1U] == seeded.events[index],
+      require(outcome.events[index + 1U] == seeded.events[index],
               "stored event " + std::to_string(index) +
                   " was not streamed byte for byte");
-    }
-
-    // the remaining pieces but the last one: still no complete event
-    for (std::size_t index{1U}; index != std::size(cuts); ++index) {
-      append_flushed(*seeded.storage,
-                     pending_span.subspan(cuts[index - 1U],
-                                          cuts[index] - cuts[index - 1U]));
-      require(drain(reader, 0U).empty(),
-              "an event was streamed before its last " +
-                  std::to_string(pending_size - cuts[index]) +
-                  " byte(s) were written");
-    }
-
-    // the last piece completes the event, then more events follow
-    append_flushed(*seeded.storage, pending_span.subspan(cuts.back()));
-    std::vector<byte_vector> expected{pending};
-    std::uint32_t id{2'000'000U};
-    for (const auto size : later_sizes) {
-      expected.push_back(make_event(size, id++));
-      append_flushed(*seeded.storage, util::const_byte_span{expected.back()});
-    }
-
-    const auto after{drain(reader, std::size(expected))};
-    require(std::size(after) == std::size(expected),
-            "expected " + std::to_string(std::size(expected)) +
-                " event(s) after the pending event was completed, got " +
-                std::to_string(std::size(after)));
-    for (std::size_t index{0U}; index != std::size(expected); ++index) {
-      require(after[index] == expected[index],
-              "event " + std::to_string(index) +
-                  " after the pending one was completed was not streamed "
-                  "byte for byte");
     }
   });
 }

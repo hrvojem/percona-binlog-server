@@ -222,6 +222,7 @@ if(WITH_PROPERTY_TESTS)
   add_executable(storage_property_test
     storage_property_test.cpp
     "${PROJECT_SOURCE_DIR}/src/operations/sender_context.cpp"
+    "${PROJECT_SOURCE_DIR}/src/operations/sender_single_file_context.cpp"
     # sender_context now builds the artificial preamble through the event
     # generators, so it needs them linked in too
     "${PROJECT_SOURCE_DIR}/src/operations/event_generation_helpers.cpp"
@@ -306,6 +307,7 @@ if(WITH_PROPERTY_TESTS)
     "${PROJECT_SOURCE_DIR}/src/minimysql/connection_context.cpp"
     "${PROJECT_SOURCE_DIR}/src/minimysql/caching_sha2_password_authenticator.cpp"
     "${PROJECT_SOURCE_DIR}/src/operations/sender_context.cpp"
+    "${PROJECT_SOURCE_DIR}/src/operations/sender_single_file_context.cpp"
     "${PROJECT_SOURCE_DIR}/src/operations/event_generation_helpers.cpp"
   )
   target_include_directories(replication_source_property_test
@@ -415,6 +417,7 @@ if(WITH_PROPERTY_TESTS)
   add_executable(sender_context_property_test
     sender_context_property_test.cpp
     "${PROJECT_SOURCE_DIR}/src/operations/sender_context.cpp"
+    "${PROJECT_SOURCE_DIR}/src/operations/sender_single_file_context.cpp"
     "${PROJECT_SOURCE_DIR}/src/operations/event_generation_helpers.cpp"
   )
   target_include_directories(sender_context_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")

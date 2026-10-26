@@ -190,7 +190,7 @@ EOF
 --echo *** Sending SIGTERM to the mysqlbinlog client and waiting for it to
 --echo *** terminate.
 --error 0, 1
---exec kill -0 $client_pid 2>/dev/null
+--exec kill -0 `cat $client_pid_file` 2>/dev/null
 --let $client_kill_status = $__error
 if ($client_kill_status == 0)
 {

@@ -150,7 +150,10 @@
 #include "binsrv/events/common_header_flag_type.hpp"
 #include "binsrv/events/common_header_view.hpp"
 #include "binsrv/events/composite_binlog_name.hpp"
+#include "binsrv/events/event.hpp"
 #include "binsrv/events/event_fwd.hpp"
+#include "binsrv/events/generic_body.hpp"
+#include "binsrv/events/generic_post_header.hpp"
 #include "binsrv/events/protocol_traits_fwd.hpp"
 
 #include "binsrv/gtids/common_types.hpp"
@@ -160,6 +163,7 @@
 
 #include "operations/event_generation_helpers.hpp"
 #include "operations/sender_context.hpp"
+#include "operations/sender_single_file_context.hpp"
 
 #include "util/byte_range.hpp"
 #include "util/byte_span.hpp"
@@ -634,6 +638,9 @@ std::ostream &operator<<(std::ostream &output, const operation &op) {
 constexpr std::size_t min_event_size{
     binsrv::events::common_header_view_base::size_in_bytes};
 constexpr std::size_t max_event_size{512U};
+// larger than the largest reader block, see storage_settings_generator()
+constexpr std::size_t max_large_event_size{
+    3U * operations::sender_single_file_context::min_allowed_block_size};
 
 [[nodiscard]] gs::Generator<operation>
 operations(bool with_close_mid_transaction = false) {
@@ -664,8 +671,11 @@ operations(bool with_close_mid_transaction = false) {
           {.min_value = 1U, .max_value = max_purge_count}));
     }
     if (kind == operation_kind::write_event) {
-      result.event_size = tc.draw(gs::integers<std::size_t>(
-          {.min_value = min_event_size, .max_value = max_event_size}));
+      result.event_size = tc.draw(gs::one_of(
+          {gs::integers<std::size_t>(
+               {.min_value = min_event_size, .max_value = max_event_size}),
+           gs::integers<std::size_t>({.min_value = min_event_size,
+                                      .max_value = max_large_event_size})}));
       result.at_transaction_boundary = tc.draw(gs::booleans());
       result.timestamp = tc.draw(gs::integers<std::uint32_t>(
           {.min_value = 0U,
@@ -680,17 +690,14 @@ operations(bool with_close_mid_transaction = false) {
   return gs::compose([](const hegel::TestCase &tc) {
     static constexpr std::uint64_t min_checkpoint_size{64ULL};
     static constexpr std::uint64_t max_checkpoint_size{4096ULL};
-    // block sizes smaller than one event make the reader re-fetch with the
-    // exact event size, larger ones make it split blocks into several events;
-    // a block must hold at least one common header (the server uses 1 MiB
-    // blocks, and sender_context treats a shorter block as corruption)
-    static constexpr std::size_t max_small_block_size{64U};
-    static constexpr std::size_t max_block_size{4096U};
-    const auto block_sizes{gs::one_of(
-        {gs::integers<std::size_t>(
-             {.min_value = min_event_size, .max_value = max_small_block_size}),
-         gs::integers<std::size_t>(
-             {.min_value = min_event_size, .max_value = max_block_size})})};
+    // the sender requires blocks of at least min_allowed_block_size (PBS-29;
+    // the listener uses 1 MiB blocks); events larger than a block
+    // (max_large_event_size) make the reader re-fetch with the exact event
+    // size, smaller ones make it split blocks into several events
+    static constexpr auto min_block_size{
+        operations::sender_single_file_context::min_allowed_block_size};
+    const auto block_sizes{gs::integers<std::size_t>(
+        {.min_value = min_block_size, .max_value = 2U * min_block_size})};
     storage_settings result{.s3 = std::nullopt,
                             .gtid_mode = tc.draw(gs::booleans()),
                             .checkpoint_size = std::nullopt,
@@ -1086,9 +1093,19 @@ void read_until_end(operations::sender_context &reader, event_list &received,
     require(reads <= max_events,
             std::string{label} + ": the reader returned more events than "
                                  "are on disk");
-    require(reader.get_event(event),
-            std::string{label} + ": sender_context::get_event() failed after " +
-                std::to_string(std::size(received)) + " event(s)");
+    // an error is an exception; 'waiting' (and an empty event) once no more
+    // data is stored
+    try {
+      if (reader.get_event(event) !=
+          operations::event_fetching_result_type::success) {
+        event = {};
+      }
+    } catch (const std::exception &e) {
+      require(false, std::string{label} +
+                         ": sender_context::get_event() failed after " +
+                         std::to_string(std::size(received)) +
+                         " event(s): " + e.what());
+    }
     if (event.empty()) {
       return;
     }
@@ -1200,6 +1217,27 @@ std::ostream &operator<<(std::ostream &output, const damage &value) {
     return static_cast<char>(std::to_integer<unsigned char>(value));
   });
   return result;
+}
+
+// the PREVIOUS_GTIDS_LOG event a server writes right after the
+// FORMAT_DESCRIPTION (empty GTID set, CRC32 like that FORMAT_DESCRIPTION);
+// the sender requires both at the start of every binlog (PBS-29)
+[[nodiscard]] std::vector<std::byte>
+make_previous_gtids_log(std::uint64_t offset, std::uint32_t event_server_id) {
+  binsrv::events::event_storage buffer;
+  [[maybe_unused]] const auto event{
+      binsrv::events::event::create_event<
+          binsrv::events::code_type::previous_gtids_log>(
+          static_cast<std::uint32_t>(offset),
+          util::ctime_timestamp{std::time_t{1}}, event_server_id,
+          binsrv::events::common_header_flag_set{},
+          binsrv::events::generic_post_header<
+              binsrv::events::code_type::previous_gtids_log>{},
+          binsrv::events::generic_body<
+              binsrv::events::code_type::previous_gtids_log>{
+              binsrv::gtids::gtid_set{}},
+          /*include_checksum=*/true, buffer)};
+  return {std::cbegin(buffer), std::cend(buffer)};
 }
 
 void write_text(storage_location &location, std::string_view name,
@@ -1668,11 +1706,11 @@ void read_concurrently(const std::stop_token &stop,
   util::const_byte_span event{};
   try {
     while (true) {
-      if (!reader.get_event(event)) {
-        result.error = "sender_context::get_event() failed after " +
-                       std::to_string(std::size(result.received)) +
-                       " event(s)";
-        return;
+      // an error is an exception (reported below); 'waiting' (and an empty
+      // event) once no more data is stored
+      if (reader.get_event(event) !=
+          operations::event_fetching_result_type::success) {
+        event = {};
       }
       if (!event.empty()) {
         result.received.emplace_back(std::cbegin(event), std::cend(event));
@@ -2395,8 +2433,9 @@ private:
                 op.at_transaction_boundary);
   }
 
-  // the first event of every binlog is a real FORMAT_DESCRIPTION, as a server
-  // sends it; the reworked sender_context fetches it to start streaming, so
+  // the first events of every binlog are a real FORMAT_DESCRIPTION and a
+  // PREVIOUS_GTIDS_LOG, as a server sends them; the sender fetches both to
+  // start streaming (PBS-29), so
   // the read-back properties need it on disk (the others keep their synthetic
   // events only)
   void write_first_binlog_event() {
@@ -2408,7 +2447,13 @@ private:
         buffer, fde_server_version, binsrv::events::magic_binlog_offset,
         fde_server_id, /*enable_checksum_algorithm=*/true,
         /*artificial=*/false);
+    // as in the collector, the FORMAT_DESCRIPTION is not a transaction
+    // boundary on its own: it is flushed together with the PREVIOUS_GTIDS_LOG
     store_event({std::cbegin(buffer), std::cend(buffer)},
+                util::ctime_timestamp{std::time_t{1}}, /*at_boundary=*/false);
+    store_event(make_previous_gtids_log(binsrv::events::magic_binlog_offset +
+                                            std::size(buffer),
+                                        fde_server_id),
                 util::ctime_timestamp{std::time_t{1}}, /*at_boundary=*/true);
   }
 

@@ -21,7 +21,8 @@
 // complete events. Its input comes from storage files, which can be
 // truncated (a crash) or corrupted, so for any bytes it must either reject
 // them cleanly (std::logic_error and its descendants, as the event parsers
-// do) or produce an index that is consistent with the bytes.
+// do, or std::runtime_error, as the constructor does for an abnormal event
+// size since PBS-29) or produce an index that is consistent with the bytes.
 
 #include <algorithm>
 #include <cstddef>
@@ -182,6 +183,8 @@ BOOST_AUTO_TEST_CASE(IndexedEventBlockIndexesOnlyCompleteEvents) {
       block.emplace(original);
     } catch (const std::logic_error &) {
       return; // clean rejection
+    } catch (const std::runtime_error &) {
+      return; // clean rejection (an abnormal event size, since PBS-29)
     }
 
     require(block->get_parsed_size() <= std::size(original),

@@ -115,10 +115,16 @@
 #include "binsrv/storage.hpp"
 
 #include "binsrv/events/composite_binlog_name.hpp"
+#include "binsrv/events/code_type.hpp"
+#include "binsrv/events/common_header_flag_type.hpp"
+#include "binsrv/events/event.hpp"
 #include "binsrv/events/event_fwd.hpp"
+#include "binsrv/events/generic_body.hpp"
+#include "binsrv/events/generic_post_header.hpp"
 #include "binsrv/events/protocol_traits_fwd.hpp"
 
 #include "binsrv/gtids/gtid.hpp"
+#include "binsrv/gtids/gtid_set.hpp"
 
 #include "minimysql/connection_context.hpp"
 #include "minimysql/connection_context_fwd.hpp"
@@ -253,6 +259,27 @@ std::ostream &operator<<(std::ostream &output, const source_settings &value) {
 // (a FORMAT_DESCRIPTION event, so that a dump has something to stream) and
 // the listener serving it, with its io_context running on its own thread as
 // in pull_operation.cpp
+// the PREVIOUS_GTIDS_LOG event a server writes right after the
+// FORMAT_DESCRIPTION (empty GTID set, CRC32 like that FORMAT_DESCRIPTION);
+// the sender requires both at the start of every binlog (PBS-29)
+[[nodiscard]] std::vector<std::byte>
+make_previous_gtids_log(std::uint64_t offset, std::uint32_t event_server_id) {
+  binsrv::events::event_storage buffer;
+  [[maybe_unused]] const auto event{
+      binsrv::events::event::create_event<
+          binsrv::events::code_type::previous_gtids_log>(
+          static_cast<std::uint32_t>(offset),
+          util::ctime_timestamp{std::time_t{1}}, event_server_id,
+          binsrv::events::common_header_flag_set{},
+          binsrv::events::generic_post_header<
+              binsrv::events::code_type::previous_gtids_log>{},
+          binsrv::events::generic_body<
+              binsrv::events::code_type::previous_gtids_log>{
+              binsrv::gtids::gtid_set{}},
+          /*include_checksum=*/true, buffer)};
+  return {std::cbegin(buffer), std::cend(buffer)};
+}
+
 class replication_source {
 public:
   explicit replication_source(const source_settings &settings) {
@@ -374,6 +401,13 @@ private:
         binsrv::events::magic_binlog_offset, fde_server_id,
         /*enable_checksum_algorithm=*/true, /*artificial=*/false);
     storage_->write_event(util::const_byte_span{buffer},
+                          /*at_transaction_boundary=*/true,
+                          binsrv::gtids::gtid{},
+                          util::ctime_timestamp{std::time_t{1}}, 0ULL);
+    const auto previous_gtids{make_previous_gtids_log(
+        binsrv::events::magic_binlog_offset + std::size(buffer),
+        fde_server_id)};
+    storage_->write_event(util::const_byte_span{previous_gtids},
                           /*at_transaction_boundary=*/true,
                           binsrv::gtids::gtid{},
                           util::ctime_timestamp{std::time_t{1}}, 0ULL);
@@ -602,10 +636,12 @@ public:
   }
 
   // server greeting, client greeting with the caching_sha2_password scramble,
-  // then the full authentication over an unencrypted connection, as a MySQL
-  // client with --get-server-public-key does it: "perform full
-  // authentication", a request for the server's RSA public key, the password
-  // XOR the scramble encrypted with that key (RSA-OAEP), and OK
+  // then either the fast path (a user the listener has authenticated before:
+  // "fast authentication succeeded" and OK) or the full authentication over
+  // an unencrypted connection, as a MySQL client with --get-server-public-key
+  // does it: "perform full authentication", a request for the server's RSA
+  // public key, the password XOR the scramble encrypted with that key
+  // (RSA-OAEP), and OK
   void authenticate(std::string_view user, std::string_view password) {
     const auto greeting{read_frame()};
     require(greeting.has_value(), "no server greeting");
@@ -636,13 +672,24 @@ public:
         ""};
     write_frame(encode_client_frame(1U, client_greeting, capabilities_));
 
-    // "perform full authentication" (0x01 0x04)
+    // "fast authentication succeeded" (0x01 0x03) and OK for a user the
+    // listener has authenticated before (PBS-10 part 3), otherwise "perform
+    // full authentication" (0x01 0x04)
     const auto full_auth{read_frame()};
     require(full_auth.has_value() &&
                 std::size(*full_auth) == frame_header_size + 2U &&
                 (*full_auth)[frame_header_size] == '\x01' &&
-                (*full_auth)[frame_header_size + 1U] == '\x04',
-            "no 'perform full authentication' after the client greeting");
+                ((*full_auth)[frame_header_size + 1U] == '\x03' ||
+                 (*full_auth)[frame_header_size + 1U] == '\x04'),
+            "neither 'fast authentication succeeded' nor 'perform full "
+            "authentication' after the client greeting");
+    if ((*full_auth)[frame_header_size + 1U] == '\x03') {
+      const auto fast_ok{read_frame()};
+      require(fast_ok.has_value() && std::size(*fast_ok) > frame_header_size &&
+                  (*fast_ok)[frame_header_size] == '\0',
+              "no OK after 'fast authentication succeeded'");
+      return;
+    }
     // request the public key (0x02); the reply is 0x01 followed by its PEM
     write_frame(raw_client_frame(3U, std::string_view{"\x02", 1U}));
     const auto public_key{read_frame()};

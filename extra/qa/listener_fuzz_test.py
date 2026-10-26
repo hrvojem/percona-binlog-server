@@ -206,10 +206,11 @@ class Listener:
         self.send(frame(1, greeting_payload(
             BASE_CAPABILITIES, PULL_USER.encode(), response,
             b"caching_sha2_password")))
-        # fast auth (0x01 0x03) then OK; or, as the listener does since
-        # PBS-10 (it has no auth cache), "perform full authentication"
-        # (0x01 0x04): request the public key (0x02), then send the password
-        # XOR the salt, RSA-OAEP encrypted with it; read until an OK/ERR
+        # fast auth (0x01 0x03) then OK, as the listener answers a user it
+        # has already authenticated since PBS-10 part 3; or, for the first
+        # login, "perform full authentication" (0x01 0x04): request the
+        # public key (0x02), then send the password XOR the salt, RSA-OAEP
+        # encrypted with it; read until an OK/ERR
         for _ in range(6):
             read = self.read_frame()
             if read is None:

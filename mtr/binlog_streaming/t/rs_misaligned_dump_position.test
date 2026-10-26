@@ -1,0 +1,124 @@
+#
+# Checks that a COM_BINLOG_DUMP from a position that is not an event
+# boundary fails for that client only: the Binlog Server replication source
+# ('pull' mode) must keep running and keep serving other clients, as a MySQL
+# source does (it answers ER 1236).
+#
+# Since PBS-29 part 1 the bytes at such a position reach a noexcept accessor
+# of indexed_event_block that throws, and the whole process ends with
+# std::terminate (ticket 39).
+#
+--source ../include/have_binsrv.inc
+
+--source ../include/v80_v84_compatibility_defines.inc
+
+--source include/count_sessions.inc
+
+# in case of --repeat=N, we need to start from a fresh binary log to make
+# this test deterministic
+--disable_query_log
+eval $stmt_reset_binary_logs_and_gtids;
+--enable_query_log
+
+# identifying backend storage type ('file' or 's3')
+--source ../include/identify_storage_backend.inc
+
+# creating data directory, configuration file, etc.
+--let $binsrv_connect_timeout = 3
+--let $binsrv_read_timeout = 3
+--let $binsrv_idle_time = 1
+--let $binsrv_verify_checksum = TRUE
+--let $binsrv_replication_mode = position
+--source ../include/set_up_auth_rsa_keys.inc
+--source ../include/set_up_binsrv_environment.inc
+
+--echo
+--echo *** Determining the first binary log name.
+--let $first_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+
+--echo
+--echo *** Creating source_db.tbl and inserting the first batch of rows.
+CREATE DATABASE source_db;
+CREATE TABLE source_db.tbl(
+  id INT UNSIGNED NOT NULL,
+  value VARCHAR(32) NOT NULL,
+  PRIMARY KEY(id)
+) ENGINE=InnoDB;
+INSERT INTO source_db.tbl VALUES (1, 'first_batch_one'), (2, 'first_batch_two');
+
+--echo
+--echo *** Remembering the position after the first batch.
+--let $position_after_first_batch = query_get_value($stmt_show_binary_log_status, Position, 1)
+
+--echo
+--echo *** Inserting the second batch of rows in the same binary log.
+INSERT INTO source_db.tbl VALUES (3, 'second_batch_three');
+
+--echo
+--echo *** Flushing the source binary log and inserting the third batch.
+FLUSH BINARY LOGS;
+--let $second_binlog = query_get_value($stmt_show_binary_log_status, File, 1)
+INSERT INTO source_db.tbl VALUES (4, 'third_batch_four');
+
+--echo
+--echo *** Fetching the source binary logs.
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null
+
+--echo
+--echo *** Starting Binlog Server Utility in background in pull mode.
+--let $proc_command_line = $BINSRV pull $binsrv_config_file_path > /dev/null
+--source ../include/start_proc_in_background.inc
+
+--echo
+--echo *** Waiting for the replication source listener port ready to accept
+--echo *** connections.
+--let $listening_port = $binsrv_replication_source_port
+--let $listening_host = 127.0.0.1
+--source ../include/wait_for_listening_port.inc
+
+--echo
+--echo *** Dumping from a position 5 bytes past the end of the first batch,
+--echo *** inside the header of the next event: the dump must fail.
+--let $misaligned_position = `SELECT $position_after_first_batch + 5`
+--error 1
+--exec $MYSQL_BINLOG --read-from-remote-server --host=127.0.0.1 --port=$binsrv_replication_source_port --user=rpl --password=password --default-auth=caching_sha2_password --get-server-public-key --start-position=$misaligned_position $first_binlog > /dev/null 2>&1
+
+--echo
+--echo *** The Binlog Server Utility must still be running.
+--sleep 1
+--error 0, 1
+--exec kill -0 `cat $proc_pid_file` 2>/dev/null
+if ($__error != 0)
+{
+  --die The Binlog Server Utility terminated after a dump from a misaligned position (ticket 39)
+}
+
+--echo
+--echo *** And still serve a dump from a position at an event boundary.
+--let $dump_from_position = $MYSQL_TMP_DIR/rs_misaligned_dump_position.txt
+--exec $MYSQL_BINLOG --read-from-remote-server --to-last-log --host=127.0.0.1 --port=$binsrv_replication_source_port --user=rpl --password=password --default-auth=caching_sha2_password --get-server-public-key --base64-output=decode-rows --verbose --start-position=$position_after_first_batch $first_binlog > $dump_from_position 2>/dev/null
+--let $assert_file = $dump_from_position
+--let $assert_count = 0
+--let $assert_select = 'first_batch_
+--let $assert_text = The aligned dump has none of the first batch
+--source include/assert_grep.inc
+--let $assert_count = 1
+--let $assert_select = 'second_batch_three'
+--let $assert_text = The aligned dump has the second batch
+--source include/assert_grep.inc
+--remove_file $dump_from_position
+
+--echo
+--echo *** Sending SIGTERM signal to the Binlog Server Utility and waiting for
+--echo *** the process to terminate
+--source ../include/terminate_proc.inc
+
+--echo
+--echo *** Dropping the database.
+DROP DATABASE source_db;
+
+# cleaning up
+--source ../include/tear_down_binsrv_environment.inc
+
+--source ../include/kill_binlog_dump_connection.inc
+--source include/wait_until_count_sessions.inc

@@ -571,6 +571,16 @@ read_lenenc_int(std::string_view bytes, std::size_t &offset) {
 // a blocking TCP connection to the listener speaking the client side of the
 // MySQL protocol; every read gives up after a timeout, so that a listener
 // that stops answering fails the property instead of hanging it
+// how a login went: the path the listener took (none when it refused the
+// client greeting outright) and whether it ended with OK
+enum class auth_path : std::uint8_t { none, fast, full };
+
+struct auth_outcome {
+  auth_path path;
+  bool ok;
+  std::string detail;
+};
+
 class mysql_client {
 public:
   explicit mysql_client(std::uint16_t port)
@@ -642,7 +652,8 @@ public:
   // does it: "perform full authentication", a request for the server's RSA
   // public key, the password XOR the scramble encrypted with that key
   // (RSA-OAEP), and OK
-  void authenticate(std::string_view user, std::string_view password) {
+  [[nodiscard]] auth_outcome try_authenticate(std::string_view user,
+                                             std::string_view password) {
     const auto greeting{read_frame()};
     require(greeting.has_value(), "no server greeting");
     // the greeting can be decoded with any capabilities that include
@@ -676,19 +687,29 @@ public:
     // listener has authenticated before (PBS-10 part 3), otherwise "perform
     // full authentication" (0x01 0x04)
     const auto full_auth{read_frame()};
-    require(full_auth.has_value() &&
-                std::size(*full_auth) == frame_header_size + 2U &&
+    if (!full_auth.has_value()) {
+      return {.path = auth_path::none, .ok = false,
+              .detail = "the connection closed after the client greeting"};
+    }
+    if (std::size(*full_auth) > frame_header_size &&
+        (*full_auth)[frame_header_size] == '\xFF') {
+      // refused without a second exchange (a cached user with a wrong
+      // scramble)
+      return {.path = auth_path::none, .ok = false, .detail = "ERR"};
+    }
+    require(std::size(*full_auth) == frame_header_size + 2U &&
                 (*full_auth)[frame_header_size] == '\x01' &&
                 ((*full_auth)[frame_header_size + 1U] == '\x03' ||
                  (*full_auth)[frame_header_size + 1U] == '\x04'),
-            "neither 'fast authentication succeeded' nor 'perform full "
+            "neither ERR, 'fast authentication succeeded' nor 'perform full "
             "authentication' after the client greeting");
     if ((*full_auth)[frame_header_size + 1U] == '\x03') {
       const auto fast_ok{read_frame()};
-      require(fast_ok.has_value() && std::size(*fast_ok) > frame_header_size &&
-                  (*fast_ok)[frame_header_size] == '\0',
-              "no OK after 'fast authentication succeeded'");
-      return;
+      return {.path = auth_path::fast,
+              .ok = fast_ok.has_value() &&
+                    std::size(*fast_ok) > frame_header_size &&
+                    (*fast_ok)[frame_header_size] == '\0',
+              .detail = "after 'fast authentication succeeded'"};
     }
     // request the public key (0x02); the reply is 0x01 followed by its PEM
     write_frame(raw_client_frame(3U, std::string_view{"\x02", 1U}));
@@ -714,9 +735,15 @@ public:
                                  std::data(encrypted)),
                              std::size(encrypted)}));
     const auto ok{read_frame()};
-    require(ok.has_value() && std::size(*ok) > frame_header_size &&
-                (*ok)[frame_header_size] == '\0',
-            "no OK after the encrypted password");
+    return {.path = auth_path::full,
+            .ok = ok.has_value() && std::size(*ok) > frame_header_size &&
+                  (*ok)[frame_header_size] == '\0',
+            .detail = "after the encrypted password"};
+  }
+
+  void authenticate(std::string_view user, std::string_view password) {
+    const auto outcome{try_authenticate(user, password)};
+    require(outcome.ok, "authentication failed: " + outcome.detail);
   }
 
   // reads the reply to a statement, COM_PING or COM_REGISTER_SLAVE
@@ -1055,6 +1082,10 @@ enum class command_kind : std::uint8_t {
 struct command {
   command_kind kind;
   std::string statement;
+  // COM_BINLOG_DUMP only: the binlog and the position the client asks for
+  // (an empty name: the beginning of the storage)
+  std::string dump_binlog{};
+  std::uint64_t dump_position{binsrv::events::magic_binlog_offset};
 };
 
 std::ostream &operator<<(std::ostream &output, const command &value) {
@@ -1066,7 +1097,12 @@ std::ostream &operator<<(std::ostream &output, const command &value) {
   case command_kind::register_replica:
     return output << "COM_REGISTER_SLAVE";
   case command_kind::binlog_dump:
-    return output << "COM_BINLOG_DUMP";
+    output << "COM_BINLOG_DUMP";
+    if (!value.dump_binlog.empty() ||
+        value.dump_position != binsrv::events::magic_binlog_offset) {
+      output << " '" << value.dump_binlog << "':" << value.dump_position;
+    }
+    return output;
   }
   return output;
 }
@@ -1113,8 +1149,8 @@ encode_command(const command &value,
     static constexpr std::uint32_t replica_server_id{2U};
     return encode_client_frame(
         0U,
-        dump{flags, replica_server_id, "",
-             static_cast<std::uint32_t>(binsrv::events::magic_binlog_offset)},
+        dump{flags, replica_server_id, value.dump_binlog,
+             static_cast<std::uint32_t>(value.dump_position)},
         capabilities);
   }
   }
@@ -1281,6 +1317,122 @@ BOOST_AUTO_TEST_CASE(ReplicationSourceDumpRequiresChecksumDeclaration) {
       }
     }
     require(false, "the session ended before the dump");
+  });
+}
+
+// a COM_BINLOG_DUMP from any position - also one that is not an event
+// boundary, or past the end of the binlog - ends that session only: the
+// listener keeps serving new connections (ticket 39: a position inside an
+// event made a noexcept indexed_event_block accessor throw, which ended the
+// whole process)
+BOOST_AUTO_TEST_CASE(ReplicationSourceSurvivesAnyDumpPosition) {
+  run_property([](hegel::TestCase &tc) {
+    const auto settings{tc.draw("settings", source_settings_generator())};
+    // the stored binlog (FORMAT_DESCRIPTION and PREVIOUS_GTIDS_LOG) is
+    // shorter than this, so positions past its end are drawn too
+    static constexpr std::uint64_t max_position{512U};
+    const command dump{
+        .kind = command_kind::binlog_dump,
+        .statement = {},
+        .dump_binlog = tc.draw(
+            "binlog", gs::sampled_from(std::vector<std::string>{
+                          "", "binlog.000001"})),
+        .dump_position = tc.draw(
+            "position", gs::integers<std::uint64_t>(
+                            {.min_value = 0U, .max_value = max_position}))};
+
+    const replication_source source{settings};
+    {
+      mysql_client client{source.port()};
+      client.authenticate(replica_user, replica_password);
+      client.write_frame(encode_command(
+          {.kind = command_kind::query,
+           .statement = "SET @source_binlog_checksum = 'NONE', "
+                        "@master_binlog_checksum = 'NONE'"},
+          client.capabilities()));
+      require(client.read_reply().kind == reply_kind::ok,
+              "the checksum SET was not answered with OK");
+      client.write_frame(encode_command(dump, client.capabilities()));
+      // ERR, an event stream or a closed connection: any of them ends the
+      // session; only the listener's survival is checked here
+      static_cast<void>(client.read_dump_reply());
+    }
+
+    std::ostringstream label;
+    label << dump;
+    mysql_client next{source.port()};
+    next.authenticate(replica_user, replica_password);
+    next.write_frame(encode_command({.kind = command_kind::ping, .statement = {}},
+                                    next.capabilities()));
+    require(next.read_reply().kind == reply_kind::ok,
+            "after " + label.str() +
+                " a new connection was not answered with OK to COM_PING");
+  });
+}
+
+// the caching_sha2_password authentication cache (PBS-10 part 3), checked
+// against a model over any sequence of logins: the configured user is
+// cached after its first successful full authentication; a cached user is
+// only ever offered the fast path, which succeeds exactly with the right
+// password and otherwise is refused at once (no fallback to the full
+// authentication, as MySQL Server does); everyone else goes through the full
+// authentication, which succeeds exactly with the right user and password
+BOOST_AUTO_TEST_CASE(ReplicationSourceAuthenticationCacheFollowsModel) {
+  run_property([](hegel::TestCase &tc) {
+    const auto settings{tc.draw("settings", source_settings_generator())};
+    struct login {
+      bool right_user;
+      bool right_password;
+    };
+    const auto logins{tc.draw(
+        "logins",
+        gs::vectors(gs::compose([](const hegel::TestCase &inner) {
+                      return login{.right_user = inner.draw(gs::booleans()),
+                                   .right_password =
+                                       inner.draw(gs::booleans())};
+                    }),
+                    {.min_size = 1U, .max_size = 8U}))};
+
+    const replication_source source{settings};
+    bool cached{false};
+    std::string history;
+    const auto attempt{[&](const login &value) {
+      history += std::string{history.empty() ? "" : ", "} +
+                 (value.right_user ? "user" : "other user") + "/" +
+                 (value.right_password ? "password" : "wrong password");
+      const bool fast{cached && value.right_user};
+      const bool expected_ok{value.right_user && value.right_password};
+      mysql_client client{source.port()};
+      const auto outcome{client.try_authenticate(
+          value.right_user ? replica_user : std::string_view{"intruder"},
+          value.right_password ? replica_password
+                               : std::string_view{"not the password"})};
+      const auto expected_path{fast ? (expected_ok ? auth_path::fast
+                                                   : auth_path::none)
+                                    : auth_path::full};
+      require(outcome.path == expected_path,
+              "logins [" + history + "]: the last one took the " +
+                  (outcome.path == auth_path::fast   ? "fast path"
+                   : outcome.path == auth_path::full ? "full path"
+                                                     : "refusal") +
+                  " instead of the " +
+                  (expected_path == auth_path::fast   ? "fast path"
+                   : expected_path == auth_path::full ? "full path"
+                                                      : "refusal") +
+                  (cached ? " (the user is cached)" : " (nothing cached)"));
+      require(outcome.ok == expected_ok,
+              "logins [" + history + "]: the last one " +
+                  (outcome.ok ? "succeeded" : "failed") + " (" +
+                  outcome.detail + ")");
+      if (!fast && expected_ok) {
+        cached = true;
+      }
+    }};
+    for (const auto &value : logins) {
+      attempt(value);
+    }
+    // whatever happened before, the right user and password still get in
+    attempt(login{.right_user = true, .right_password = true});
   });
 }
 

@@ -36,3 +36,4 @@ StorageRestartSurvivesAFault  ticket 37: a failed delete during the startup reco
 StorageRestartSurvivesAFaultOnS3  ticket 37: a failed delete during the startup recovery removes the data file but keeps its metadata (S3 backend variant; the shared remove_objects batch, not hit in every run)
 StorageQueryingReportsKeyringErrors  ticket 35: querying_only skips every encrypted binlog when the keyring lacks the KEK or is not configured, and reports success with no binlogs
 EmptyStorageIsPolledUntilTheBinlogArrives  ticket 38: since PBS-29 a dump naming a binlog on an empty storage is refused instead of polled, which reopens the PBS-91 startup race
+ReplicationSourceSurvivesAnyDumpPosition  ticket 39: a dump from a position inside an event terminates the listener process (std::terminate from a noexcept indexed_event_block accessor)

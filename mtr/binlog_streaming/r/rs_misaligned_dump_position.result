@@ -1,0 +1,56 @@
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+
+*** Determining binlog file directory from the server.
+
+*** Creating a temporary directory <BINSRV_STORAGE_PATH> for storing
+*** binlog files downloaded via the Binlog Server utility.
+
+*** Determining the first binary log name.
+
+*** Creating source_db.tbl and inserting the first batch of rows.
+CREATE DATABASE source_db;
+CREATE TABLE source_db.tbl(
+id INT UNSIGNED NOT NULL,
+value VARCHAR(32) NOT NULL,
+PRIMARY KEY(id)
+) ENGINE=InnoDB;
+INSERT INTO source_db.tbl VALUES (1, 'first_batch_one'), (2, 'first_batch_two');
+
+*** Remembering the position after the first batch.
+
+*** Inserting the second batch of rows in the same binary log.
+INSERT INTO source_db.tbl VALUES (3, 'second_batch_three');
+
+*** Flushing the source binary log and inserting the third batch.
+FLUSH BINARY LOGS;
+INSERT INTO source_db.tbl VALUES (4, 'third_batch_four');
+
+*** Fetching the source binary logs.
+
+*** Starting Binlog Server Utility in background in pull mode.
+
+*** Waiting for the replication source listener port ready to accept
+*** connections.
+
+*** Dumping from a position 5 bytes past the end of the first batch,
+*** inside the header of the next event: the dump must fail.
+
+*** The Binlog Server Utility must still be running.
+
+*** And still serve a dump from a position at an event boundary.
+include/assert_grep.inc [The aligned dump has none of the first batch]
+include/assert_grep.inc [The aligned dump has the second batch]
+
+*** Sending SIGTERM signal to the Binlog Server Utility and waiting for
+*** the process to terminate
+
+*** Dropping the database.
+DROP DATABASE source_db;
+
+*** Removing the Binlog Server utility storage directory.
+
+*** Removing the Binlog Server utility log file.
+
+*** Removing the Binlog Server utility configuration file.

@@ -84,6 +84,8 @@
 #include "binsrv/events/generic_body.hpp"
 #include "binsrv/events/generic_post_header.hpp"
 #include "binsrv/gtids/gtid_set.hpp"
+#include "binsrv/gtids/tag.hpp"
+#include "binsrv/gtids/uuid.hpp"
 #include "binsrv/events/code_type.hpp"
 #include "binsrv/events/common_header_flag_type.hpp"
 #include "binsrv/events/common_header_view.hpp"
@@ -203,7 +205,8 @@ make_storage(const std::filesystem::path &config_path) {
 // FORMAT_DESCRIPTION (empty GTID set, CRC32 like that FORMAT_DESCRIPTION);
 // the sender requires both at the start of every binlog (PBS-29)
 [[nodiscard]] std::vector<std::byte>
-make_previous_gtids_log(std::uint64_t offset, std::uint32_t event_server_id) {
+make_previous_gtids_log(std::uint64_t offset, std::uint32_t event_server_id,
+                        const binsrv::gtids::gtid_set &gtids = {}) {
   binsrv::events::event_storage buffer;
   [[maybe_unused]] const auto event{
       binsrv::events::event::create_event<
@@ -214,8 +217,7 @@ make_previous_gtids_log(std::uint64_t offset, std::uint32_t event_server_id) {
           binsrv::events::generic_post_header<
               binsrv::events::code_type::previous_gtids_log>{},
           binsrv::events::generic_body<
-              binsrv::events::code_type::previous_gtids_log>{
-              binsrv::gtids::gtid_set{}},
+              binsrv::events::code_type::previous_gtids_log>{gtids},
           /*include_checksum=*/true, buffer)};
   return {std::cbegin(buffer), std::cend(buffer)};
 }
@@ -255,7 +257,8 @@ struct seeded_storage {
 [[nodiscard]] seeded_storage
 fill_open_binlog(binsrv::storage_ptr storage,
                  const std::vector<std::size_t> &event_sizes,
-                 std::uint32_t first_id = 1U) {
+                 std::uint32_t first_id = 1U,
+                 const binsrv::gtids::gtid_set &previous_gtids = {}) {
   seeded_storage result{.storage = std::move(storage), .events = {},
                         .offsets = {}};
   const binsrv::gtids::gtid no_gtid{};
@@ -270,7 +273,7 @@ fill_open_binlog(binsrv::storage_ptr storage,
   }};
 
   store(make_fde());
-  store(make_previous_gtids_log(offset, server_id));
+  store(make_previous_gtids_log(offset, server_id, previous_gtids));
   std::uint32_t id{first_id};
   for (const auto size : event_sizes) {
     store(make_event(size, id++));
@@ -282,28 +285,34 @@ fill_open_binlog(binsrv::storage_ptr storage,
 // opens a single binlog in 'storage' and fills it (see 'fill_open_binlog()')
 [[nodiscard]] seeded_storage
 write_binlog(binsrv::storage_ptr storage,
-             const std::vector<std::size_t> &event_sizes) {
+             const std::vector<std::size_t> &event_sizes,
+             const binsrv::gtids::gtid_set &previous_gtids = {}) {
   require(storage->open_binlog(the_binlog) ==
               binsrv::open_binlog_status::created,
           "the binlog was not created");
-  return fill_open_binlog(std::move(storage), event_sizes);
+  return fill_open_binlog(std::move(storage), event_sizes, 1U, previous_gtids);
 }
 
 // a storage with a single binlog (see 'write_binlog()')
-[[nodiscard]] seeded_storage seed(const std::filesystem::path &directory,
-                                  const std::vector<std::size_t> &event_sizes) {
-  return write_binlog(make_storage(write_config(directory)), event_sizes);
+[[nodiscard]] seeded_storage
+seed(const std::filesystem::path &directory,
+     const std::vector<std::size_t> &event_sizes,
+     const binsrv::gtids::gtid_set &previous_gtids = {}) {
+  return write_binlog(make_storage(write_config(directory)), event_sizes,
+                      previous_gtids);
 }
 
 // the offset of each event 'write_binlog()' will store for 'event_sizes', FDE
 // and PREVIOUS_GTIDS_LOG first, so a test can pick a position before anything
 // is written
 [[nodiscard]] std::vector<std::uint64_t>
-planned_offsets(const std::vector<std::size_t> &event_sizes) {
+planned_offsets(const std::vector<std::size_t> &event_sizes,
+                const binsrv::gtids::gtid_set &previous_gtids = {}) {
   std::vector<std::uint64_t> result{events::magic_binlog_offset};
   result.push_back(result.back() + std::size(make_fde()));
   result.push_back(result.back() +
-                   std::size(make_previous_gtids_log(result.back(), server_id)));
+                   std::size(make_previous_gtids_log(result.back(), server_id,
+                                                     previous_gtids)));
   for (const auto size : event_sizes) {
     result.push_back(result.back() + size);
   }
@@ -517,6 +526,30 @@ is_artificial_rotate_to(const byte_vector &bytes,
             .max_value = max_large_event_size})}));
 }
 
+// the GTID set of a binlog's PREVIOUS_GTIDS_LOG: mostly a few UUIDs, some
+// with hundreds (each UUID takes 40 bytes), so that the event outgrows the
+// sender's first preamble read (a block from the beginning, about 2 KiB
+// when resuming) and the rest has to be fetched
+[[nodiscard]] gs::Generator<binsrv::gtids::gtid_set> previous_gtid_sets() {
+  return gs::compose([](const hegel::TestCase &tc) {
+    const auto count{tc.draw(gs::one_of(
+        {gs::integers<std::size_t>({.min_value = 0U, .max_value = 3U}),
+         gs::integers<std::size_t>({.min_value = 50U, .max_value = 400U})}))};
+    binsrv::gtids::gtid_set result;
+    for (std::size_t index{0U}; index < count; ++index) {
+      binsrv::gtids::uuid_storage data{};
+      // distinct and never the nil UUID
+      const auto value{index + 1U};
+      for (std::size_t byte{0U}; byte < sizeof value; ++byte) {
+        data[byte] = static_cast<std::byte>((value >> (8U * byte)) & 0xFFU);
+      }
+      data[std::size(data) - 1U] = std::byte{0x5A};
+      result.add(binsrv::gtids::uuid{data}, binsrv::gtids::tag{}, 1U);
+    }
+    return result;
+  });
+}
+
 // the size of a single event that can be split into a non-empty prefix and a
 // non-empty rest
 [[nodiscard]] gs::Generator<std::size_t> splittable_event_sizes() {
@@ -541,7 +574,9 @@ BOOST_AUTO_TEST_CASE(FromBeginningStreamsPreambleAndEvents) {
     const bool session_checksum{tc.draw("checksum", gs::booleans())};
     const auto block_size{tc.draw("block", block_sizes())};
 
-    const auto seeded{seed(directory.path(), sizes)};
+    const auto previous_gtids{
+        tc.draw("previous_gtids", previous_gtid_sets())};
+    const auto seeded{seed(directory.path(), sizes, previous_gtids)};
     operations::sender_context reader{
         std::make_shared<binsrv::null_logger>(), seeded.storage, block_size,
         std::string_view{}, events::magic_binlog_offset, session_checksum};
@@ -590,7 +625,9 @@ BOOST_AUTO_TEST_CASE(FromPositionStreamsArtificialPreambleAndRemainingEvents) {
     const bool session_checksum{tc.draw("checksum", gs::booleans())};
     const auto block_size{tc.draw("block", block_sizes())};
 
-    const auto seeded{seed(directory.path(), sizes)};
+    const auto previous_gtids{
+        tc.draw("previous_gtids", previous_gtid_sets())};
+    const auto seeded{seed(directory.path(), sizes, previous_gtids)};
     // resume at the boundary of one of the synthetic events (index 1..N;
     // index 0 is the FDE, which is the from-beginning case)
     const auto resume_index{tc.draw(
@@ -649,7 +686,9 @@ BOOST_AUTO_TEST_CASE(EveryStoredByteIsFetchedOnce) {
 
     object_reads reads{.name = the_binlog.str(), .ranges = {}};
     const read_recording_scope scope{reads};
-    const auto seeded{seed(directory.path(), sizes)};
+    const auto previous_gtids{
+        tc.draw("previous_gtids", previous_gtid_sets())};
+    const auto seeded{seed(directory.path(), sizes, previous_gtids)};
     // 0 streams from the beginning, any other index resumes at that event
     const auto start_index{tc.draw(
         "start",
@@ -677,31 +716,34 @@ BOOST_AUTO_TEST_CASE(EveryStoredByteIsFetchedOnce) {
 
     const auto file_size{seeded.offsets.back() +
                          std::size(seeded.events.back())};
-    // the first read takes the preamble (FORMAT_DESCRIPTION and
-    // PREVIOUS_GTIDS_LOG, PBS-29) and may cover events after it, which the
-    // event loop can read once more; the event loop itself reads every byte
-    // from the starting position on exactly once, unless the preamble read
-    // already covered it
+    // the preamble (FORMAT_DESCRIPTION and PREVIOUS_GTIDS_LOG, PBS-29) takes
+    // one read of an estimated size, and one more for the rest of a large
+    // PREVIOUS_GTIDS_LOG; a dump that resumes inside the preamble, or right
+    // after it, reads part of it again in the event loop. Beyond the
+    // preamble, the first read and the starting position, every byte is
+    // read exactly once (PBS-65: a partial trailing event is carried over
+    // in memory, not re-read), and every byte from the starting position on
+    // is read at least once.
     require(!reads.ranges.empty(), "the binlog was never read");
-    const auto [preamble_offset, preamble_length]{reads.ranges.front()};
+    const auto preamble_end{std::size(seeded.offsets) > 2U ? seeded.offsets[2]
+                                                            : file_size};
+    const auto [first_offset, first_length]{reads.ranges.front()};
+    const auto strict_from{
+        std::max({start_position, preamble_end, first_offset + first_length})};
     std::vector<std::size_t> times_read(file_size, 0U);
-    for (std::size_t index{1U}; index < std::size(reads.ranges); ++index) {
-      const auto [offset, length]{reads.ranges[index]};
+    for (const auto &[offset, length] : reads.ranges) {
       for (auto position{offset};
            position < offset + length && position < file_size; ++position) {
         ++times_read[position];
       }
     }
     for (auto position{start_position}; position < file_size; ++position) {
-      const bool in_preamble_read{position >= preamble_offset &&
-                                  position <
-                                      preamble_offset + preamble_length};
-      require(times_read[position] == 1U ||
-                  (times_read[position] == 0U && in_preamble_read),
+      require(times_read[position] >= 1U &&
+                  (position < strict_from || times_read[position] == 1U),
               "byte " + std::to_string(position) + " of " +
                   std::to_string(file_size) + " was read " +
                   std::to_string(times_read[position]) +
-                  " time(s) by the event loop to stream from position " +
+                  " time(s) to stream from position " +
                   std::to_string(start_position) + "; reads " +
                   describe_reads(reads));
     }
@@ -950,7 +992,11 @@ BOOST_AUTO_TEST_CASE(SwitchToTheNextBinlogEmitsArtificialRotate) {
     const bool next_filled_before_read{
         tc.draw("next_filled_before_read", gs::booleans())};
 
-    const auto seeded{seed(directory.path(), sizes)};
+    const auto previous_gtids{
+        tc.draw("previous_gtids", previous_gtid_sets())};
+    const auto next_previous_gtids{
+        tc.draw("next_previous_gtids", previous_gtid_sets())};
+    const auto seeded{seed(directory.path(), sizes, previous_gtids)};
     seeded.storage->close_binlog();
     require(seeded.storage->open_binlog(the_next_binlog) ==
                 binsrv::open_binlog_status::created,
@@ -967,11 +1013,13 @@ BOOST_AUTO_TEST_CASE(SwitchToTheNextBinlogEmitsArtificialRotate) {
     const auto limit{std::size(seeded.events) + std::size(next_sizes) + 4U};
     std::optional<seeded_storage> next;
     if (next_filled_before_read) {
-      next = fill_open_binlog(seeded.storage, next_sizes, 1'000'000U);
+      next = fill_open_binlog(seeded.storage, next_sizes, 1'000'000U,
+                              next_previous_gtids);
     }
     auto emitted{drain(reader, limit)};
     if (!next_filled_before_read) {
-      next = fill_open_binlog(seeded.storage, next_sizes, 1'000'000U);
+      next = fill_open_binlog(seeded.storage, next_sizes, 1'000'000U,
+                              next_previous_gtids);
       for (auto &event : drain(reader, limit)) {
         emitted.push_back(std::move(event));
       }

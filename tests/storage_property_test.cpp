@@ -1239,7 +1239,9 @@ struct read_start {
 // past the start yet, whether the reader has announced it depends on timing.
 // The first ROTATE has a checksum when the session asked for one; at a
 // switch to the next binlog the sender carries over the checksum setting of
-// the previous binlog's FORMAT_DESCRIPTION (PBS-29), which is always CRC32
+// the previous binlog's FORMAT_DESCRIPTION (PBS-29), as MySQL's
+// Binlog_sender does (init_checksum_alg() for the first ROTATE, the last
+// FORMAT_DESCRIPTION read for the later ones); that setting is always CRC32
 // here (write_first_binlog_event())
 void require_stream_matches_disk(const event_list &received,
                                  const storage_model &model,

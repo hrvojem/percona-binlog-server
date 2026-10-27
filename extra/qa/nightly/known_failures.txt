@@ -29,8 +29,6 @@ StorageNeverReusesKeystreamAfterCrashRecovery  ticket 32: CTR keystream reuse af
 ReplicationSourceMatchesStatementsExactlyOrByPrefix  ticket 31: listener prefix match ignores the delimiter ('SET @source_heartbeat_period', 'SET @slave_uuidx = 1' answered OK, network_service.cpp known_prefix_queries)
 # Release build (release_gcc14, assertions compiled out): how a known bug
 # fails differently there. '<build>:<test case>' lines win for that build.
-release_gcc14:IndexedEventBlockIndexesOnlyCompleteEvents  tickets 7/39 (release): before PBS-29 an event size of 0 looped until std::bad_alloc; since, std::terminate as in debug (not yet seen in a release run), debug aborts at indexed_event_block.cpp:43
-release_gcc14:MisalignedDumpPositionNeverStreamsGarbage  tickets 7/39 (release): before PBS-29 streamed an event cut out of the stored data; since, std::terminate as in debug (not yet seen in a release run)
 release_gcc14:StorageClosingMidTransactionDropsIt  ticket 6 (release): no assert, the binlog record keeps the dropped events' timestamps ('timestamps do not match the events on disk'), debug aborts at storage.cpp:138
 StorageRestartSurvivesAFault  ticket 37: a failed delete during the startup recovery removes the data file but keeps its metadata, which no later start accepts ('found metadata for a non-existing binlog')
 StorageRestartSurvivesAFaultOnS3  ticket 37: a failed delete during the startup recovery removes the data file but keeps its metadata (S3 backend variant; the shared remove_objects batch, not hit in every run)

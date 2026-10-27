@@ -155,6 +155,7 @@
 #include "binsrv/events/generic_body.hpp"
 #include "binsrv/events/generic_post_header.hpp"
 #include "binsrv/events/protocol_traits_fwd.hpp"
+#include "binsrv/events/rotate_post_header_impl.hpp"
 
 #include "binsrv/gtids/common_types.hpp"
 #include "binsrv/gtids/gtid.hpp"
@@ -266,6 +267,9 @@ struct storage_settings {
   // block sizes used by the sender_context readers
   std::size_t tailing_reader_block_size;
   std::size_t fresh_reader_block_size;
+  // the session's @source_binlog_checksum of the concurrent property's
+  // readers (drawn by that property only)
+  bool reader_checksum;
 };
 
 std::ostream &operator<<(std::ostream &output,
@@ -282,7 +286,9 @@ std::ostream &operator<<(std::ostream &output,
            << " (KEK '" << settings.encryption->kek_id << "')";
   }
   return output << ", reader block sizes " << settings.tailing_reader_block_size
-                << " / " << settings.fresh_reader_block_size;
+                << " / " << settings.fresh_reader_block_size
+                << ", reader checksum "
+                << (settings.reader_checksum ? "on" : "off");
 }
 
 // the keys of the test keyring (the same as in the MTR suite's
@@ -703,7 +709,8 @@ operations(bool with_close_mid_transaction = false) {
                             .checkpoint_size = std::nullopt,
                             .encryption = std::nullopt,
                             .tailing_reader_block_size = 0U,
-                            .fresh_reader_block_size = 0U};
+                            .fresh_reader_block_size = 0U,
+                            .reader_checksum = false};
     if (tc.draw(gs::booleans())) {
       result.checkpoint_size = tc.draw(gs::integers<std::uint64_t>(
           {.min_value = min_checkpoint_size,
@@ -1126,6 +1133,178 @@ void require_same_events(const event_list &received,
   require(std::size(received) == std::size(expected),
           std::string{label} + ": read " + std::to_string(std::size(received)) +
               " event(s) instead of " + std::to_string(std::size(expected)));
+}
+
+// whether 'bytes' is an artificial ROTATE that names 'binlog_name' at
+// 'position', with a CRC32 footer exactly when 'with_checksum' (the
+// session's @source_binlog_checksum)
+[[nodiscard]] bool
+is_artificial_rotate_to(const std::vector<std::byte> &bytes,
+                        const binsrv::events::composite_binlog_name &binlog_name,
+                        std::uint64_t position, bool with_checksum) {
+  using header = binsrv::events::common_header_view_base;
+  using rotate_post_header =
+      binsrv::events::generic_post_header<binsrv::events::code_type::rotate>;
+  static constexpr std::size_t footer_size{4U};
+  const auto name{binlog_name.str()};
+  const auto name_offset{header::size_in_bytes +
+                         rotate_post_header::size_in_bytes};
+  if (std::size(bytes) !=
+      name_offset + std::size(name) + (with_checksum ? footer_size : 0U)) {
+    return false;
+  }
+  const util::const_byte_span span{bytes};
+  const binsrv::events::common_header_view view{
+      span.subspan(0U, header::size_in_bytes)};
+  const rotate_post_header post_header{
+      span.subspan(header::size_in_bytes, rotate_post_header::size_in_bytes)};
+  const std::string stored_name(
+      reinterpret_cast<const char *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+          std::next(std::data(bytes),
+                    static_cast<std::ptrdiff_t>(name_offset))),
+      std::size(name));
+  return view.get_type_code() == binsrv::events::code_type::rotate &&
+         view.get_flags().has_element(
+             binsrv::events::common_header_flag_type::artificial) &&
+         post_header.get_position_raw() == position && stored_name == name;
+}
+
+// whether 'bytes' is the artificial FORMAT_DESCRIPTION a reader that resumes
+// from a position gets (derived from the stored one, next_event_position 0)
+[[nodiscard]] bool
+is_artificial_format_description(const std::vector<std::byte> &bytes) {
+  using header = binsrv::events::common_header_view_base;
+  if (std::size(bytes) < header::size_in_bytes) {
+    return false;
+  }
+  const binsrv::events::common_header_view view{
+      util::const_byte_span{bytes}.subspan(0U, header::size_in_bytes)};
+  return view.get_type_code() ==
+             binsrv::events::code_type::format_description &&
+         view.get_next_event_position_raw() == 0U;
+}
+
+// the type, flags and size of a received event (and the binlog name and
+// position of a ROTATE), for failure messages
+[[nodiscard]] std::string describe_event(const std::vector<std::byte> &bytes) {
+  using header = binsrv::events::common_header_view_base;
+  using rotate_post_header =
+      binsrv::events::generic_post_header<binsrv::events::code_type::rotate>;
+  if (std::size(bytes) < header::size_in_bytes) {
+    return std::to_string(std::size(bytes)) + " byte(s), no common header";
+  }
+  const util::const_byte_span span{bytes};
+  const binsrv::events::common_header_view view{
+      span.subspan(0U, header::size_in_bytes)};
+  std::ostringstream result;
+  result << "type " << static_cast<unsigned>(view.get_type_code_raw())
+         << ", flags " << view.get_flags_raw() << ", " << std::size(bytes)
+         << " bytes";
+  const auto name_offset{header::size_in_bytes +
+                         rotate_post_header::size_in_bytes};
+  if (view.get_type_code() == binsrv::events::code_type::rotate &&
+      std::size(bytes) >= name_offset) {
+    const rotate_post_header post_header{
+        span.subspan(header::size_in_bytes, rotate_post_header::size_in_bytes)};
+    result << ", ROTATE position " << post_header.get_position_raw()
+           << ", name and footer '";
+    for (std::size_t index{name_offset}; index < std::size(bytes); ++index) {
+      const auto value{std::to_integer<unsigned char>(bytes[index])};
+      if (value >= 0x20U && value < 0x7FU) {
+        result << static_cast<char>(value);
+      } else {
+        result << "\\x" << std::hex << static_cast<unsigned>(value) << std::dec;
+      }
+    }
+    result << "'";
+  }
+  return result.str();
+}
+
+// where a reader starts: a binlog, how many of its transactions on disk lie
+// before the starting position, and that position (the magic offset when
+// the binlog is read from its beginning)
+struct read_start {
+  std::size_t binlog_index;
+  std::size_t transactions_before;
+  std::uint64_t position;
+};
+
+// checks the whole stream a reader returned, artificial events included:
+// every binlog from the starting one on is announced by exactly one
+// artificial ROTATE naming it (at the starting position for the first
+// binlog, at the magic offset for the others), a reader that starts inside a
+// binlog gets an artificial FORMAT_DESCRIPTION next, and the binlog's events
+// on disk follow byte for byte; when the last binlog has nothing on disk
+// past the start yet, whether the reader has announced it depends on timing.
+// The first ROTATE has a checksum when the session asked for one; at a
+// switch to the next binlog the sender carries over the checksum setting of
+// the previous binlog's FORMAT_DESCRIPTION (PBS-29), which is always CRC32
+// here (write_first_binlog_event())
+void require_stream_matches_disk(const event_list &received,
+                                 const storage_model &model,
+                                 const disk_state &state,
+                                 const read_start &start,
+                                 bool session_checksum,
+                                 std::string_view label) {
+  const auto &binlogs{model.get_binlogs()};
+  std::size_t next{0U};
+  const auto at_next{[&label, &next, &received] {
+    return std::string{label} + ": event " + std::to_string(next + 1U) + " (" +
+           (next < std::size(received) ? describe_event(received[next])
+                                       : std::string{"past the end"}) +
+           ")";
+  }};
+  for (std::size_t index{start.binlog_index}; index < std::size(binlogs);
+       ++index) {
+    const auto &binlog{binlogs[index]};
+    const bool first{index == start.binlog_index};
+    const auto position{first ? start.position
+                              : binsrv::events::magic_binlog_offset};
+    const auto first_transaction{first ? start.transactions_before : 0U};
+    const auto on_disk{state.transactions_on_disk_per_binlog[index]};
+    const bool with_checksum{first ? session_checksum : true};
+    const bool announced{
+        next < std::size(received) &&
+        is_artificial_rotate_to(received[next], binlog.name, position,
+                                with_checksum)};
+    if (index + 1U == std::size(binlogs) && on_disk == first_transaction &&
+        !announced) {
+      break;
+    }
+    require(announced, at_next() + " is not an artificial ROTATE to '" +
+                           binlog.name.str() + "' at position " +
+                           std::to_string(position) + " (checksum " +
+                           (with_checksum ? "on" : "off") + ")");
+    ++next;
+    if (position != binsrv::events::magic_binlog_offset) {
+      require(next < std::size(received) &&
+                  is_artificial_format_description(received[next]),
+              at_next() + " is not the artificial FORMAT_DESCRIPTION of '" +
+                  binlog.name.str() + "'");
+      ++next;
+    }
+    for (std::size_t transaction_index{first_transaction};
+         transaction_index < on_disk; ++transaction_index) {
+      for (const auto &event : binlog.transactions[transaction_index].events) {
+        require(next < std::size(received),
+                std::string{label} + ": the stream ends before transaction " +
+                    std::to_string(transaction_index + 1U) + " of '" +
+                    binlog.name.str() + "'");
+        require(received[next] == event.bytes,
+                at_next() + " differs from the one on disk in '" +
+                    binlog.name.str() + "' (" +
+                    std::to_string(std::size(received[next])) +
+                    " bytes read, " + std::to_string(std::size(event.bytes)) +
+                    " expected)");
+        ++next;
+      }
+    }
+  }
+  require(next == std::size(received),
+          std::string{label} + ": read " + std::to_string(std::size(received)) +
+              " event(s), " + std::to_string(std::size(received) - next) +
+              " more than on disk");
 }
 
 // ---------------------------------------------------------------------------
@@ -1822,8 +2001,7 @@ public:
       concurrent_reader_ = std::make_unique<operations::sender_context>(
           std::make_shared<binsrv::null_logger>(), storage_,
           settings_.tailing_reader_block_size, std::string_view{},
-          binsrv::events::magic_binlog_offset,
-          /*session_source_binlog_checksum=*/false);
+          binsrv::events::magic_binlog_offset, settings_.reader_checksum);
       concurrent_thread_ = std::jthread{[this](const std::stop_token &stop) {
         read_concurrently(stop, *concurrent_reader_, concurrent_result_);
       }};
@@ -1855,14 +2033,28 @@ public:
     }
     concurrent_thread_.request_stop();
     concurrent_thread_.join();
+    if (resuming_reader_ != nullptr) {
+      resuming_thread_.request_stop();
+      resuming_thread_.join();
+    }
     require(concurrent_result_.error.empty(),
             "concurrent reader: " + concurrent_result_.error);
+    require(resuming_result_.error.empty(),
+            "resuming reader: " + resuming_result_.error);
     const auto state{require_disk_matches_model(
         *location_, storage_->get_binlog_records(), model_,
         settings_)};
-    strip_artificial_rotates(concurrent_result_.received);
-    require_same_events(concurrent_result_.received,
-                        expected_events(model_, state), "concurrent reader");
+    require_stream_matches_disk(
+        concurrent_result_.received, model_, state,
+        read_start{.binlog_index = 0U,
+                   .transactions_before = 0U,
+                   .position = binsrv::events::magic_binlog_offset},
+        settings_.reader_checksum, "concurrent reader");
+    if (resuming_reader_ != nullptr) {
+      require_stream_matches_disk(resuming_result_.received, model_, state,
+                                  resuming_start_, settings_.reader_checksum,
+                                  "resuming reader");
+    }
   }
 
   void apply(const operation &op) {
@@ -2309,6 +2501,38 @@ public:
     }
   }
 
+  // starts the concurrent property's second reader unless it is running
+  // already or the current binlog has nothing past its preamble on disk yet
+  // (then a later call tries again): it resumes at the end of what is on
+  // disk, as a replica that reconnects with its last binlog name and
+  // position does, a COM_BINLOG_DUMP from a position while the writer keeps
+  // appending and rotating
+  void start_resuming_reader() {
+    if (properties_ != checked_properties::concurrent_read_back ||
+        resuming_reader_ != nullptr) {
+      return;
+    }
+    const auto records{storage_->get_binlog_records()};
+    const auto state{
+        require_disk_matches_model(*location_, records, model_, settings_)};
+    // the first transaction is the FORMAT_DESCRIPTION and PREVIOUS_GTIDS_LOG
+    if (state.transactions_on_disk == 0U) {
+      return;
+    }
+    resuming_start_ = read_start{
+        .binlog_index = std::size(model_.get_binlogs()) - 1U,
+        .transactions_before = state.transactions_on_disk,
+        .position = records.back().size};
+    resuming_reader_ = std::make_unique<operations::sender_context>(
+        std::make_shared<binsrv::null_logger>(), storage_,
+        settings_.fresh_reader_block_size,
+        model_.get_current_binlog().name.str(), resuming_start_.position,
+        settings_.reader_checksum);
+    resuming_thread_ = std::jthread{[this](const std::stop_token &stop) {
+      read_concurrently(stop, *resuming_reader_, resuming_result_);
+    }};
+  }
+
 private:
   storage_settings settings_;
   checked_properties properties_;
@@ -2334,6 +2558,12 @@ private:
   std::unique_ptr<operations::sender_context> concurrent_reader_{};
   concurrent_read_result concurrent_result_{};
   std::jthread concurrent_thread_{};
+  // the concurrent property's second reader, which connects while the writer
+  // runs (see start_resuming_reader()), in the same order
+  std::unique_ptr<operations::sender_context> resuming_reader_{};
+  read_start resuming_start_{};
+  concurrent_read_result resuming_result_{};
+  std::jthread resuming_thread_{};
   // the query thread of the concurrent-query property, likewise stopped and
   // joined before the result it writes to is destroyed
   concurrent_query_result query_result_{};
@@ -2998,6 +3228,9 @@ void run_storage_property(hegel::TestCase &tc, checked_properties properties,
                           const std::optional<s3_server> &s3 = std::nullopt) {
   auto settings{tc.draw("settings", storage_settings_generator())};
   settings.s3 = s3;
+  if (properties == checked_properties::concurrent_read_back) {
+    settings.reader_checksum = tc.draw("reader_checksum", gs::booleans());
+  }
   const auto ops{tc.draw(
       "ops", gs::vectors(operations(
                  properties == checked_properties::close_mid_transaction)))};
@@ -3096,9 +3329,23 @@ void run_storage_property(hegel::TestCase &tc, checked_properties properties,
         "keyring_variant",
         gs::integers<std::size_t>({.min_value = 0U, .max_value = 2U}));
   }
+  // the operation after which the concurrent property's second reader
+  // connects (or tries to, see start_resuming_reader())
+  std::optional<std::size_t> resuming_reader_after;
+  if (properties == checked_properties::concurrent_read_back) {
+    resuming_reader_after = tc.draw(
+        "resuming_reader_after",
+        gs::integers<std::size_t>({.min_value = 0U, .max_value = std::size(ops)}));
+  }
   storage_harness harness{settings, properties};
-  for (const auto &op : ops) {
-    harness.apply(op);
+  for (std::size_t index{0U}; index < std::size(ops); ++index) {
+    if (resuming_reader_after.has_value() && index >= *resuming_reader_after) {
+      harness.start_resuming_reader();
+    }
+    harness.apply(ops[index]);
+  }
+  if (resuming_reader_after.has_value()) {
+    harness.start_resuming_reader();
   }
   harness.finish();
   if (keyring_variant.has_value()) {
@@ -3266,7 +3513,8 @@ void run_keystream_property(hegel::TestCase &tc) {
       .encryption =
           encryption_settings{.kek_id = kek_id, .data_cipher = data_cipher},
       .tailing_reader_block_size = 0U,
-      .fresh_reader_block_size = 0U};
+      .fresh_reader_block_size = 0U,
+      .reader_checksum = false};
   const scratch_directory root{};
   {
     std::ofstream keyring{root.path() / keyring_name};
@@ -3402,6 +3650,11 @@ BOOST_AUTO_TEST_CASE(StorageReadBackMatchesDisk) {
   });
 }
 
+// a reader on its own thread from the beginning, and a second one that
+// connects mid-run and resumes at the end of what is on disk, while the
+// writer writes, checkpoints and rotates: each stream is exactly what is on
+// disk, every binlog announced by one artificial ROTATE (plus an artificial
+// FORMAT_DESCRIPTION when resuming), with the session's checksum setting
 BOOST_AUTO_TEST_CASE(StorageConcurrentReadBackMatchesDisk) {
   run_property([](hegel::TestCase &tc) {
     run_storage_property(tc, checked_properties::concurrent_read_back);

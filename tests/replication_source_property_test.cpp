@@ -44,6 +44,7 @@
 #include <netinet/in.h>
 
 #include <arpa/inet.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -76,6 +77,8 @@
 
 #include <boost/system/system_error.hpp>
 
+#include <boost/crc.hpp>
+
 // needed for 'digest_storage'
 #include <boost/container/static_vector.hpp> // IWYU pragma: keep
 // needed for binsrv::gtids::gtid_set_storage
@@ -90,6 +93,7 @@
 
 #include <hegel/hegel.h>
 
+#include "heartbeat_test_helpers.hpp"
 #include "property_test_helpers.hpp"
 
 // the protocol codec headers produce conversion warnings, as in
@@ -120,11 +124,16 @@
 #include "binsrv/events/event.hpp"
 #include "binsrv/events/event_fwd.hpp"
 #include "binsrv/events/generic_body.hpp"
+#include "binsrv/events/common_header_view.hpp"
 #include "binsrv/events/generic_post_header.hpp"
+#include "binsrv/events/gtid_log_flag_type.hpp"
+#include "binsrv/events/gtid_log_post_header.hpp"
 #include "binsrv/events/protocol_traits_fwd.hpp"
 
 #include "binsrv/gtids/gtid.hpp"
 #include "binsrv/gtids/gtid_set.hpp"
+#include "binsrv/gtids/tag.hpp"
+#include "binsrv/gtids/uuid.hpp"
 
 #include "minimysql/connection_context.hpp"
 #include "minimysql/connection_context_fwd.hpp"
@@ -263,7 +272,8 @@ std::ostream &operator<<(std::ostream &output, const source_settings &value) {
 // FORMAT_DESCRIPTION (empty GTID set, CRC32 like that FORMAT_DESCRIPTION);
 // the sender requires both at the start of every binlog (PBS-29)
 [[nodiscard]] std::vector<std::byte>
-make_previous_gtids_log(std::uint64_t offset, std::uint32_t event_server_id) {
+make_previous_gtids_log(std::uint64_t offset, std::uint32_t event_server_id,
+                        const binsrv::gtids::gtid_set &gtids = {}) {
   binsrv::events::event_storage buffer;
   [[maybe_unused]] const auto event{
       binsrv::events::event::create_event<
@@ -274,22 +284,126 @@ make_previous_gtids_log(std::uint64_t offset, std::uint32_t event_server_id) {
           binsrv::events::generic_post_header<
               binsrv::events::code_type::previous_gtids_log>{},
           binsrv::events::generic_body<
-              binsrv::events::code_type::previous_gtids_log>{
-              binsrv::gtids::gtid_set{}},
+              binsrv::events::code_type::previous_gtids_log>{gtids},
           /*include_checksum=*/true, buffer)};
   return {std::cbegin(buffer), std::cend(buffer)};
 }
 
+// the UUID of the transactions of a GTID-mode test storage
+const binsrv::gtids::uuid stored_uuid{"5a5a5a5a-1111-2222-3333-444455556666"};
+
+// a GTID-mode storage for COM_BINLOG_DUMP_GTID: binlogs holding the
+// transactions stored_uuid:first_gno, :first_gno+1, ... in order (a GTID_LOG
+// and an XID event each), 'transactions_per_binlog' of them in each binlog;
+// the GTIDs below first_gno count as purged (the first binlog's
+// PREVIOUS_GTIDS_LOG names them, no binlog holds them)
+struct gtid_layout {
+  binsrv::gtids::gno_t first_gno;
+  std::vector<std::size_t> transactions_per_binlog;
+};
+
+std::ostream &operator<<(std::ostream &output, const gtid_layout &value) {
+  output << "GTIDs from " << value.first_gno << " in binlogs of";
+  for (const auto count : value.transactions_per_binlog) {
+    output << " " << count;
+  }
+  return output << " transaction(s)";
+}
+
+void put_little_endian(std::vector<std::byte> &bytes, std::size_t offset,
+                       std::uint64_t value, std::size_t size) {
+  for (std::size_t index{0U}; index < size; ++index) {
+    bytes[offset + index] =
+        static_cast<std::byte>((value >> (8U * index)) & 0xFFU);
+  }
+}
+
+// an XID event (common header, the 8-byte XID, a CRC32 footer), which ends a
+// transaction
+[[nodiscard]] std::vector<std::byte>
+make_xid_event(std::uint64_t offset, std::uint32_t event_server_id,
+               std::uint64_t xid) {
+  using header = binsrv::events::common_header_view_base;
+  static constexpr std::size_t xid_size{8U};
+  static constexpr std::size_t footer_size{4U};
+  static constexpr std::size_t size{header::size_in_bytes + xid_size +
+                                    footer_size};
+  std::vector<std::byte> result(size);
+  put_little_endian(result, header::timestamp_offset, 1U, 4U);
+  put_little_endian(result, header::type_code_offset,
+                    static_cast<std::uint8_t>(binsrv::events::code_type::xid),
+                    1U);
+  put_little_endian(result, header::server_id_offset, event_server_id, 4U);
+  put_little_endian(result, header::event_size_offset, size, 4U);
+  put_little_endian(result, header::next_event_position_offset, offset + size,
+                    4U);
+  put_little_endian(result, header::flags_offset, 0U, 2U);
+  put_little_endian(result, header::size_in_bytes, xid, xid_size);
+  boost::crc_32_type crc;
+  crc.process_bytes(std::data(result), size - footer_size);
+  put_little_endian(result, size - footer_size, crc.checksum(), footer_size);
+  return result;
+}
+
+// the GTID_LOG event of 'gtid', its transaction_length covering it and the
+// XID event that follows
+[[nodiscard]] std::vector<std::byte>
+make_gtid_log_event(std::uint64_t offset, std::uint32_t event_server_id,
+                    binsrv::gtids::gno_t gno, std::size_t xid_size) {
+  const auto commit_time{std::chrono::high_resolution_clock::time_point{
+      std::chrono::seconds{1'700'000'000}}};
+  const binsrv::events::generic_post_header<binsrv::events::code_type::gtid_log>
+      post_header{binsrv::events::gtid_log_flag_set{},
+                  stored_uuid,
+                  gno,
+                  binsrv::events::gtid_log_post_header::known_logical_ts_code,
+                  binsrv::events::seq_no_t{0ULL},
+                  binsrv::events::seq_no_t{1ULL}};
+  const auto encode{[&](std::uint64_t transaction_length) {
+    binsrv::events::event_storage buffer;
+    [[maybe_unused]] const auto event{
+        binsrv::events::event::create_event<
+            binsrv::events::code_type::gtid_log>(
+            static_cast<std::uint32_t>(offset),
+            util::ctime_timestamp{std::time_t{1}}, event_server_id,
+            binsrv::events::common_header_flag_set{}, post_header,
+            binsrv::events::generic_body<binsrv::events::code_type::gtid_log>{
+                commit_time, commit_time, transaction_length,
+                util::semantic_version{8U, 4U, 8U},
+                util::semantic_version{8U, 4U, 8U}, std::nullopt},
+            /*include_checksum=*/true, buffer)};
+    return std::vector<std::byte>{std::cbegin(buffer), std::cend(buffer)};
+  }};
+  // the length is a packed integer, so its own size can change the event's
+  const auto first{encode(xid_size)};
+  auto result{encode(std::size(first) + xid_size)};
+  if (std::size(result) != std::size(first)) {
+    result = encode(std::size(result) + xid_size);
+  }
+  return result;
+}
+
+// the server_id of the stored binlog's FORMAT_DESCRIPTION, which the
+// listener's heartbeats carry
+constexpr std::uint32_t stored_fde_server_id{42U};
+
 class replication_source {
 public:
-  explicit replication_source(const source_settings &settings) {
+  // a storage holding one binlog with only its preamble, or, given a
+  // 'layout' (with settings.gtid_mode), the GTID transactions it describes
+  explicit replication_source(const source_settings &settings,
+                              const gtid_layout *layout = nullptr) {
     std::filesystem::create_directories(root_.path() / "storage");
     const auto config_path{write_config(settings)};
     config_ = std::make_unique<binsrv::main_config>(config_path.string());
     storage_ = std::make_shared<binsrv::storage>(
         std::make_shared<binsrv::null_logger>(), *config_,
         binsrv::storage_construction_mode_type::streaming);
-    store_binlog();
+    if (layout == nullptr) {
+      store_binlog();
+    } else {
+      store_gtid_binlogs(*layout);
+    }
 
     source_config_.get<"server_id">() = settings.server_id;
     source_config_.get<"server_uuid">() = settings.server_uuid;
@@ -391,7 +505,7 @@ private:
   }
 
   void store_binlog() {
-    static constexpr std::uint32_t fde_server_id{42U};
+    static constexpr std::uint32_t fde_server_id{stored_fde_server_id};
     const binsrv::events::composite_binlog_name name{"binlog", 1U};
     require(storage_->open_binlog(name) == binsrv::open_binlog_status::created,
             "the binlog of the test storage was not created");
@@ -412,6 +526,56 @@ private:
                           binsrv::gtids::gtid{},
                           util::ctime_timestamp{std::time_t{1}}, 0ULL);
     storage_->flush_event_buffer();
+  }
+
+  void store_gtid_binlogs(const gtid_layout &layout) {
+    static constexpr std::uint32_t fde_server_id{stored_fde_server_id};
+    const auto at{[](std::uint64_t seconds) {
+      return util::ctime_timestamp{static_cast<std::time_t>(seconds)};
+    }};
+    binsrv::gtids::gtid_set previous;
+    for (binsrv::gtids::gno_t gno{1U}; gno < layout.first_gno; ++gno) {
+      previous.add(stored_uuid, binsrv::gtids::tag{}, gno);
+    }
+    auto gno{layout.first_gno};
+    std::uint64_t xid{1U};
+    for (std::size_t index{0U};
+         index < std::size(layout.transactions_per_binlog); ++index) {
+      if (index != 0U) {
+        storage_->close_binlog();
+      }
+      const binsrv::events::composite_binlog_name name{
+          "binlog", static_cast<std::uint32_t>(index + 1U)};
+      require(storage_->open_binlog(name) ==
+                  binsrv::open_binlog_status::created,
+              "a binlog of the test storage was not created");
+      std::uint64_t position{binsrv::events::magic_binlog_offset};
+      const auto store{[&](const std::vector<std::byte> &bytes,
+                           bool at_boundary, const binsrv::gtids::gtid &gtid) {
+        storage_->write_event(util::const_byte_span{bytes}, at_boundary, gtid,
+                              at(1U), 0ULL);
+        position += std::size(bytes);
+      }};
+      binsrv::events::event_storage buffer;
+      operations::generate_format_description_event_ex(
+          buffer, util::semantic_version{8U, 4U, 8U},
+          binsrv::events::magic_binlog_offset, fde_server_id,
+          /*enable_checksum_algorithm=*/true, /*artificial=*/false);
+      store({std::cbegin(buffer), std::cend(buffer)}, false,
+            binsrv::gtids::gtid{});
+      store(make_previous_gtids_log(position, fde_server_id, previous), true,
+            binsrv::gtids::gtid{});
+      for (std::size_t count{0U};
+           count < layout.transactions_per_binlog[index]; ++count, ++gno) {
+        const binsrv::gtids::gtid gtid{stored_uuid, gno};
+        const auto xid_size{std::size(make_xid_event(0U, fde_server_id, 0U))};
+        store(make_gtid_log_event(position, fde_server_id, gno, xid_size),
+              false, gtid);
+        store(make_xid_event(position, fde_server_id, xid++), true, gtid);
+        previous.add(gtid);
+      }
+      storage_->flush_event_buffer();
+    }
   }
 };
 
@@ -859,6 +1023,13 @@ public:
     }
   }
 
+  // whether a packet (or the end of the connection) arrives within
+  // 'timeout'
+  [[nodiscard]] bool wait_readable(std::chrono::milliseconds timeout) {
+    pollfd descriptor{.fd = socket_, .events = POLLIN, .revents = 0};
+    return ::poll(&descriptor, 1U, static_cast<int>(timeout.count())) > 0;
+  }
+
   // true when the server has closed the connection (nothing more arrives)
   [[nodiscard]] bool closed_by_server() {
     char byte{};
@@ -1086,6 +1257,9 @@ struct command {
   // (an empty name: the beginning of the storage)
   std::string dump_binlog{};
   std::uint64_t dump_position{binsrv::events::magic_binlog_offset};
+  // a blocking dump waits at the end of the data (and gets heartbeats)
+  // instead of ending with EOF
+  bool dump_blocking{false};
 };
 
 std::ostream &operator<<(std::ostream &output, const command &value) {
@@ -1141,11 +1315,13 @@ encode_command(const command &value,
         capabilities);
   }
   case command_kind::binlog_dump: {
-    // non-blocking, from the beginning of the storage: the stream ends with
-    // EOF once the stored binlog has been sent
+    // non-blocking unless asked otherwise: the stream ends with EOF once
+    // the stored binlog has been sent
     using dump = cp::message::client::BinlogDump;
     stdx::flags<dump::Flags> flags{};
-    flags |= dump::Flags::non_blocking;
+    if (!value.dump_blocking) {
+      flags |= dump::Flags::non_blocking;
+    }
     static constexpr std::uint32_t replica_server_id{2U};
     return encode_client_frame(
         0U,
@@ -1493,5 +1669,393 @@ BOOST_AUTO_TEST_CASE(ReplicationSourceReportsConfiguredIdentity) {
                   received.first_row.front() == expected,
               "expected '" + *expected + "':" + describe(transcript, index));
     }
+  });
+}
+
+
+// the statement by which a replica asks for heartbeats (PBS-30), in the
+// spellings a replica or a hand-written client may use: any letter case and
+// spacing, leading zeros, the legacy and the modern variable (one or both)
+struct heartbeat_period_statement {
+  std::string text;
+  // whether the listener has to accept it (OK); one without a value is a
+  // syntax error and leaves heartbeats off
+  bool accepted;
+  // the period the listener has to use after it: 0 (off) for an explicit 0
+  // and for a value that does not fit a signed 64-bit count of nanoseconds
+  std::chrono::nanoseconds period;
+};
+
+std::ostream &operator<<(std::ostream &output,
+                         const heartbeat_period_statement &value) {
+  return output << "'" << value.text << "' ("
+                << (value.accepted ? "accepted" : "refused") << ", period "
+                << value.period.count() << " ns)";
+}
+
+[[nodiscard]] gs::Generator<heartbeat_period_statement>
+heartbeat_period_statements() {
+  return gs::compose([](const hegel::TestCase &tc) {
+    const auto variable{[&tc] {
+      std::string name{tc.draw(gs::sampled_from(
+                           std::vector<std::string>{"master", "source"})) +
+                       "_heartbeat_period"};
+      if (tc.draw(gs::booleans())) {
+        std::ranges::transform(name, std::begin(name), [](char character) {
+          return static_cast<char>(
+              std::toupper(static_cast<unsigned char>(character)));
+        });
+      }
+      return "@" + name;
+    }};
+    const auto spacing{
+        gs::sampled_from(std::vector<std::string>{"", " ", "  "})};
+    std::string text{
+        tc.draw(gs::sampled_from(std::vector<std::string>{"SET", "set", "Set"})) +
+        tc.draw(gs::sampled_from(std::vector<std::string>{" ", "  ", "\t"})) +
+        variable()};
+    static constexpr int no_value_odds{10};
+    if (tc.draw(gs::integers<int>({.min_value = 1, .max_value = no_value_odds})) ==
+        1) {
+      if (tc.draw(gs::booleans())) {
+        text += tc.draw(spacing) + "=";
+      }
+      return heartbeat_period_statement{
+          .text = text, .accepted = false,
+          .period = std::chrono::nanoseconds::zero()};
+    }
+    static constexpr std::int64_t min_period_ms{60};
+    static constexpr std::int64_t max_period_ms{150};
+    std::string digits;
+    std::chrono::nanoseconds period{};
+    switch (tc.draw(gs::integers<int>({.min_value = 0, .max_value = 5}))) {
+    case 0:
+      digits = "0";
+      break;
+    case 1:
+      // more than a signed 64-bit count of nanoseconds holds
+      digits = "99999999999999999999";
+      break;
+    default:
+      period = std::chrono::milliseconds{tc.draw(gs::integers<std::int64_t>(
+          {.min_value = min_period_ms, .max_value = max_period_ms}))};
+      digits = std::to_string(period.count());
+      break;
+    }
+    digits.insert(0U,
+                  tc.draw(gs::integers<std::size_t>(
+                      {.min_value = 0U, .max_value = 3U})),
+                  '0');
+    const auto value_part{[&tc, &spacing, &digits] {
+      return tc.draw(spacing) + "=" + tc.draw(spacing) + digits;
+    }};
+    text += value_part();
+    if (tc.draw(gs::booleans())) {
+      text += ", " + variable() + value_part();
+    }
+    return heartbeat_period_statement{
+        .text = text, .accepted = true, .period = period};
+  });
+}
+
+// a blocking dump that has sent everything stored gets a heartbeat about
+// every period the client asked for (PBS-30), each reporting where the
+// client has got to; a non-blocking dump, or one whose period is 0, gets
+// none. Timing-based: the bounds are loose (the count, and the average
+// spacing), and the property runs a fixed, small number of cases (about one
+// second each)
+BOOST_AUTO_TEST_CASE(ReplicationSourceHeartbeatsFollowTheRequestedPeriod) {
+  hegel::Settings settings{};
+  static constexpr std::uint64_t test_cases{25U};
+  settings.test_cases = test_cases;
+  settings.suppress_health_check = {hegel::HealthCheck::TooSlow};
+  run_property(
+      [](hegel::TestCase &tc) {
+        const auto source_values{
+            tc.draw("settings", source_settings_generator())};
+        const auto statement{
+            tc.draw("statement", heartbeat_period_statements())};
+        const bool blocking{tc.draw("blocking", gs::booleans())};
+
+        const replication_source source{source_values};
+        mysql_client client{source.port()};
+        client.authenticate(replica_user, replica_password);
+        client.write_frame(encode_command(
+            {.kind = command_kind::query,
+             .statement = "SET @source_binlog_checksum = 'NONE', "
+                          "@master_binlog_checksum = 'NONE'"},
+            client.capabilities()));
+        require(client.read_reply().kind == reply_kind::ok,
+                "the checksum SET was not answered with OK");
+        client.write_frame(encode_command(
+            {.kind = command_kind::query, .statement = statement.text},
+            client.capabilities()));
+        const auto period_reply{client.read_reply()};
+        std::ostringstream label;
+        label << statement << (blocking ? ", blocking" : ", non-blocking")
+              << " dump";
+        require(period_reply.kind == (statement.accepted ? reply_kind::ok
+                                                         : reply_kind::error),
+                label.str() + ": answered with " +
+                    std::string{to_string(period_reply.kind)});
+        client.write_frame(encode_command({.kind = command_kind::binlog_dump,
+                                           .statement = {},
+                                           .dump_blocking = blocking},
+                                          client.capabilities()));
+
+        // every event packet until EOF, or for 'window' of a blocking dump
+        using clock = std::chrono::steady_clock;
+        static constexpr auto window{std::chrono::milliseconds{900}};
+        const auto deadline{clock::now() + window};
+        std::vector<std::pair<clock::time_point, std::vector<std::byte>>>
+            received;
+        bool ended{false};
+        while (true) {
+          const auto remaining{
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  deadline - clock::now())};
+          if (remaining.count() <= 0 || !client.wait_readable(remaining)) {
+            break;
+          }
+          const auto frame{client.read_frame()};
+          require(frame.has_value(),
+                  label.str() + ": the listener closed the connection");
+          const std::string_view payload{
+              std::string_view{*frame}.substr(frame_header_size)};
+          if (is_eof_packet(payload)) {
+            ended = true;
+            break;
+          }
+          require(!payload.empty() && payload.front() == '\0',
+                  label.str() + ": a packet that is not an event");
+          const auto event{payload.substr(1U)};
+          received.emplace_back(
+              clock::now(),
+              std::vector<std::byte>{
+                  reinterpret_cast<const std::byte *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+                      std::data(event)),
+                  reinterpret_cast<const std::byte *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+                      std::data(event) + std::size(event))});
+        }
+        require(ended == !blocking,
+                label.str() + (blocking ? ": ended with EOF"
+                                        : ": did not end with EOF"));
+
+        // the heartbeats, each checked against the coordinates the client
+        // had reached
+        heartbeat_testing::replica_coordinates coordinates;
+        std::vector<clock::time_point> heartbeats;
+        std::optional<clock::time_point> last_stored;
+        for (const auto &[moment, event] : received) {
+          const bool is_heartbeat{
+              std::size(event) >
+                  binsrv::events::common_header_view_base::size_in_bytes &&
+              static_cast<std::uint8_t>(event[binsrv::events::
+                                                  common_header_view_base::
+                                                      type_code_offset]) ==
+                  static_cast<std::uint8_t>(
+                      binsrv::events::code_type::heartbeat_log_v2)};
+          if (!is_heartbeat) {
+            require(heartbeats.empty(),
+                    label.str() + ": a stored event after a heartbeat");
+            heartbeat_testing::follow(coordinates, event,
+                                      /*session_checksum=*/false,
+                                      /*format_description_checksum=*/true);
+            last_stored = moment;
+            continue;
+          }
+          const auto error{heartbeat_testing::heartbeat_error(
+              event, coordinates, stored_fde_server_id,
+              /*with_checksum=*/true)};
+          require(error.empty(), label.str() + ": " + error);
+          heartbeats.push_back(moment);
+        }
+
+        const auto period{statement.period};
+        if (!blocking || period == std::chrono::nanoseconds::zero()) {
+          require(heartbeats.empty(),
+                  label.str() + ": " + std::to_string(std::size(heartbeats)) +
+                      " heartbeat(s) where none are due");
+          return;
+        }
+        require(last_stored.has_value(),
+                label.str() + ": no stored event was streamed");
+        const auto expected{window / period};
+        const auto lower{std::max<std::int64_t>(1, expected / 3)};
+        const auto upper{expected + 2};
+        require(std::ssize(heartbeats) >= lower &&
+                    std::ssize(heartbeats) <= upper,
+                label.str() + ": " + std::to_string(std::size(heartbeats)) +
+                    " heartbeat(s) in " + std::to_string(window.count()) +
+                    " ms, expected " + std::to_string(lower) + " to " +
+                    std::to_string(upper));
+        // single gaps are measured when the client reads the packets, which
+        // TCP may deliver late and then together (a small packet held back
+        // until the previous one is acknowledged), so only their average is
+        // compared with the period
+        if (std::size(heartbeats) >= 2U) {
+          const auto average{(heartbeats.back() - heartbeats.front()) /
+                             (std::ssize(heartbeats) - 1)};
+          require(average >= period / 2,
+                  label.str() + ": heartbeats every " +
+                      std::to_string(std::chrono::duration_cast<
+                                         std::chrono::milliseconds>(average)
+                                         .count()) +
+                      " ms on average");
+        }
+      },
+      settings);
+}
+
+// COM_BINLOG_DUMP_GTID (PBS-29 part 2) as a MySQL source answers it: a
+// replica that lacks a GTID the source has purged gets ERR 1236; any other
+// replica gets exactly the stored transactions whose GTIDs it does not have,
+// in stored order (the source starts at the first binlog it needs and skips
+// the transactions the replica has), whatever else its set holds (GTIDs of
+// other servers)
+BOOST_AUTO_TEST_CASE(ReplicationSourceDumpGtidSendsTheMissingTransactions) {
+  run_property([](hegel::TestCase &tc) {
+    auto source_values{tc.draw("settings", source_settings_generator())};
+    source_values.gtid_mode = true;
+    const gtid_layout layout{
+        .first_gno = tc.draw(
+            "first_gno", gs::integers<binsrv::gtids::gno_t>(
+                             {.min_value = 1U, .max_value = 4U})),
+        .transactions_per_binlog = tc.draw(
+            "transactions_per_binlog",
+            gs::vectors(gs::integers<std::size_t>(
+                            {.min_value = 1U, .max_value = 4U}),
+                        {.min_size = 1U, .max_size = 4U}))};
+    binsrv::gtids::gno_t last_gno{layout.first_gno - 1U};
+    for (const auto count : layout.transactions_per_binlog) {
+      last_gno += count;
+    }
+
+    // the replica's executed GTIDs: everything up to a point (the usual
+    // case), any subset, or a prefix plus GTIDs of another server
+    binsrv::gtids::gtid_set replica;
+    const auto shape{tc.draw(
+        "replica_shape",
+        gs::sampled_from(std::vector<std::string>{"prefix", "subset",
+                                                  "prefix_and_foreign"}))};
+    if (shape == "subset") {
+      for (binsrv::gtids::gno_t gno{1U}; gno <= last_gno; ++gno) {
+        if (tc.draw(gs::booleans())) {
+          replica.add(stored_uuid, binsrv::gtids::tag{}, gno);
+        }
+      }
+    } else {
+      const auto executed{tc.draw(
+          "executed_up_to", gs::integers<binsrv::gtids::gno_t>(
+                                {.min_value = 0U, .max_value = last_gno}))};
+      for (binsrv::gtids::gno_t gno{1U}; gno <= executed; ++gno) {
+        replica.add(stored_uuid, binsrv::gtids::tag{}, gno);
+      }
+      if (shape == "prefix_and_foreign") {
+        const binsrv::gtids::uuid foreign{
+            "77777777-8888-9999-aaaa-bbbbccccdddd"};
+        for (binsrv::gtids::gno_t gno{1U}; gno <= 3U; ++gno) {
+          replica.add(foreign, binsrv::gtids::tag{}, gno);
+        }
+      }
+    }
+
+    bool lacks_purged{false};
+    for (binsrv::gtids::gno_t gno{1U}; gno < layout.first_gno; ++gno) {
+      lacks_purged =
+          lacks_purged || !replica.contains(binsrv::gtids::gtid{stored_uuid, gno});
+    }
+    std::vector<binsrv::gtids::gno_t> expected;
+    for (auto gno{layout.first_gno}; gno <= last_gno; ++gno) {
+      if (!replica.contains(binsrv::gtids::gtid{stored_uuid, gno})) {
+        expected.push_back(gno);
+      }
+    }
+
+    std::ostringstream label;
+    label << layout << ", replica has '" << replica << "'";
+
+    const replication_source source{source_values, &layout};
+    mysql_client client{source.port()};
+    client.authenticate(replica_user, replica_password);
+    client.write_frame(encode_command(
+        {.kind = command_kind::query,
+         .statement = "SET @source_binlog_checksum = 'NONE', "
+                      "@master_binlog_checksum = 'NONE'"},
+        client.capabilities()));
+    require(client.read_reply().kind == reply_kind::ok,
+            "the checksum SET was not answered with OK");
+
+    std::vector<std::byte> encoded(replica.calculate_encoded_size());
+    util::byte_span encoded_span{encoded};
+    replica.encode_to(encoded_span);
+    using dump_gtid = cp::message::client::BinlogDumpGtid;
+    stdx::flags<dump_gtid::Flags> flags{};
+    flags |= dump_gtid::Flags::non_blocking;
+    flags |= dump_gtid::Flags::through_gtid;
+    static constexpr std::uint32_t replica_server_id{2U};
+    client.write_frame(encode_client_frame(
+        0U,
+        dump_gtid{flags, replica_server_id, "",
+                  binsrv::events::magic_binlog_offset,
+                  std::string{reinterpret_cast<const char *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+                                  std::data(encoded)),
+                              std::size(encoded)}},
+        client.capabilities()));
+
+    // the transactions streamed (by the GNO of their GTID_LOG events) up to
+    // EOF, or the error
+    using header = binsrv::events::common_header_view_base;
+    // GTID_LOG post header: flags (1 byte), UUID (16 bytes), GNO (8 bytes)
+    static constexpr std::size_t gno_offset{header::size_in_bytes + 1U + 16U};
+    static constexpr auto reply_timeout{std::chrono::seconds{10}};
+    std::vector<binsrv::gtids::gno_t> received;
+    std::optional<std::uint16_t> error_code;
+    std::string ending{"no reply within " +
+                       std::to_string(reply_timeout.count()) + " s"};
+    while (client.wait_readable(reply_timeout)) {
+      const auto frame{client.read_frame()};
+      if (!frame.has_value()) {
+        ending = "the connection closed";
+        break;
+      }
+      const std::string_view payload{
+          std::string_view{*frame}.substr(frame_header_size)};
+      if (is_eof_packet(payload)) {
+        ending = "EOF";
+        break;
+      }
+      if (!payload.empty() && static_cast<std::uint8_t>(payload[0]) == 0xFFU) {
+        error_code = static_cast<std::uint16_t>(read_fixed_int(payload, 1U, 2U));
+        ending = "ERR " + std::to_string(*error_code);
+        break;
+      }
+      const auto event{payload.substr(1U)};
+      if (std::size(event) >= gno_offset + 8U &&
+          static_cast<std::uint8_t>(event[header::type_code_offset]) ==
+              static_cast<std::uint8_t>(binsrv::events::code_type::gtid_log)) {
+        received.push_back(read_fixed_int(event, gno_offset, 8U));
+      }
+    }
+
+    const auto list{[](const std::vector<binsrv::gtids::gno_t> &gnos) {
+      std::string result;
+      for (const auto gno : gnos) {
+        result += (result.empty() ? "" : ",") + std::to_string(gno);
+      }
+      return "[" + result + "]";
+    }};
+    if (lacks_purged) {
+      require(error_code == er_source_fatal_error_reading_binlog,
+              label.str() + ": a replica lacking purged GTIDs was answered "
+                            "with " + ending + " instead of ERR 1236");
+      return;
+    }
+    require(ending == "EOF",
+            label.str() + ": the dump ended with " + ending + " after GNOs " +
+                list(received) + ", expected GNOs " + list(expected));
+    require(received == expected,
+            label.str() + ": streamed GNOs " + list(received) +
+                ", expected " + list(expected));
   });
 }

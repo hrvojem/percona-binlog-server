@@ -1,6 +1,9 @@
 # Hegel settings profiles for the nightly property-test run. run_nightly.sh
 # selects one per build through HEGEL_DEFAULT_PROFILE. Each build has its own
 # failure database, so a failure found one night is replayed first the next.
+# Before each build's run, run_nightly.sh copies into its database every input
+# the other builds have saved, so a failure found in one build is replayed in
+# all of them (each keeps its own copy, see run_nightly.sh).
 #
 # report_multiple_failures keeps each case generating after the first failing
 # example so one night surfaces every distinct bug in a property, not just the

@@ -350,6 +350,23 @@ for config in "${cpp_configs[@]}"; do
   jobs=$JOBS
   [ "$config" = tsan_gcc14 ] && jobs=$TSAN_JOBS
 
+  # share failing inputs between the builds: before its run, this build's
+  # Hegel database (hegel.toml) gets every input another build has saved,
+  # copied without overwriting, so a bug one build found is replayed first in
+  # all of them. One shared database would not do: Hegel drops a saved input
+  # that no longer fails, so a build that cannot hit it (an assertion compiled
+  # out of release) would delete it for the build that found it
+  database=$NIGHTLY/hegel-db/$config
+  mkdir -p "$database"
+  saved_before=$(find "$database" -type f | wc -l)
+  for other in "$NIGHTLY"/hegel-db/*/; do
+    [ "${other%/}" = "$database" ] && continue
+    cp -r --update=none "$other". "$database"/
+  done
+  log "hegel database of $config: $saved_before saved input(s)," \
+    "$(( $(find "$database" -type f | wc -l) - saved_before )) taken from" \
+    "the other builds"
+
   # collect every (program, binary, test case) task for this config
   case_tasks=()
   for binary in "${property_tests[@]}"; do

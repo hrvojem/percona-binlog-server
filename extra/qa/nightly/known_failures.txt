@@ -12,7 +12,7 @@ IndexedEventBlockIndexesOnlyCompleteEvents  tickets 7/39 (PBS-112): since PBS-29
 CipherContextOffsetMatchesCounterReference  ticket 8: CTR counter carry in create_with_offset
 CipherContextDecryptionAtOffsetsRoundTrips  ticket 8: CTR counter carry in create_with_offset
 CipherContextSplitEncryptionMatchesWhole  ticket 8: CTR counter carry (split encryption variant)
-MinimysqlBinlogEventFramesRoundTrip  ticket 10: binlog events of 16 MB or more in pull mode
+MinimysqlBinlogEventFramesRoundTrip  ticket 10 (PBS-76): binlog events of 16 MB or more in pull mode
 TimestampParsingMatchesModel  ticket 11: out-of-range time of day accepted (search_by_timestamp)
 FilesystemStorageUriMatchesModel  ticket 12: file URI with %00 opens the directory before it
 StorageOpeningOfDamagedFilesFailsCleanly  ticket 36: startup deletes a complete binlog as interrupted-creation garbage when binlog.index is missing or lost its last entry

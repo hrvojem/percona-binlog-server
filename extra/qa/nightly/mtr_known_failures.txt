@@ -10,7 +10,7 @@
 9.7 gtid_tagged_log_oversized_tag  ticket 5: oversized GTID tag in a GTID_TAGGED_LOG event
 8.4 previous_gtids_log_oversized_tag  ticket 5: oversized GTID tag in a PREVIOUS_GTIDS_LOG event
 9.7 previous_gtids_log_oversized_tag  ticket 5: oversized GTID tag in a PREVIOUS_GTIDS_LOG event
-* rs_huge_event  ticket 10: binlog events of 16 MB or more in pull mode
+* rs_huge_event  ticket 10 (PBS-76): binlog events of 16 MB or more in pull mode
 * search_by_timestamp_invalid_time  ticket 11: out-of-range time of day accepted (search_by_timestamp)
 * gtid_resume_after_rotation  ticket 14: GTID-mode resume after a rotation misses the closing ROTATE and empty binlogs
 * rs_source_killed_after_rotation  ticket 6: closing a binlog mid-transaction keeps the dropped events' timestamps (pull aborts at storage.cpp:138 after the source is killed right after a rotation)

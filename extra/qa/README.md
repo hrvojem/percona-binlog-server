@@ -274,7 +274,7 @@ closes, and a `fetch` on the same storage resumes to exact copies). The first
 three pass (30 clients, 316 binlogs). `shutdown` fails: with the source idle,
 `pull` exits only when its blocking read from the source times out
 (`connection.read_timeout`), and the clients stay connected until then
-(ticket 43); the storage is left consistent.
+(ticket 43, PBS-116); the storage is left consistent.
 
 All three harnesses start `pull` and point the replica at it through the same
 helpers in `pull_replica_test.py` (`start_pull()`, `replicate_from_pull()`).
@@ -449,7 +449,7 @@ server rather than starting one.
   `query_race_test list_next_to_pull` (ticket 29),
   `pull_heartbeat_test quiet_after_rotation` (ticket 40, PBS-113),
   `large_binlog_test position/transaction_over_4gib` (ticket 41, PBS-114),
-  `pull_load_test position/shutdown` (ticket 43) and
+  `pull_load_test position/shutdown` (ticket 43, PBS-116) and
   `fetch_crash_test gtid` (ticket 14, when the run generates a fetch /
   `FLUSH BINARY LOGS` / fetch sequence).
 - **`ci_property_tests.sh`** — what the CI job *GCC 14 Debug Property Tests*

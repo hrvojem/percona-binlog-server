@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <ostream>
@@ -72,9 +73,11 @@
 #include "binsrv/events/footer_view.hpp"
 #include "binsrv/events/gtid_log_flag_type.hpp"
 #include "binsrv/events/gtid_log_post_header.hpp"
+#include "binsrv/events/heartbeat_log_v2_body_impl.hpp"
 #include "binsrv/events/protocol_traits_fwd.hpp"
 #include "binsrv/events/reader_context.hpp"
 
+#include "util/byte_span.hpp"
 #include "util/byte_span_fwd.hpp"
 #include "util/byte_span_inserters.hpp"
 #include "util/common_optional_types.hpp"
@@ -722,6 +725,269 @@ BOOST_AUTO_TEST_CASE(EventChecksumDetectsSingleBitFlip) {
       throw std::runtime_error{
           "a single bit flip was not detected, the event was parsed as:\n" +
           to_string(*parsed)};
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// HEARTBEAT_LOG_EVENT_V2 body decoding (PBS-30)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using heartbeat_body =
+    events::generic_body_impl<code_type::heartbeat_log_v2>;
+using byte_list = std::vector<std::uint8_t>;
+
+// the packed integer encodings of 'value': the shortest one, and a wider one
+// (which the decoder accepts as well); 'width' 0 picks the shortest
+[[nodiscard]] byte_list packed(std::uint64_t value, int width = 0) {
+  static constexpr std::uint64_t single_limit{251U};
+  byte_list result;
+  const auto append_le{[&result](std::uint64_t number, std::size_t bytes) {
+    for (std::size_t index{0U}; index < bytes; ++index) {
+      result.push_back(static_cast<std::uint8_t>(number >> (8U * index)));
+    }
+  }};
+  if (width == 0) {
+    width = value < single_limit ? 1 : value < (1ULL << 16U) ? 2
+            : value < (1ULL << 24U)                         ? 3
+                                                            : 8;
+  }
+  switch (width) {
+  case 1:
+    result.push_back(static_cast<std::uint8_t>(value));
+    break;
+  case 2:
+    result.push_back(0xFCU);
+    append_le(value, 2U);
+    break;
+  case 3:
+    result.push_back(0xFDU);
+    append_le(value, 3U);
+    break;
+  default:
+    result.push_back(0xFEU);
+    append_le(value, 8U);
+    break;
+  }
+  return result;
+}
+
+// the TLV decoding of MySQL's Heartbeat::decode (libs/mysql/binlog/event/
+// codecs/binary.cpp), written independently of the decoder under test: a
+// sequence of <type> <length> <value> triples of packed integers up to the
+// end marker (type 0) or the end of the data; type 1 is the log file name
+// (<length> bytes), type 2 the log position (a packed integer read after
+// <length>, which is not used), any other type is skipped by <length>.
+// Packed integers: below 251 one byte, 0xFC / 0xFD / 0xFE then 2 / 3 / 8
+// little-endian bytes, 0xFB the maximum value, 0xFF invalid.
+struct heartbeat_model_result {
+  bool rejected;
+  std::string binlog;
+  std::uint64_t position;
+};
+
+[[nodiscard]] heartbeat_model_result decode_heartbeat_model(const byte_list &body) {
+  std::size_t offset{0U};
+  const auto read_packed{[&body, &offset]() -> std::optional<std::uint64_t> {
+    if (offset >= std::size(body)) {
+      return std::nullopt;
+    }
+    const auto first{body[offset++]};
+    std::size_t bytes{0U};
+    switch (first) {
+    case 0xFBU:
+      return std::numeric_limits<std::uint64_t>::max();
+    case 0xFCU:
+      bytes = 2U;
+      break;
+    case 0xFDU:
+      bytes = 3U;
+      break;
+    case 0xFEU:
+      bytes = 8U;
+      break;
+    case 0xFFU:
+      return std::nullopt;
+    default:
+      return first;
+    }
+    if (std::size(body) - offset < bytes) {
+      return std::nullopt;
+    }
+    std::uint64_t value{0U};
+    for (std::size_t index{0U}; index < bytes; ++index) {
+      value |= static_cast<std::uint64_t>(body[offset++]) << (8U * index);
+    }
+    return value;
+  }};
+  heartbeat_model_result result{.rejected = false, .binlog = {}, .position = 0U};
+  while (offset < std::size(body)) {
+    const auto type{read_packed()};
+    if (!type.has_value()) {
+      result.rejected = true;
+      return result;
+    }
+    if (*type == 0U) {
+      break;
+    }
+    const auto length{read_packed()};
+    if (!length.has_value()) {
+      result.rejected = true;
+      return result;
+    }
+    if (*type == 2U) {
+      const auto position{read_packed()};
+      if (!position.has_value()) {
+        result.rejected = true;
+        return result;
+      }
+      result.position = *position;
+      continue;
+    }
+    if (*length > std::size(body) - offset) {
+      result.rejected = true;
+      return result;
+    }
+    if (*type == 1U) {
+      result.binlog.assign(
+          reinterpret_cast<const char *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+              std::next(std::data(body), static_cast<std::ptrdiff_t>(offset))),
+          *length);
+    }
+    offset += *length;
+  }
+  return result;
+}
+
+// a heartbeat body built from its fields: the log file name, the position
+// (with its declared length right or wrong), unknown fields, an optional end
+// marker and trailing bytes after it, packed integers in their shortest or a
+// wider encoding; sometimes corrupted (cut short, a byte replaced by a packed
+// integer prefix, or an inflated length)
+[[nodiscard]] gs::Generator<byte_list> heartbeat_bodies() {
+  return gs::compose([](const hegel::TestCase &tc) {
+    const auto width{[&tc] {
+      return tc.draw(gs::sampled_from(std::vector<int>{0, 0, 0, 2, 3, 8}));
+    }};
+    byte_list body;
+    const auto append{[&body](const byte_list &bytes) {
+      body.insert(std::end(body), std::begin(bytes), std::end(bytes));
+    }};
+    const auto fields{tc.draw(gs::integers<std::size_t>(
+        {.min_value = 0U, .max_value = 5U}))};
+    for (std::size_t field{0U}; field < fields; ++field) {
+      switch (tc.draw(gs::integers<int>({.min_value = 0, .max_value = 2}))) {
+      case 0: {
+        // a binlog name, or any bytes (a name on the wire is just bytes)
+        std::string name;
+        if (tc.draw(gs::booleans())) {
+          name = tc.draw(gs::from_regex("binlog\\.[0-9]{6}", true));
+        } else {
+          for (const auto value : tc.draw(gs::vectors(
+                   gs::integers<std::uint8_t>(), {.max_size = 70U}))) {
+            name.push_back(static_cast<char>(value));
+          }
+        }
+        append(packed(1U, width()));
+        append(packed(std::size(name), width()));
+        body.insert(std::end(body), std::begin(name), std::end(name));
+      } break;
+      case 1: {
+        const auto position{tc.draw(gs::one_of(
+            {gs::integers<std::uint64_t>({.min_value = 0U, .max_value = 300U}),
+             gs::integers<std::uint64_t>()}))};
+        const auto value{packed(position, width())};
+        const bool wrong_length{tc.draw(gs::booleans())};
+        append(packed(2U, width()));
+        append(packed(wrong_length ? tc.draw(gs::integers<std::uint64_t>(
+                                         {.min_value = 0U, .max_value = 20U}))
+                                   : std::size(value),
+                      width()));
+        append(value);
+      } break;
+      default: {
+        const auto type{tc.draw(gs::integers<std::uint64_t>(
+            {.min_value = 3U, .max_value = 1U << 20U}))};
+        const auto value{tc.draw(gs::vectors(
+            gs::integers<std::uint8_t>(), {.max_size = 40U}))};
+        append(packed(type, width()));
+        append(packed(std::size(value), width()));
+        append(value);
+      } break;
+      }
+    }
+    if (tc.draw(gs::booleans())) {
+      append(packed(0U, width()));
+      append(tc.draw(gs::vectors(gs::integers<std::uint8_t>(),
+                                 {.max_size = 8U})));
+    }
+    switch (tc.draw(gs::integers<int>({.min_value = 0, .max_value = 5}))) {
+    case 0:
+      if (!body.empty()) {
+        body.resize(tc.draw(gs::integers<std::size_t>(
+            {.min_value = 0U, .max_value = std::size(body) - 1U})));
+      }
+      break;
+    case 1:
+      if (!body.empty()) {
+        body[tc.draw(gs::integers<std::size_t>(
+            {.min_value = 0U, .max_value = std::size(body) - 1U}))] =
+            tc.draw(gs::sampled_from(
+                std::vector<std::uint8_t>{0xFBU, 0xFCU, 0xFDU, 0xFEU, 0xFFU}));
+      }
+      break;
+    default:
+      break;
+    }
+    return body;
+  });
+}
+
+[[nodiscard]] std::string describe_bytes(const byte_list &bytes) {
+  static constexpr std::string_view digits{"0123456789abcdef"};
+  std::string result;
+  for (const auto byte : bytes) {
+    result += digits[byte >> 4U];
+    result += digits[byte & 0x0FU];
+  }
+  return result;
+}
+
+} // namespace
+
+// a HEARTBEAT_LOG_EVENT_V2 body (PBS-30) decodes as MySQL decodes it, over
+// generated field sequences and corruptions of them: the decoder throws
+// std::invalid_argument exactly when the model rejects the body (a truncated
+// or invalid packed integer, a file name or unknown field longer than the
+// rest of the body), and otherwise reports the same file name and position,
+// skipping unknown fields and tolerating a missing end marker
+BOOST_AUTO_TEST_CASE(HeartbeatLogV2BodyDecodesLikeMysql) {
+  run_property([](hegel::TestCase &tc) {
+    const auto body{tc.draw("body", heartbeat_bodies())};
+    const auto expected{decode_heartbeat_model(body)};
+    const auto label{"body " + describe_bytes(body)};
+    std::vector<std::byte> bytes(std::size(body));
+    std::ranges::transform(body, std::begin(bytes), [](std::uint8_t value) {
+      return static_cast<std::byte>(value);
+    });
+    try {
+      const heartbeat_body decoded{util::const_byte_span{bytes}};
+      require(!expected.rejected,
+              label + ": accepted, but MySQL's decoding rejects it");
+      require(decoded.get_readable_binlog() == expected.binlog,
+              label + ": file name '" +
+                  std::string{decoded.get_readable_binlog()} + "', expected '" +
+                  expected.binlog + "'");
+      require(decoded.get_position() == expected.position,
+              label + ": position " + std::to_string(decoded.get_position()) +
+                  ", expected " + std::to_string(expected.position));
+    } catch (const std::invalid_argument &) {
+      require(expected.rejected,
+              label + ": rejected, but MySQL's decoding accepts it (file name '" +
+                  expected.binlog + "', position " +
+                  std::to_string(expected.position) + ")");
     }
   });
 }

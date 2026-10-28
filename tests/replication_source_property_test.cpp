@@ -36,7 +36,9 @@
 //   statement gets OK or a resultset, and a near-miss (an extra suffix, a
 //   prefix without its delimiter, a different letter case) gets an error;
 // - SELECT @@GLOBAL.SERVER_ID / SERVER_UUID return the configured values and
-//   SELECT @@GLOBAL.GTID_MODE is ON exactly for a storage in GTID mode.
+//   SELECT @@GLOBAL.GTID_MODE is ON exactly for a storage in GTID mode;
+// - a client disconnecting at any point is logged as "connection closed by
+//   peer" at info level, never as an error.
 
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -60,6 +62,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ostream>
 #include <sstream>
@@ -113,6 +116,8 @@
 
 #pragma GCC diagnostic pop
 
+#include "binsrv/basic_logger.hpp"
+#include "binsrv/log_severity.hpp"
 #include "binsrv/main_config.hpp"
 #include "binsrv/null_logger.hpp"
 #include "binsrv/replication_source_config.hpp"
@@ -390,9 +395,14 @@ constexpr std::uint32_t stored_fde_server_id{42U};
 class replication_source {
 public:
   // a storage holding one binlog with only its preamble, or, given a
-  // 'layout' (with settings.gtid_mode), the GTID transactions it describes
+  // 'layout' (with settings.gtid_mode), the GTID transactions it describes;
+  // the listener logs to 'logger' if given (otherwise nowhere)
   explicit replication_source(const source_settings &settings,
-                              const gtid_layout *layout = nullptr) {
+                              const gtid_layout *layout = nullptr,
+                              binsrv::basic_logger_ptr logger = {}) {
+    if (logger != nullptr) {
+      logger_ = std::move(logger);
+    }
     std::filesystem::create_directories(root_.path() / "storage");
     const auto config_path{write_config(settings)};
     config_ = std::make_unique<binsrv::main_config>(config_path.string());
@@ -773,7 +783,23 @@ public:
   mysql_client &operator=(const mysql_client &) = delete;
   mysql_client(mysql_client &&) = delete;
   mysql_client &operator=(mysql_client &&) = delete;
-  ~mysql_client() { ::close(socket_); }
+  ~mysql_client() {
+    if (socket_ >= 0) {
+      ::close(socket_);
+    }
+  }
+
+  // closes the connection: an orderly close (FIN, the listener reads EOF) or
+  // an abortive one (SO_LINGER 0: RST, the listener gets ECONNRESET)
+  void disconnect(bool abortive) {
+    if (abortive) {
+      const linger no_linger{.l_onoff = 1, .l_linger = 0};
+      ::setsockopt(socket_, SOL_SOCKET, SO_LINGER, &no_linger,
+                   sizeof no_linger);
+    }
+    ::close(socket_);
+    socket_ = -1;
+  }
 
   [[nodiscard]] const minimysql::capability_bitset &
   capabilities() const noexcept {
@@ -2057,5 +2083,135 @@ BOOST_AUTO_TEST_CASE(ReplicationSourceDumpGtidSendsTheMissingTransactions) {
     require(received == expected,
             label.str() + ": streamed GNOs " + list(received) +
                 ", expected " + list(expected));
+  });
+}
+
+namespace {
+
+// a logger that keeps every line the listener logs at info level or above
+class capturing_logger final : public binsrv::basic_logger {
+public:
+  capturing_logger() noexcept : basic_logger{binsrv::log_severity::info} {}
+
+  [[nodiscard]] std::vector<std::string> lines() const {
+    const std::scoped_lock lock{lines_mutex_};
+    return lines_;
+  }
+
+private:
+  mutable std::mutex lines_mutex_;
+  std::vector<std::string> lines_;
+
+  void do_log(std::string_view message) override {
+    const std::scoped_lock lock{lines_mutex_};
+    lines_.emplace_back(message);
+  }
+};
+
+// where in a session the client disconnects
+enum class disconnect_point : std::uint8_t {
+  after_server_greeting,
+  inside_client_greeting,
+  after_authentication,
+  inside_command
+};
+
+[[nodiscard]] std::string_view to_string(disconnect_point point) {
+  switch (point) {
+  case disconnect_point::after_server_greeting:
+    return "after the server greeting";
+  case disconnect_point::inside_client_greeting:
+    return "inside the client greeting";
+  case disconnect_point::after_authentication:
+    return "after authentication";
+  case disconnect_point::inside_command:
+    return "inside a command";
+  }
+  return "?";
+}
+
+} // anonymous namespace
+
+// a client that goes away at any point of a session (an orderly close or a
+// reset) ends only that session, which the listener reports as "connection
+// closed by peer" at info level, never at error level: a replica or
+// mysqlbinlog disconnecting is routine (ticket 42, PBS-115: fails today for an
+// orderly close, which network_service::handle_exception looks for as
+// boost::asio::error::eof in the system category, while Asio reports it in
+// asio.misc; the reset is ECONNRESET in the system category and passes)
+BOOST_AUTO_TEST_CASE(ReplicationSourceLogsDisconnectsAsRoutine) {
+  run_property([](hegel::TestCase &tc) {
+    const auto settings{tc.draw("settings", source_settings_generator())};
+    const auto point{static_cast<disconnect_point>(tc.draw(
+        "point", gs::integers<std::uint8_t>(
+                     {.min_value = 0U,
+                      .max_value = static_cast<std::uint8_t>(
+                          disconnect_point::inside_command)})))};
+    const auto abortive{tc.draw("abortive", gs::booleans())};
+    const std::string label{std::string{"a client disconnecting "} +
+                            std::string{to_string(point)} +
+                            (abortive ? " with a reset" : " with a FIN")};
+
+    const auto logger{std::make_shared<capturing_logger>()};
+    const replication_source source{settings, nullptr, logger};
+    {
+      mysql_client client{source.port()};
+      switch (point) {
+      case disconnect_point::after_server_greeting:
+        require(client.read_frame().has_value(), "no server greeting");
+        break;
+      case disconnect_point::inside_client_greeting:
+        require(client.read_frame().has_value(), "no server greeting");
+        // a frame header announcing 64 bytes, then only 3 of them
+        client.write_frame(network_buffer_type{"\x40\x00\x00\x01xyz", 7U});
+        break;
+      case disconnect_point::after_authentication:
+        client.authenticate(replica_user, replica_password);
+        break;
+      case disconnect_point::inside_command:
+        client.authenticate(replica_user, replica_password);
+        // COM_QUERY announcing 32 bytes, then only "SEL"
+        client.write_frame(network_buffer_type{"\x20\x00\x00\x00\x03SEL", 8U});
+        break;
+      }
+      client.disconnect(abortive);
+    }
+
+    // the session ends in network_service::handle_exception, which logs
+    // either outcome with the session's name
+    const auto ended{[&logger] {
+      for (const auto &line : logger->lines()) {
+        if ((line.find(": session ") != std::string::npos &&
+             line.find("connection closed by peer") != std::string::npos) ||
+            line.find("caught in session ") != std::string::npos) {
+          return true;
+        }
+      }
+      return false;
+    }};
+    const auto deadline{std::chrono::steady_clock::now() +
+                        std::chrono::seconds{10}};
+    while (!ended() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    const auto lines{logger->lines()};
+    std::string log;
+    for (const auto &line : lines) {
+      log += "\n  " + line;
+    }
+    require(ended(), label + ": the listener logged no end of the session:" +
+                         log);
+    for (const auto &line : lines) {
+      require(line.find("[  error]") == std::string::npos &&
+                  line.find("[  fatal]") == std::string::npos,
+              label + " was logged as an error:" + log);
+    }
+    require(std::ranges::any_of(lines,
+                                [](const std::string &line) {
+                                  return line.find(
+                                             "connection closed by peer") !=
+                                         std::string::npos;
+                                }),
+            label + " was not logged as 'connection closed by peer':" + log);
   });
 }

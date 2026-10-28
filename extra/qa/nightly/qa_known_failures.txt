@@ -6,8 +6,8 @@
 # without '/' also covers every '<name>/...' case. Multi-case harnesses name
 # their cases '<mode>/...' (see nightly_stages.py); the rotation harnesses
 # (s3_fault_sweep, disk_fault_sweep, network_fault_test, listener_fuzz_test,
-# source_change_test) run about once a week, so their known failures show up
-# on those nights only.
+# source_change_test, large_binlog_test) run about once a week, so their known
+# failures show up on those nights only.
 # A sanitizer report is never covered by a pattern line (its reason names
 # the report) unless the ticket text mentions the sanitizer.
 # A failure listed here is reported as known; any other failure is NEW.
@@ -38,3 +38,4 @@ s3_fault_sweep */PUT-binlog.0/reset_*/x6  ticket 18 (PBS-83): double write after
 source_change_test */reset  ticket 25: RESET BINARY LOGS AND GTIDS on the source is not detected (the stored binlog.000001 no longer matches the source's)
 source_change_test */identity  ticket 25: a different source server (new server_uuid) on the same address is not detected
 source_change_test gtid/restart  ticket 6: pull aborts at storage.cpp:138 (incomplete_transaction_timestamps_ not empty in open_binlog) when it reconnects in GTID mode after the source restarted
+large_binlog_test position/transaction_over_4gib  ticket 41: the collector refuses a transaction of 4 GiB or more ("transaction length in the ... gtid log event is too large"), so fetch / pull stop at it for good

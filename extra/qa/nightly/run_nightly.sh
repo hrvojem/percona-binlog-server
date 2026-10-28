@@ -16,8 +16,8 @@
 # pull_replica_test.py, query_race_test.py, pull_heartbeat_test.py and a
 # short fetch_crash_test.py run per mode on file and on S3 storage; and one
 # of the heavier harnesses by day of the week (QA_ROTATION: the S3 and disk
-# fault sweeps, the network fault test, the listener fuzzer and the source
-# change test). Their
+# fault sweeps, the network fault test, the listener fuzzer, the source
+# change test and the over-4-GiB binlog test). Their
 # failures are compared with mtr_known_failures.txt and qa_known_failures.txt
 # (see nightly_stages.py, which runs those stages). QA_ROTATION_DAY (1-7 for
 # Monday-Sunday, a comma list, 'all' or 'none'; default today's weekday)
@@ -97,7 +97,7 @@ QA_S3_EXAMPLES=${QA_S3_EXAMPLES:-5}
 S3_BUCKET_DIR=${S3_BUCKET_DIR:-$WS/s3/data/pbs-mtr}
 # the rotation of the heavier QA harnesses: '<weekday>:<harness>/<mode>'
 # (weekday 1-7 is Monday-Sunday, date +%u); 4-15 min a night (README.md)
-QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 2:disk_fault_sweep/position 3:network_fault_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 5:s3_fault_sweep/gtid 6:disk_fault_sweep/gtid 7:network_fault_test/gtid"}
+QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 2:disk_fault_sweep/position 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 5:s3_fault_sweep/gtid 6:disk_fault_sweep/gtid 7:network_fault_test/gtid"}
 QA_ROTATION_DAY=${QA_ROTATION_DAY:-$(date -u +%u)}
 # each fuzz connection takes about 1 s since the listener always does full
 # caching_sha2_password authentication (PBS-10), 3000 would take 50 min
@@ -561,6 +561,12 @@ if want qa; then
         qa_run source_change_test "source_change_test ($mode)" \
           "${common[@]}" --workdir "$out/qa/sc-$mode" \
           --port $((QA_PORT + 110)) --timeout 1500 ;;
+      large_binlog_test)
+        # binlogs and transactions past 4 GiB; about 20 GB of disk while it
+        # runs, removed at the end
+        qa_run large_binlog_test "large_binlog_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/lb-$mode" \
+          --port $((QA_PORT + 140)) --timeout 5400 ;;
       *) log "unknown QA_ROTATION harness $harness" ;;
     esac
     log "$harness ($mode) done in $(( ($(date +%s) - stage_started) / 60 )) min"

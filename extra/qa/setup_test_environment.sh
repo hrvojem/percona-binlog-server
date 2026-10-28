@@ -4,7 +4,8 @@
 #
 # It provisions everything the tests under extra/qa and the binlog_streaming
 # MTR suite need:
-#   * the GCC 14 toolchain and build dependencies (system packages);
+#   * the GCC 14 toolchain and build dependencies (system packages), and
+#     Clang 20 with its compiler-rt runtimes for the libFuzzer targets;
 #   * Boost and the AWS SDK for C++, built with the project's CMake presets;
 #   * the binlog_server builds (debug, ASan, TSan, coverage);
 #   * the MySQL server + test tarballs for 8.0, 8.4 and 9.7;
@@ -98,6 +99,7 @@ step_packages() {
     pkg-config unzip xz-utils python3 python3-pip python3-venv \
     libssl-dev zlib1g-dev libaio-dev libnuma1 libncurses6 \
     libcurl4-openssl-dev libmysqlclient-dev libzstd-dev \
+    clang-20 libclang-rt-20-dev lld-20 \
     || fail "apt-get install failed"
   # the MySQL minimal tarballs link against libaio.so.1
   if [ ! -e /lib/x86_64-linux-gnu/libaio.so.1 ] && \
@@ -356,6 +358,7 @@ step_nightly() {
   install -m 0644 "$src_dir/known_failures.txt" "$dst_dir/known_failures.txt"
   install -m 0644 "$src_dir/mtr_known_failures.txt" "$dst_dir/mtr_known_failures.txt"
   install -m 0644 "$src_dir/qa_known_failures.txt" "$dst_dir/qa_known_failures.txt"
+  install -m 0644 "$src_dir/fuzz_known_failures.txt" "$dst_dir/fuzz_known_failures.txt"
   install -m 0755 "$src_dir/nightly_stages.py" "$dst_dir/nightly_stages.py"
   install -m 0644 "$src_dir/tsan.supp" "$dst_dir/tsan.supp"
   install -m 0644 "$src_dir/build_report_data.py" "$dst_dir/build_report_data.py"

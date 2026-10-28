@@ -75,7 +75,7 @@ RELEASE_CASE_MEMORY_MB=${RELEASE_CASE_MEMORY_MB:-4096}
 # cases are memory-heavy, so they use a smaller pool.
 JOBS=${JOBS:-4}
 TSAN_JOBS=${TSAN_JOBS:-2}
-STAGES=" ${STAGES:-cpp mtr qa release} "
+STAGES=" ${STAGES:-cpp mtr qa release fuzz} "
 # MTR stage: <series>:<distribution under $WS/dist>; its own build thread
 # (ports) and var directories so it does not collide with manual MTR runs.
 # A worker of build thread N uses ports 10000+10*N.. (30 per worker) and the
@@ -87,6 +87,12 @@ MYSQL_SUFFIX=linux-glibc2.28-x86_64
 MTR_DISTS=${MTR_DISTS:-"8.0:mysql-8.0.45-$MYSQL_SUFFIX 8.4:mysql-8.4.8-$MYSQL_SUFFIX-minimal 9.7:mysql-9.7.2-$MYSQL_SUFFIX-minimal"}
 MTR_BUILD_THREAD=${MTR_BUILD_THREAD:-500}
 MTR_PARALLEL=${MTR_PARALLEL:-4}
+# fuzzing stage: the libFuzzer targets of fuzz/, each run for FUZZ_SECONDS
+# with FUZZ_JOBS workers against its corpus in $WS/fuzz/corpus (kept between
+# nights, started from $WS/fuzz/seeds, written by fuzz/make_seeds.py)
+FUZZ_TARGETS=${FUZZ_TARGETS:-"event_stream_fuzzer listener_packet_fuzzer"}
+FUZZ_SECONDS=${FUZZ_SECONDS:-900}
+FUZZ_JOBS=${FUZZ_JOBS:-12}
 # QA-harness stage: one MySQL version, the Python libraries, a port range
 QA_DIST=${QA_DIST:-8.4:mysql-8.4.8-$MYSQL_SUFFIX-minimal}
 QA_PORT=${QA_PORT:-24470}
@@ -610,6 +616,57 @@ if want release; then
     log "release fetch_crash_test done in $(( ($(date +%s) - stage_started) / 60 )) min"
   fi
 fi
+# the fuzzing stage, last so that it has the machine to itself: the libFuzzer
+# targets in their own Clang build (instrumented for libFuzzer, ASan and
+# UBSan, with GCC's standard library so that the GCC-built dependencies of
+# debug_gcc14 link), configured by the nightly the first time. Each distinct
+# finding is a case of the build 'fuzz', compared with fuzz_known_failures.txt
+if want fuzz; then
+  fuzz_build=$WS/percona-binlog-server-build-fuzz_clang20
+  stage_started=$(date +%s)
+  if [ ! -f "$fuzz_build/CMakeCache.txt" ]; then
+    log "configuring fuzz_clang20"
+    fuzz_flags="-fsanitize=fuzzer-no-link,address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -O1 -g"
+    cmake -S "$SRC" -B "$fuzz_build" -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 \
+      -DWITH_STDLIB_LIBCXX=OFF -DCPP_STANDARD=23 -DBUILD_TESTING=OFF \
+      -DWITH_FUZZERS=ON -DS2N_USE_CRYPTO_SHARED_LIBS=ON \
+      "-DCMAKE_PREFIX_PATH=$WS/aws-sdk-cpp-install-debug_gcc14;$WS/boost-install-debug_gcc14" \
+      "-DCMAKE_C_FLAGS=$fuzz_flags" "-DCMAKE_CXX_FLAGS=$fuzz_flags" \
+      "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined" \
+      > "$out/configure-fuzz_clang20.log" 2>&1 ||
+      log "CONFIGURE FAILED: fuzz_clang20 (configure-fuzz_clang20.log)"
+  fi
+  log "building fuzz_clang20"
+  # shellcheck disable=SC2086 # one --target per word
+  if ! cmake --build "$fuzz_build" --parallel 4 \
+      $(printf -- '--target %s ' $FUZZ_TARGETS) \
+      > "$out/build-fuzz_clang20.log" 2>&1; then
+    log "BUILD FAILED: fuzz_clang20"
+    results+=("BUILD FAILED  fuzz_clang20  (build-fuzz_clang20.log)")
+    record fuzz_clang20 "" build build-failed "" \
+      "see build-fuzz_clang20.log" 0 >> "$results_file"
+    broken=$((broken + 1))
+  else
+    for target in $FUZZ_TARGETS; do
+      corpus=$WS/fuzz/corpus/${target%_fuzzer}
+      seeds=$WS/fuzz/seeds/${target%_fuzzer}
+      mkdir -p "$corpus"
+      if [ -z "$(ls -A "$corpus")" ] && [ -d "$seeds" ]; then
+        cp -r "$seeds/." "$corpus/"
+      fi
+      log "fuzzing $target for ${FUZZ_SECONDS}s"
+      python3 "$NIGHTLY/nightly_stages.py" fuzz --target "$target" \
+        --binary "$fuzz_build/fuzz/$target" --corpus "$corpus" \
+        --seconds "$FUZZ_SECONDS" --jobs "$FUZZ_JOBS" \
+        --known "$NIGHTLY/fuzz_known_failures.txt" \
+        --results "$stage_results" --lines "$stage_lines" --out "$out" \
+        >> "$out/nightly.log" 2>&1
+      tally_stage $? fuzz "$target"
+    done
+  fi
+  log "fuzzing done in $(( ($(date +%s) - stage_started) / 60 )) min"
+fi
 rm -f "$stage_results" "$stage_lines"
 
 duration=$(( ($(date +%s) - started) / 60 ))
@@ -622,6 +679,7 @@ duration=$(( ($(date +%s) - started) / 60 ))
   echo "Replay a property failure: cd $out/work-<build> && HEGEL_DEFAULT_PROFILE=<profile> <test binary> --run_test=<test case> (profile nightly_<debug|asan|tsan|release>; release cases under 'timeout $RELEASE_CASE_TIMEOUT')"
   echo "Replay an MTR failure: cd $WS/dist/<distribution>/mysql-test && BINSRV=$debug_binsrv ./mtr --build-thread=$MTR_BUILD_THREAD binlog_streaming.<test> (log: mtr-<series>-<test>.log)"
   echo "Replay a QA failure: see the command at the top of qa-<series>-<case>.log"
+  echo "Replay a fuzzing finding: $WS/percona-binlog-server-build-fuzz_clang20/fuzz/<target> <input> (inputs listed in fuzz-<target>-<finding>.log)"
 } >> "$summary"
 python3 -c 'import json,sys; print(json.dumps(dict(zip(["day","started","revision","qa_rotation","new","broken","known","known_passed","passed","skipped","minutes"], sys.argv[1:5]+[int(v) for v in sys.argv[5:]])), indent=1))' \
   "$day" "$started_utc" "$revision" "${rotation[*]:-}" "$new" "$broken" "$known_failed" \

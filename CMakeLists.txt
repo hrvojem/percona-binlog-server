@@ -76,6 +76,10 @@ endif()
 # configure time together with a prebuilt native engine library (libhegel),
 # so they are disabled by default to keep regular / packaging builds offline
 option(WITH_PROPERTY_TESTS "Build Hegel property-based tests (downloads hegel-cpp and libhegel)" OFF)
+# libFuzzer targets for the parsers of untrusted input (fuzz/); they need
+# Clang, and the whole build configured with
+# -fsanitize=fuzzer-no-link,address,undefined
+option(WITH_FUZZERS "Build libFuzzer targets (Clang only)" OFF)
 
 find_package(Boost 1.90.0 EXACT REQUIRED COMPONENTS url json asio)
 
@@ -802,4 +806,11 @@ set_target_properties(binlog_server PROPERTIES
 include(CTest)
 if(BUILD_TESTING)
   add_subdirectory(tests)
+endif()
+
+if(WITH_FUZZERS)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "WITH_FUZZERS needs Clang (libFuzzer)")
+  endif()
+  add_subdirectory(fuzz)
 endif()

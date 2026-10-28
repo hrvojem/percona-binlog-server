@@ -296,7 +296,7 @@ server rather than starting one.
 
 [`nightly/`](nightly) holds the nightly test runner and its data:
 
-- **`run_nightly.sh`** — runs four stages:
+- **`run_nightly.sh`** — runs five stages:
   1. **C++** (`cpp`): builds the `debug_gcc14`, `asan_gcc14` and
      `tsan_gcc14` trees in place, runs the unit tests, then runs **every
      Hegel property-test case separately** with many more cases than the
@@ -388,6 +388,14 @@ server rather than starting one.
      the first night longest, then the failure database replays the known
      failures quickly; `fetch_crash_test` 1-2 min) plus the incremental
      build (a clean build is about 8 min).
+  5. **Fuzzing** (`fuzz`), last: the libFuzzer targets of
+     [`fuzz/`](../../fuzz) in their own Clang 20 build
+     (`$WS/percona-binlog-server-build-fuzz_clang20`, configured by the
+     nightly the first time), each for 15 min (`FUZZ_SECONDS`) with 12
+     workers (`FUZZ_JOBS`) against a corpus kept between nights. Each
+     distinct finding is a case `<target>/<signature>` of the build `fuzz`,
+     compared with `fuzz_known_failures.txt`; see
+     [`fuzz/README.md`](../../fuzz/README.md).
 
   Results go to `$WS/nightly/runs/<date>/` (and the `latest` symlink):
   `summary.txt`, one log per failing case (`<build>-<test case>.log`; for MTR
@@ -407,7 +415,7 @@ server rather than starting one.
   C++ stage plus 35-50 min of MTR (9-26 min per version) and 20-35 min of QA harnesses: about 11 min for `pull_replica_test`, `query_race_test` and `fetch_crash_test` on file storage, about 5 min for `pull_heartbeat_test`, about 7 min for `fetch_crash_test` on S3 (mostly Hypothesis shrinking the known ticket 14 failure in `gtid/s3`), plus the night's rotation (measured on MySQL 8.4.8: `s3_fault_sweep` 15 min per mode, 84 cases; `disk_fault_sweep` 3-6 min, 80 cases (plus 6 recovery cases, about 1.5 min); `network_fault_test` 4-5 min, 37 cases; `source_change_test` 3-4 min per mode, 4 cases; `large_binlog_test` about 20 min on the debug build, mostly MySQL writing the large transactions; `pull_load_test` about 6 min, 4 cases; `listener_fuzz_test` about 11 min per mode at 600 connections: about 1 s per connection since the listener always does full `caching_sha2_password` authentication (PBS-10), 2-3 min for 3000 before).
 
   To try a stage without touching the nightly's own results, select stages
-  with `STAGES` (default `cpp mtr qa release`; without `cpp` the debug,
+  with `STAGES` (default `cpp mtr qa release fuzz`; without `cpp` the debug,
   ASan and TSan trees are not built) and
   write elsewhere with `OUT_DIR` (then `history.tsv`, `latest` and old runs
   are left alone):
@@ -465,6 +473,10 @@ server rather than starting one.
   label: `debug_gcc14`, ..., `release_gcc14`, `mtr-8.4`, `qa-8.4`), a description of every
   build label, and the entries of all three known-failure lists (each with
   its `kind` and `scope`).
+
+- **`fuzz_known_failures.txt`** — the same for the fuzzing stage:
+  `<target> <case pattern>  ticket N: ...`, where a case is
+  `<target>/<signature>` (see [`../../fuzz/README.md`](../../fuzz/README.md)).
 
 The setup script's `nightly` step installs these under `$WS/nightly` and adds a
 crontab entry (`NIGHTLY_CRON`, default `30 1 * * *`).

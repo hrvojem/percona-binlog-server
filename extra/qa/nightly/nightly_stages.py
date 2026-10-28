@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The MTR and QA-harness stages of the nightly run.
+"""The MTR, QA-harness and fuzzing stages of the nightly run.
 
 run_nightly.sh calls this once per stage step; each call appends one JSON
 result line per test case to --results (the same fields the property-test
@@ -701,13 +701,108 @@ def run_qa(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# libFuzzer targets
+# ---------------------------------------------------------------------------
+
+FUZZ_STATS = re.compile(r"^#(\d+):?\s+.*?cov: (\d+) ft: (\d+) corp: (\d+)")
+FUZZ_SIGNATURE = re.compile(
+    r"what\(\):\s+(?P<what>.{0,120})|"
+    r"SUMMARY: (?P<sanitizer>[A-Za-z]+Sanitizer: \S+(?: \S+)?)|"
+    r"runtime error: (?P<ub>.{0,120})|"
+    r"(?P<oom>out-of-memory)|(?P<timeout>ALARM: working on the last Unit for)")
+
+
+def fuzz_signature(output: str, artifact: str) -> str:
+    """What a finding is, independent of the input: the exception message,
+    the sanitizer summary, the UBSan error or out-of-memory / timeout, with
+    addresses and long numbers blanked."""
+    match = FUZZ_SIGNATURE.search(output)
+    if match is None:
+        text = artifact.split("-", 1)[0] + " without a message"
+    elif match.group("what"):
+        text = "terminate: " + match.group("what")
+    elif match.group("sanitizer"):
+        text = match.group("sanitizer")
+    elif match.group("ub"):
+        text = "undefined behaviour: " + match.group("ub")
+    elif match.group("oom"):
+        text = "out of memory"
+    else:
+        text = "timeout"
+    text = re.sub(r"0x[0-9a-f]+", "ADDR", text)
+    return re.sub(r"\d{3,}", "N", text).strip()
+
+
+def run_fuzz(args) -> int:
+    """Runs one libFuzzer target for --seconds against its persistent corpus
+    (--corpus), reproduces every finding and records one case per distinct
+    signature ('<target>/<signature>', known ones from --known), plus a
+    passing '<target>/run' case with the run's statistics."""
+    recorder = Recorder(args, "fuzz", args.target)
+    out = Path(args.out)
+    artifacts = out / f"fuzz-{args.target}"
+    shutil.rmtree(artifacts, ignore_errors=True)
+    artifacts.mkdir(parents=True)
+    Path(args.corpus).mkdir(parents=True, exist_ok=True)
+    known = read_known(Path(args.known))
+    command = [str(args.binary), f"-fork={args.jobs}", "-ignore_crashes=1",
+               "-ignore_ooms=1", "-ignore_timeouts=1", "-max_len=65536",
+               "-timeout=20", "-rss_limit_mb=4096",
+               f"-max_total_time={args.seconds}",
+               f"-artifact_prefix={artifacts}/", str(args.corpus)]
+    started = time.monotonic()
+    try:
+        run = subprocess.run(command, capture_output=True, text=True,
+                             errors="replace", timeout=args.seconds + 600)
+        log_text = run.stdout + run.stderr
+    except subprocess.TimeoutExpired as error:
+        log_text = (error.stdout or b"").decode(errors="replace") + \
+            "\n(the fuzzer did not stop in time)"
+    seconds = time.monotonic() - started
+    stats = [match for line in log_text.splitlines()
+             if (match := FUZZ_STATS.match(line))]
+    summary = ("no statistics" if not stats else
+               f"{stats[-1].group(1)} inputs, cov {stats[-1].group(2)}, "
+               f"ft {stats[-1].group(3)}, corpus {stats[-1].group(4)}")
+
+    groups = {}
+    for artifact in sorted(artifacts.iterdir()):
+        try:
+            replay = subprocess.run([str(args.binary), str(artifact)],
+                                    capture_output=True, text=True,
+                                    errors="replace", timeout=120)
+            output = replay.stdout + replay.stderr
+        except subprocess.TimeoutExpired:
+            output = "ALARM: working on the last Unit for (replay timeout)"
+        groups.setdefault(fuzz_signature(output, artifact.name),
+                          []).append((artifact, output))
+    for signature, findings in sorted(groups.items()):
+        # keep a few inputs to reproduce each finding, not all of them
+        for artifact, _ in findings[3:]:
+            artifact.unlink()
+        test_case = f"{args.target}/{slug(signature)[:100]}"
+        ticket = match_known(known, args.target, test_case)
+        kept = ", ".join(str(artifact) for artifact, _ in findings[:3])
+        recorder.record(
+            test_case, True, ticket,
+            f"{len(findings)} input(s): {signature}"[:300], 0,
+            f"{signature}\n\n{len(findings)} input(s); kept: {kept}\n"
+            f"reproduce: {args.binary} <input>\n\n{findings[0][1]}")
+    recorder.record(f"{args.target}/run", False, "", summary, seconds)
+    log_path = out / f"fuzz-{args.target}.log"
+    log_path.write_text(" ".join(command) + "\n\n" + log_text[-200_000:])
+    if not groups:
+        shutil.rmtree(artifacts, ignore_errors=True)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("stage", choices=["mtr", "qa"])
-    parser.add_argument("--dist", type=Path, required=True,
-                        help="the MySQL distribution")
-    parser.add_argument("--series", required=True, help="8.0, 8.4, 9.7")
-    parser.add_argument("--binsrv", type=Path, required=True)
+    parser.add_argument("stage", choices=["mtr", "qa", "fuzz"])
+    parser.add_argument("--dist", type=Path, help="the MySQL distribution")
+    parser.add_argument("--series", help="8.0, 8.4, 9.7")
+    parser.add_argument("--binsrv", type=Path)
     parser.add_argument("--known", required=True,
                         help="the known-failures file of the stage")
     parser.add_argument("--results", required=True,
@@ -750,7 +845,20 @@ def main():
                         help="listener_fuzz_test connections")
     parser.add_argument("--seed", type=int, default=1,
                         help="listener_fuzz_test seed")
+    # fuzz
+    parser.add_argument("--target", help="the libFuzzer target's name")
+    parser.add_argument("--binary", type=Path, help="the libFuzzer target")
+    parser.add_argument("--corpus", type=Path,
+                        help="the target's corpus, kept between runs")
+    parser.add_argument("--seconds", type=int, default=900)
+    parser.add_argument("--jobs", type=int, default=8)
     args = parser.parse_args()
+    if args.stage == "fuzz":
+        if not (args.target and args.binary and args.corpus):
+            parser.error("fuzz needs --target, --binary and --corpus")
+        return run_fuzz(args)
+    if not (args.dist and args.series and args.binsrv):
+        parser.error(f"{args.stage} needs --dist, --series and --binsrv")
     if args.stage == "mtr":
         if not args.vardir:
             parser.error("mtr needs --vardir")

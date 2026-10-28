@@ -1,0 +1,13 @@
+# Findings of the libFuzzer targets (fuzz/) that come from known, unfixed bugs:
+# <target> <case pattern>  <ticket>
+# A finding is the case '<target>/<signature>', the signature being the
+# exception message, sanitizer summary or UBSan error of its reproduction with
+# every run of non-alphanumeric characters turned into '-' (e.g.
+# 'event_stream_fuzzer/terminate-server_version-...'); the pattern may use '*'.
+# A finding listed here is reported as known; any other one is NEW.
+# Remove a line once its bug is fixed.
+#
+# PBS-68 (ticket 1, a FORMAT_DESCRIPTION with an unparsable server version
+# terminates the process) is not listed: event_stream_fuzzer filters it (see
+# FUZZ_KEEP_PBS_68 in fuzz/event_stream_fuzzer.cpp) so that it does not drown
+# every other finding.

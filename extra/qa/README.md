@@ -21,6 +21,7 @@ the C++ components directly.
 - [The nightly run](#the-nightly-run)
 - [Setting up a new machine](#setting-up-a-new-machine)
 - [In-tree property tests](#in-tree-property-tests)
+- [Coverage](#coverage)
 
 ## Quick start
 
@@ -114,6 +115,7 @@ JSON and exits non-zero on a failure.
 | `source_change_test.py` | changes the source under a running backup: `RESET BINARY LOGS`, a different server (failover), binlogs purged before fetch, a mid-stream restart | ticket 25 |
 | `event_variety_test.py` | drives less common event types — transaction compression, `binlog_row_image=MINIMAL`, partial JSON, XA, tagged GTIDs — through a full fetch and a kill/resume | — (no bug) |
 | `query_race_test.py` | runs `binlog_server list` `--runs` times (default 500) next to a `pull` writing a filesystem storage with `checkpoint_size` `"1K"` while the source gets small inserts and a `FLUSH BINARY LOGS` every 20 of them; reports the failed `list` runs and each distinct error message | ticket 29 |
+| `large_binlog_test.py` | binlogs and transactions past 4 GiB, where positions no longer fit the protocol's 32-bit fields. Case `binlog_over_4gib`: about 1 GB of 1 MiB transactions and one of about 3.5 GB leave a 4.5 GB binlog; `fetch` must store it byte for byte, a second `fetch` reopen the storage, `list` report its size, and `mysqlbinlog --raw` through `pull` copy it exactly (passes). Case `transaction_over_4gib`: one transaction of about 4.7 GB. Needs about 20 GB of disk; `--keep` keeps the data, `--cases` picks the cases | ticket 41 (PBS-114) |
 
 Examples:
 
@@ -132,6 +134,11 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/source_change_test.py \
 # mysqld socket lives in it
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/query_race_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/qrace --runs 500
+
+# a 4.5 GB binlog only (about 5 min plus the copies)
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/large_binlog_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/large-binlog \
+  --cases binlog_over_4gib
 ```
 
 `query_race_test.py` prints one JSON line: `runs`, `failed`, and `errors`, a
@@ -238,14 +245,31 @@ and GTID auto-position mode, and requires the replica's data to match the
 source's. When it does not, it reports the replica's I/O-thread error and the
 statements `pull` rejected. It is the end-to-end check behind tickets 20-22;
 tickets 21 (resuming from a position) and 22 (`mysqlbinlog --raw`) are fixed
-upstream in `a338dde` (PBS-42 part 5), ticket 20 is open for heartbeats.
-The nightly runs it (see below); its `gtid` case fails because `pull` does
-not support `COM_BINLOG_DUMP_GTID` yet and is listed as a known failure
-(ticket 20), while the `position` case must pass.
+upstream in `a338dde` (PBS-42 part 5). Ticket 20 is open for GTID
+auto-position (`COM_BINLOG_DUMP_GTID` is answered with "unknown command"
+until PBS-29 part 2) and TLS on the listener; heartbeats exist since PBS-30.
+The nightly runs it (see below); its `gtid` case is listed as a known
+failure (ticket 20), while the `position` case must pass.
+
+`pull_heartbeat_test.py` checks the heartbeats of PBS-30 with a real replica:
+`SOURCE_HEARTBEAT_PERIOD=1`, `replica_net_timeout=4`, `pull` checkpointing
+after every transaction, and the source quiet for 20 s (`--quiet`) once the
+replica has caught up. The replica must get about one heartbeat per period
+and must not reconnect. Case `quiet` (the source just stays quiet) passes;
+case `quiet_after_rotation` (a `FLUSH BINARY LOGS` first) gets no heartbeats
+and reconnects every few seconds on MySQL 8.0, 8.4 and 9.7, because the new
+binlog holds only the binlog magic until its first transaction (ticket 40,
+PBS-113). It prints the heartbeats, the replica's reconnections and the
+connections `pull` saw during the quiet time.
+
+Both harnesses start `pull` and point the replica at it through the same
+helpers in `pull_replica_test.py` (`start_pull()`, `replicate_from_pull()`).
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_replica_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/pull-replica
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_heartbeat_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/pull-heartbeat
 ```
 
 `repro_broken_checkpointing.py` is a self-contained reproducer kept from an
@@ -273,7 +297,9 @@ server rather than starting one.
   3. **QA harnesses** (`qa`), against MySQL 8.4 (`QA_DIST`), ports from 24470
      (`QA_PORT`): `pull_replica_test.py` (cases `position` and `gtid`),
      `query_race_test.py` (case `list_next_to_pull`, 500 `list` runs,
-     `QA_RUNS`), both with the debug build, and a short
+     `QA_RUNS`) and `pull_heartbeat_test.py` (cases `quiet` and
+     `quiet_after_rotation`, port `QA_PORT`+120), all with the debug build,
+     and a short
      `fetch_crash_test.py` run per mode (cases `gtid` and `position`,
      10 examples of 8 steps, `QA_EXAMPLES` / `QA_STEPS`) with the ASan build,
      and the same on **S3 storage** against the local S3 server (cases
@@ -286,7 +312,7 @@ server rather than starting one.
      | --- | --- | --- |
      | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts | ASan |
      | Tue | `disk_fault_sweep.py` (position) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first) |
-     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) | ASan |
+     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end) | ASan |
      | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid) | ASan |
      | Fri | `s3_fault_sweep.py` (gtid) | ASan |
      | Sat | `disk_fault_sweep.py` (gtid) | debug |
@@ -301,7 +327,8 @@ server rather than starting one.
      object, fault, consecutive requests), `position/rename/binlog-index/EIO/x1`
      (disk sweep), `position/fetch/reset-after-50-ms` and
      `position/pull/r1-stall` (network), `position` (listener fuzzer),
-     `gtid/reset` (source change); a run that stops early adds
+     `gtid/reset` (source change), `position/binlog_over_4gib` (large
+     binlog); a run that stops early adds
      `<mode>/timeout`. ASan runs get `ASAN_OPTIONS=exitcode=134`, so a
      memory error is not mistaken for the clean failure exit code 1 the
      harnesses accept.
@@ -332,11 +359,13 @@ server rather than starting one.
      compared against `known_failures.txt`; a line
      `release_gcc14:<test case>  ticket N: ...` takes precedence for that
      build and records how the release build fails differently. Found so
-     far: ticket 7 does not hang in release but never advances past an event
-     size of 0, so `indexed_event_block`'s index grows to 8+ GB until
-     `std::bad_alloc` (hence the memory limit), and a misaligned dump
-     position streams an event cut out of the stored data; ticket 6 keeps
-     the wrong timestamps instead of aborting at `storage.cpp:138`. The
+     far: ticket 6 keeps the wrong timestamps instead of aborting at
+     `storage.cpp:138`. Before PBS-29, ticket 7 did not hang in release but
+     never advanced past an event size of 0, so `indexed_event_block`'s
+     index grew to 8+ GB until `std::bad_alloc` (hence the memory limit),
+     and a misaligned dump position streamed an event cut out of the stored
+     data; since PBS-29 both terminate the process as in debug (ticket 39,
+     PBS-112), so they have no release-only line any more. The
      dependencies are built once with `setup_test_environment.sh deps` (or
      `build_deps.sh release_gcc14`; about 40 min, 1.9 GB), the project tree
      takes about 1.4 GB. The stage takes 15-30 min (property cases 14-29 min,
@@ -359,7 +388,7 @@ server rather than starting one.
   build harnesses are skipped when the debug build fails, `fetch_crash_test`
   when the ASan build fails, the release `fetch_crash_test` when the release
   build fails. Tonight's whole run takes about 40-50 min for the
-  C++ stage plus 35-50 min of MTR (9-26 min per version) and 20-35 min of QA harnesses: about 11 min for `pull_replica_test`, `query_race_test` and `fetch_crash_test` on file storage, about 7 min for `fetch_crash_test` on S3 (mostly Hypothesis shrinking the known ticket 14 failure in `gtid/s3`), plus the night's rotation (measured on MySQL 8.4.8: `s3_fault_sweep` 15 min per mode, 84 cases; `disk_fault_sweep` 3-6 min, 80 cases (plus 6 recovery cases, about 1.5 min); `network_fault_test` 4-5 min, 37 cases; `source_change_test` 3-4 min per mode, 4 cases; `listener_fuzz_test` about 11 min per mode at 600 connections: about 1 s per connection since the listener always does full `caching_sha2_password` authentication (PBS-10), 2-3 min for 3000 before).
+  C++ stage plus 35-50 min of MTR (9-26 min per version) and 20-35 min of QA harnesses: about 11 min for `pull_replica_test`, `query_race_test` and `fetch_crash_test` on file storage, about 5 min for `pull_heartbeat_test`, about 7 min for `fetch_crash_test` on S3 (mostly Hypothesis shrinking the known ticket 14 failure in `gtid/s3`), plus the night's rotation (measured on MySQL 8.4.8: `s3_fault_sweep` 15 min per mode, 84 cases; `disk_fault_sweep` 3-6 min, 80 cases (plus 6 recovery cases, about 1.5 min); `network_fault_test` 4-5 min, 37 cases; `source_change_test` 3-4 min per mode, 4 cases; `large_binlog_test` about 20 min on the debug build, mostly MySQL writing the large transactions; `listener_fuzz_test` about 11 min per mode at 600 connections: about 1 s per connection since the listener always does full `caching_sha2_password` authentication (PBS-10), 2-3 min for 3000 before).
 
   To try a stage without touching the nightly's own results, select stages
   with `STAGES` (default `cpp mtr qa release`; without `cpp` the debug,
@@ -376,8 +405,17 @@ server rather than starting one.
 - **`hegel.toml`** — the Hegel settings profiles (`nightly_debug`,
   `nightly_asan`, `nightly_tsan`, `nightly_release`) selected per build via
   `HEGEL_DEFAULT_PROFILE`; each has its own failure database so a failure found
-  one night is replayed first the next. The database paths are templated
-  (`@NIGHTLY_DIR@`) and filled in for the workspace by the setup script.
+  one night is replayed first the next. Before each build's run,
+  `run_nightly.sh` copies into its database every input the other builds have
+  saved (without overwriting), so a failure one build found is replayed in all
+  of them, and the log says how many it took. They stay separate databases
+  because Hegel drops a saved input that no longer fails: one shared database
+  would let a build that cannot hit a failure (an `assert` compiled out of
+  release) delete it for the build that found it. Before this, a rarely hit
+  failure could fail every night in one build and never in another only
+  because the other build never generated the input. The database paths are
+  templated (`@NIGHTLY_DIR@`) and filled in for the workspace by the setup
+  script.
 - **`known_failures.txt`** — maps property-test case names to the ticket that
   explains them; a listed failure is reported as *known*, any other as *new*.
   Remove a line once its bug is fixed. CI uses the same list (see below).
@@ -392,7 +430,9 @@ server rather than starting one.
   pattern such as `position/PUT-*/reset_after/*`; a name without `/` also
   covers every `<name>/...` case), e.g.
   `pull_replica_test gtid` (ticket 20),
-  `query_race_test list_next_to_pull` (ticket 29) and
+  `query_race_test list_next_to_pull` (ticket 29),
+  `pull_heartbeat_test quiet_after_rotation` (ticket 40, PBS-113),
+  `large_binlog_test position/transaction_over_4gib` (ticket 41, PBS-114) and
   `fetch_crash_test gtid` (ticket 14, when the run generates a fetch /
   `FLUSH BINARY LOGS` / fetch sequence).
 - **`ci_property_tests.sh`** — what the CI job *GCC 14 Debug Property Tests*
@@ -446,9 +486,28 @@ what the nightly runs many cases of. Among them:
 `reader_context_property_test`, `config_value_property_test`,
 `event_generation_property_test` (the artificial ROTATE / FORMAT_DESCRIPTION /
 PREVIOUS_GTIDS generators), `search_helpers_property_test`,
-`purge_selection_property_test` and `sender_context_property_test` (the
+`purge_selection_property_test`, `sender_context_property_test` (the
 `pull` COM_BINLOG_DUMP streamer: the stream preamble, reading each stored byte
-once, partial events at EOF and polling an empty storage). Build them with
+once, partial events at EOF, polling an empty storage, and the heartbeat an
+idle dump reports, ticket 40) and `replication_source_property_test` (the
+real `pull` listener in-process with a test client: handshake statements,
+authentication, dump positions, heartbeat timing, and `COM_BINLOG_DUMP_GTID`,
+written ahead of PBS-29 part 2 and a known failure until then).
+`storage_property_test`'s concurrent property runs a second reader that
+resumes from a position mid-run and checks every artificial event and
+heartbeat; the heartbeat checks are shared in `tests/heartbeat_test_helpers.hpp`.
+Build them with
 `-DWITH_PROPERTY_TESTS=ON` and run them with `ctest`. Their design, settings profiles (`hegel.toml`), how to
 replay a failure, and a per-test rundown are documented in
 [`../../tests/PROPERTY_TESTS.md`](../../tests/PROPERTY_TESTS.md).
+
+## Coverage
+
+[`COVERAGE_GAPS.md`](COVERAGE_GAPS.md) records the last line and branch
+coverage measurement of `src/` (2026-10-28: 88.3% of lines over the unit,
+property, MTR 8.4 and QA layers), how it was taken, and a table of the code
+no test reaches yet, each with the cheapest kind of test that would. It is
+measured with a gcov build in its own tree (`~/ws/build_coverage.sh`,
+`~/ws/run_coverage.sh`); see the document for the steps and for the pitfalls
+(one crashing property case hides the rest of its program; property layers
+vary between runs).

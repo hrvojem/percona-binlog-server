@@ -13,10 +13,11 @@
 # After the C++ stages, the whole binlog_streaming MTR suite runs with the
 # debug build on MySQL 8.0, 8.4 and 9.7 (MTR_DISTS), and black-box QA
 # harnesses from extra/qa run against MySQL 8.4: every night
-# pull_replica_test.py, query_race_test.py and a short fetch_crash_test.py
-# run per mode on file and on S3 storage; and one of the heavier harnesses
-# by day of the week (QA_ROTATION: the S3 and disk fault sweeps, the network
-# fault test, the listener fuzzer and the source change test). Their
+# pull_replica_test.py, query_race_test.py, pull_heartbeat_test.py and a
+# short fetch_crash_test.py run per mode on file and on S3 storage; and one
+# of the heavier harnesses by day of the week (QA_ROTATION: the S3 and disk
+# fault sweeps, the network fault test, the listener fuzzer and the source
+# change test). Their
 # failures are compared with mtr_known_failures.txt and qa_known_failures.txt
 # (see nightly_stages.py, which runs those stages). QA_ROTATION_DAY (1-7 for
 # Monday-Sunday, a comma list, 'all' or 'none'; default today's weekday)
@@ -482,6 +483,9 @@ if want qa; then
     qa_run query_race_test query_race_test \
       --binsrv "$debug_binsrv" --workdir "$out/qa/qr" \
       --port $((QA_PORT + 30)) --runs "$QA_RUNS" --timeout 1200
+    qa_run pull_heartbeat_test pull_heartbeat_test \
+      --binsrv "$debug_binsrv" --workdir "$out/qa/hb" \
+      --port $((QA_PORT + 120)) --timeout 900
   fi
   # the crash/resume test runs against the ASan build to catch memory errors
   if [ -n "${build_failed[asan_gcc14]:-}" ]; then

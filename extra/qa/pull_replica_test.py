@@ -63,6 +63,51 @@ def checksum(server) -> str:
         return f"error: {str(error).splitlines()[0][:120]}"
 
 
+def start_pull(binsrv, pull_port: int) -> subprocess.Popen:
+    """Starts 'binlog_server pull' with its replication source listener on
+    'pull_port' (debug log level) and gives it time to start listening."""
+    binsrv.write_config()
+    config = json.loads(binsrv.config_path.read_text())
+    config["logger"]["level"] = "debug"
+    config["replication_source"] = {
+        "port": pull_port, "server_id": 142,
+        "server_uuid": "00000000-0000-0000-0000-00000000008e",
+        "read_timeout": 60, "write_timeout": 60,
+        # the listener always does caching_sha2_password full
+        # authentication, which over a non-TLS connection needs its RSA
+        # key (PBS-33 / PBS-34); the replica uses GET_SOURCE_PUBLIC_KEY
+        "auth_rsa_private_key": str(AUTH_RSA_PRIVATE_KEY),
+        "authentication": {"user": PULL_USER, "password": PULL_PASSWORD,
+                           "plugin": "caching_sha2_password"}}
+    binsrv.config_path.write_text(json.dumps(config, indent=2))
+    pull = subprocess.Popen(
+        [str(binsrv.binary), "pull", str(binsrv.config_path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, AWS_EC2_METADATA_DISABLED="true"))
+    time.sleep(3)
+    return pull
+
+
+def replicate_from_pull(replica, pull_port: int, gtid_mode: bool,
+                        start: str) -> None:
+    """Points 'replica' at the listener of 'pull' and starts replication;
+    'start' holds the starting-point options of CHANGE REPLICATION SOURCE TO
+    (and any other options to add)."""
+    # the source creates the 'qa' database before resetting its binary
+    # logs (see fetch_crash_test.Server), so the schema is not in any
+    # binlog: the replica starts from an empty 'qa' of its own
+    replica.sql("STOP REPLICA; RESET REPLICA ALL; "
+                "DROP DATABASE IF EXISTS qa; CREATE DATABASE qa;")
+    if gtid_mode:
+        replica.sql("RESET BINARY LOGS AND GTIDS"
+                    if replica.version() >= (8, 2, 0) else "RESET MASTER")
+    replica.sql(
+        f"CHANGE REPLICATION SOURCE TO SOURCE_HOST='127.0.0.1', "
+        f"SOURCE_PORT={pull_port}, SOURCE_USER='{PULL_USER}', "
+        f"SOURCE_PASSWORD='{PULL_PASSWORD}', GET_SOURCE_PUBLIC_KEY=1, SOURCE_SSL=0, "
+        f"SOURCE_CONNECT_RETRY=2, {start}; START REPLICA;")
+
+
 def run_case(args, gtid_mode: bool) -> dict:
     mode = "gtid" if gtid_mode else "position"
     work = args.workdir / mode
@@ -83,42 +128,11 @@ def run_case(args, gtid_mode: bool) -> dict:
         machine = harness.FetchCrashMachine()
         machine.start_from_scratch()
         machine.run_workload(WORKLOAD)
-        binsrv.write_config()
-        config = json.loads(binsrv.config_path.read_text())
-        config["logger"]["level"] = "debug"
-        config["replication_source"] = {
-            "port": pull_port, "server_id": 142,
-            "server_uuid": "00000000-0000-0000-0000-00000000008e",
-            "read_timeout": 60, "write_timeout": 60,
-            # the listener always does caching_sha2_password full
-            # authentication, which over a non-TLS connection needs its RSA
-            # key (PBS-33 / PBS-34); the replica uses GET_SOURCE_PUBLIC_KEY
-            "auth_rsa_private_key": str(AUTH_RSA_PRIVATE_KEY),
-            "authentication": {"user": PULL_USER, "password": PULL_PASSWORD,
-                               "plugin": "caching_sha2_password"}}
-        binsrv.config_path.write_text(json.dumps(config, indent=2))
-        pull = subprocess.Popen(
-            [str(binsrv.binary), "pull", str(binsrv.config_path)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=dict(os.environ, AWS_EC2_METADATA_DISABLED="true"))
-        time.sleep(3)
-
-        # the source creates the 'qa' database before resetting its binary
-        # logs (see fetch_crash_test.Server), so the schema is not in any
-        # binlog: the replica starts from an empty 'qa' of its own
-        replica.sql("STOP REPLICA; RESET REPLICA ALL; "
-                    "DROP DATABASE IF EXISTS qa; CREATE DATABASE qa;")
-        if gtid_mode:
-            replica.sql("RESET BINARY LOGS AND GTIDS"
-                        if replica.version() >= (8, 2, 0) else "RESET MASTER")
+        pull = start_pull(binsrv, pull_port)
         start = ("SOURCE_AUTO_POSITION=1" if gtid_mode else
                  f"SOURCE_LOG_FILE='{source.binlog_names()[0]}', "
                  "SOURCE_LOG_POS=4")
-        replica.sql(
-            f"CHANGE REPLICATION SOURCE TO SOURCE_HOST='127.0.0.1', "
-            f"SOURCE_PORT={pull_port}, SOURCE_USER='{PULL_USER}', "
-            f"SOURCE_PASSWORD='{PULL_PASSWORD}', GET_SOURCE_PUBLIC_KEY=1, SOURCE_SSL=0, "
-            f"SOURCE_CONNECT_RETRY=2, {start}; START REPLICA;")
+        replicate_from_pull(replica, pull_port, gtid_mode, start)
 
         expected = checksum(source)
         deadline = time.monotonic() + CATCH_UP_SECONDS

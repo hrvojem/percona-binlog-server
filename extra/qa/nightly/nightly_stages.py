@@ -272,7 +272,7 @@ def harness_command(args, workdir: Path) -> list:
             "--workdir", str(workdir)]
     common = base + ["--port", str(args.port)]
     mode = ["--mode", args.mode] if args.mode else []
-    if args.harness == "pull_replica_test":
+    if args.harness in ("pull_replica_test", "pull_heartbeat_test"):
         return script + common
     if args.harness == "fetch_crash_test":
         command = script + common + [
@@ -313,6 +313,23 @@ def harness_cases(args, returncode: int, output: str, lines: list,
     wall-clock times of a case that has its own JSON line."""
     objects = json_lines(lines)
     mode = args.mode or "position"
+    if args.harness == "pull_heartbeat_test":
+        cases = []
+        for result, _ in objects:
+            if "case" not in result:
+                continue
+            reason = ""
+            if not result.get("ok"):
+                reason = (f"{result.get('heartbeats_during_quiet')} "
+                          f"heartbeat(s), "
+                          f"{result.get('replica_connections_during_quiet')} "
+                          f"replica reconnection(s) in "
+                          f"{result.get('quiet_seconds')} s of quiet")
+                if not result.get("caught_up"):
+                    reason = "replica did not catch up; " + reason
+            cases.append((result["case"], not result.get("ok"), reason,
+                          None, None, None))
+        return cases
     if args.harness == "pull_replica_test":
         cases = []
         for result, _ in objects:

@@ -13,6 +13,7 @@
 # A failure listed here is reported as known; any other failure is NEW.
 # Remove a line once its bug is fixed.
 pull_replica_test gtid  ticket 20: COM_BINLOG_DUMP_GTID unsupported (GTID auto-position replica of pull)
+pull_heartbeat_test quiet_after_rotation  ticket 40 (PBS-113): no heartbeats while the replica waits in a new binlog that holds only the binlog magic, so it reconnects every replica_net_timeout
 query_race_test list_next_to_pull  ticket 29: a query next to a writer fails stat()ing a .tmp file the writer renamed away
 fetch_crash_test gtid  ticket 14: GTID-mode resume after a rotation misses the closing ROTATE and empty binlogs (fetch, FLUSH BINARY LOGS, fetch: binlog.000001 lacks its ROTATE, binlog.000002 is skipped; debug and release alike, file and S3 storage (case gtid/s3), hit when Hypothesis generates that sequence)
 # a failed save of a binlog's metadata (.json) makes the next fetch append

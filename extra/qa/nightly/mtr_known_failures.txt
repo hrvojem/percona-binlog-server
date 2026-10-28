@@ -4,7 +4,7 @@
 # <test> is the test name (every combination of it) or <test>/<combination>.
 # A failure listed here is reported as known; any other failure is NEW.
 # Remove a line once its bug is fixed.
-* fde_invalid_server_version  ticket 1: bad FDE server version terminates the utility
+* fde_invalid_server_version  ticket 1 (PBS-68): bad FDE server version terminates the utility
 * search_by_gtid_set_gno_range  ticket 3: gtid_set GNO bounds
 8.4 gtid_tagged_log_oversized_tag  ticket 5: oversized GTID tag in a GTID_TAGGED_LOG event
 9.7 gtid_tagged_log_oversized_tag  ticket 5: oversized GTID tag in a GTID_TAGGED_LOG event

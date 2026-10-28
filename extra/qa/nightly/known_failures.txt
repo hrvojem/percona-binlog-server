@@ -2,8 +2,8 @@
 # <test case> <ticket>
 # A failure listed here is reported as known; any other failure is NEW.
 # Remove a line once its bug is fixed.
-EventParsingOfCorruptedEventsFailsCleanly  ticket 1/5: bad FDE server version, oversized GTID tag
-EventPrintingOfCorruptedEventsFailsCleanly  ticket 1: bad FDE server version terminates when printed
+EventParsingOfCorruptedEventsFailsCleanly  ticket 1 (PBS-68) / 5: bad FDE server version, oversized GTID tag
+EventPrintingOfCorruptedEventsFailsCleanly  ticket 1 (PBS-68): bad FDE server version terminates when printed
 GtidSetParseRejectsOutOfRangeGno  ticket 3: gtid_set GNO bounds
 GtidSetAddIntervalRejectsOutOfRangeUpperBound  ticket 3: gtid_set GNO bounds
 GtidSetSubtractIntervalBeyondMaxGnoRemovesTail  ticket 3: gtid_set GNO bounds

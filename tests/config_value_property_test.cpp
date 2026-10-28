@@ -694,26 +694,43 @@ struct config_spec {
   std::string description;
 };
 
+// the defects config_specs() draws from
+const std::vector<std::string> &config_defects() {
+  static const std::vector<std::string> defects{
+      "log_level",           "connection_endpoint",
+      "connection_port",     "connection_timeout",
+      "server_id",           "mode",
+      "rewrite_mode",        "rewrite_file_size_unit",
+      "rewrite_file_size",   "source_port_zero",
+      "source_port_range",   "source_read_timeout",
+      "source_write_timeout", "source_server_id_range",
+      "source_server_uuid",  "authentication_user",
+      "authentication_password", "authentication_plugin",
+      "backend",             "checkpoint_size",
+      "checkpoint_interval", "encryption_format",
+      "encryption_cipher",   "missing_field",
+      "auth_rsa_private_key_empty"};
+  return defects;
+}
+
+// how config_specs() damages a source_server_uuid defect (index of
+// 'damage' in the generator)
+constexpr int uuid_damage_kinds{6};
+
 // a valid configuration with at most one defect, so that every check is
-// exercised on its own
-[[nodiscard]] gs::Generator<config_spec> config_specs() {
-  return gs::compose([](const hegel::TestCase &tc) {
-    static const std::vector<std::string> defects{
-        "log_level",           "connection_endpoint",
-        "connection_port",     "connection_timeout",
-        "server_id",           "mode",
-        "rewrite_mode",        "rewrite_file_size_unit",
-        "rewrite_file_size",   "source_port_zero",
-        "source_port_range",   "source_read_timeout",
-        "source_write_timeout", "source_server_id_range",
-        "source_server_uuid",  "authentication_user",
-        "authentication_password", "authentication_plugin",
-        "backend",             "checkpoint_size",
-        "checkpoint_interval", "encryption_format",
-        "encryption_cipher",   "missing_field"};
-    std::string defect;
-    if (!tc.draw(gs::booleans())) {
-      defect = tc.draw(gs::sampled_from(defects));
+// exercised on its own; with 'forced_defect', always that defect (a
+// source_server_uuid defect may name its damage: "source_server_uuid:<n>")
+[[nodiscard]] gs::Generator<config_spec>
+config_specs(std::string forced_defect = {}) {
+  return gs::compose([forced_defect](const hegel::TestCase &tc) {
+    std::string defect{forced_defect};
+    std::optional<int> forced_uuid_damage;
+    if (defect.starts_with("source_server_uuid:")) {
+      forced_uuid_damage = defect.back() - '0';
+      defect = "source_server_uuid";
+    }
+    if (defect.empty() && !tc.draw(gs::booleans())) {
+      defect = tc.draw(gs::sampled_from(config_defects()));
     }
     config_spec spec{
         .json = {}, .valid = defect.empty(), .description = defect};
@@ -858,8 +875,11 @@ struct config_spec {
         }
       }
       if (is_defect("source_server_uuid")) {
-        const auto damage{tc.draw(gs::integers<int>(
-            {.min_value = 0, .max_value = 5}))};
+        const auto damage{forced_uuid_damage.has_value()
+                              ? *forced_uuid_damage
+                              : tc.draw(gs::integers<int>(
+                                    {.min_value = 0,
+                                     .max_value = uuid_damage_kinds - 1}))};
         switch (damage) {
         case 0: // one character short
           uuid.pop_back();
@@ -890,6 +910,13 @@ struct config_spec {
     source["write_timeout"] = is_defect("source_write_timeout")
                                   ? std::int64_t{0}
                                   : valid_uint32();
+    // the RSA key file is only read when the listener starts, so any
+    // non-empty path is valid here
+    if (is_defect("auth_rsa_private_key_empty")) {
+      source["auth_rsa_private_key"] = "";
+    } else if (tc.draw(gs::booleans())) {
+      source["auth_rsa_private_key"] = "/nonexistent/private_key.pem";
+    }
     source["authentication"] = boost::json::object{
         {"user", is_defect("authentication_user") ? std::string{}
                                                   : choose({"rpl", "replica"})},
@@ -1623,101 +1650,137 @@ BOOST_AUTO_TEST_CASE(KeyringDamagedFileFailsCleanly) {
   });
 }
 
+namespace {
+
+// loads 'spec' and checks the outcome against it: a rejection exactly for a
+// defect, and every value of an accepted file as written
+void check_config_file(const config_spec &spec) {
+  const scratch_directory scratch;
+  const auto path{scratch.path() / "config.json"};
+  const auto text{boost::json::serialize(spec.json)};
+  write_file(path, text);
+
+  std::optional<binsrv::main_config> config;
+  const auto error{load_cleanly([&] { config.emplace(path.string()); })};
+  require(config.has_value() == spec.valid,
+          "'" + text + "' was " +
+              (spec.valid ? "rejected: " + error.value_or("")
+                          : "accepted, expected a rejection for: " +
+                                spec.description));
+  if (!config.has_value()) {
+    return;
+  }
+  const auto &root{config->root()};
+  const auto &json{spec.json};
+  const auto same_string{[&](std::string_view section,
+                             std::string_view field,
+                             const std::string &actual) {
+    require(json_at(json, section, field).as_string() == actual,
+            std::string{section} + '.' + std::string{field} + " is '" +
+                actual + "' in '" + text + "'");
+  }};
+  const auto same_number{[&](std::string_view section,
+                             std::string_view field, std::uint64_t actual) {
+    require(json_at(json, section, field).to_number<std::uint64_t>() ==
+                actual,
+            std::string{section} + '.' + std::string{field} + " is " +
+                std::to_string(actual) + " in '" + text + "'");
+  }};
+  const auto &logger{root.get<"logger">()};
+  same_string("logger", "level",
+              std::string{binsrv::to_string_view(logger.get<"level">())});
+  const auto &connection{root.get<"connection">()};
+  same_string("connection", "user", connection.get<"user">());
+  same_string("connection", "password", connection.get<"password">());
+  if (connection.get<"host">().has_value()) {
+    same_string("connection", "host", *connection.get<"host">());
+  }
+  if (connection.get<"port">().has_value()) {
+    same_number("connection", "port", *connection.get<"port">());
+  }
+  if (connection.get<"dns_srv_name">().has_value()) {
+    same_string("connection", "dns_srv_name",
+                *connection.get<"dns_srv_name">());
+  }
+  same_number("connection", "connect_timeout",
+              connection.get<"connect_timeout">());
+  same_number("connection", "read_timeout",
+              connection.get<"read_timeout">());
+  same_number("connection", "write_timeout",
+              connection.get<"write_timeout">());
+  const auto &replication{root.get<"replication">()};
+  same_number("replication", "server_id", replication.get<"server_id">());
+  same_number("replication", "idle_time", replication.get<"idle_time">());
+  require(json_at(json, "replication", "verify_checksum").as_bool() ==
+              replication.get<"verify_checksum">(),
+          "replication.verify_checksum differs");
+  same_string("replication", "mode",
+              boost::lexical_cast<std::string>(replication.get<"mode">()));
+  const auto &source{root.get<"replication_source">()};
+  same_number("replication_source", "port", source.get<"port">());
+  same_number("replication_source", "server_id",
+              source.get<"server_id">());
+  same_string("replication_source", "server_uuid",
+              source.get<"server_uuid">());
+  same_number("replication_source", "read_timeout",
+              source.get<"read_timeout">());
+  same_number("replication_source", "write_timeout",
+              source.get<"write_timeout">());
+  const auto &storage{root.get<"storage">()};
+  same_string("storage", "backend",
+              boost::lexical_cast<std::string>(storage.get<"backend">()));
+  same_string("storage", "uri", storage.get<"uri">());
+  if (storage.get<"checkpoint_size">().has_value()) {
+    const auto expected{model_unit(
+        json_at(json, "storage", "checkpoint_size").as_string(),
+        size_symbols)};
+    require(expected == storage.get<"checkpoint_size">()->get_value(),
+            "storage.checkpoint_size differs in '" + text + "'");
+  }
+  if (storage.get<"checkpoint_interval">().has_value()) {
+    const auto expected{model_unit(
+        json_at(json, "storage", "checkpoint_interval").as_string(),
+        time_symbols)};
+    require(expected == storage.get<"checkpoint_interval">()->get_value(),
+            "storage.checkpoint_interval differs in '" + text + "'");
+  }
+  require(root.get<"keyring">().has_value() == json.contains("keyring"),
+          "keyring section presence differs in '" + text + "'");
+}
+
+} // anonymous namespace
+
 BOOST_AUTO_TEST_CASE(ConfigFileMatchesModel) {
   run_property([](hegel::TestCase &tc) {
-    const auto spec{tc.draw("config", config_specs())};
-    const scratch_directory scratch;
-    const auto path{scratch.path() / "config.json"};
-    const auto text{boost::json::serialize(spec.json)};
-    write_file(path, text);
-
-    std::optional<binsrv::main_config> config;
-    const auto error{load_cleanly([&] { config.emplace(path.string()); })};
-    require(config.has_value() == spec.valid,
-            "'" + text + "' was " +
-                (spec.valid ? "rejected: " + error.value_or("")
-                            : "accepted, expected a rejection for: " +
-                                  spec.description));
-    if (!config.has_value()) {
-      return;
-    }
-    const auto &root{config->root()};
-    const auto &json{spec.json};
-    const auto same_string{[&](std::string_view section,
-                               std::string_view field,
-                               const std::string &actual) {
-      require(json_at(json, section, field).as_string() == actual,
-              std::string{section} + '.' + std::string{field} + " is '" +
-                  actual + "' in '" + text + "'");
-    }};
-    const auto same_number{[&](std::string_view section,
-                               std::string_view field, std::uint64_t actual) {
-      require(json_at(json, section, field).to_number<std::uint64_t>() ==
-                  actual,
-              std::string{section} + '.' + std::string{field} + " is " +
-                  std::to_string(actual) + " in '" + text + "'");
-    }};
-    const auto &logger{root.get<"logger">()};
-    same_string("logger", "level",
-                std::string{binsrv::to_string_view(logger.get<"level">())});
-    const auto &connection{root.get<"connection">()};
-    same_string("connection", "user", connection.get<"user">());
-    same_string("connection", "password", connection.get<"password">());
-    if (connection.get<"host">().has_value()) {
-      same_string("connection", "host", *connection.get<"host">());
-    }
-    if (connection.get<"port">().has_value()) {
-      same_number("connection", "port", *connection.get<"port">());
-    }
-    if (connection.get<"dns_srv_name">().has_value()) {
-      same_string("connection", "dns_srv_name",
-                  *connection.get<"dns_srv_name">());
-    }
-    same_number("connection", "connect_timeout",
-                connection.get<"connect_timeout">());
-    same_number("connection", "read_timeout",
-                connection.get<"read_timeout">());
-    same_number("connection", "write_timeout",
-                connection.get<"write_timeout">());
-    const auto &replication{root.get<"replication">()};
-    same_number("replication", "server_id", replication.get<"server_id">());
-    same_number("replication", "idle_time", replication.get<"idle_time">());
-    require(json_at(json, "replication", "verify_checksum").as_bool() ==
-                replication.get<"verify_checksum">(),
-            "replication.verify_checksum differs");
-    same_string("replication", "mode",
-                boost::lexical_cast<std::string>(replication.get<"mode">()));
-    const auto &source{root.get<"replication_source">()};
-    same_number("replication_source", "port", source.get<"port">());
-    same_number("replication_source", "server_id",
-                source.get<"server_id">());
-    same_string("replication_source", "server_uuid",
-                source.get<"server_uuid">());
-    same_number("replication_source", "read_timeout",
-                source.get<"read_timeout">());
-    same_number("replication_source", "write_timeout",
-                source.get<"write_timeout">());
-    const auto &storage{root.get<"storage">()};
-    same_string("storage", "backend",
-                boost::lexical_cast<std::string>(storage.get<"backend">()));
-    same_string("storage", "uri", storage.get<"uri">());
-    if (storage.get<"checkpoint_size">().has_value()) {
-      const auto expected{model_unit(
-          json_at(json, "storage", "checkpoint_size").as_string(),
-          size_symbols)};
-      require(expected == storage.get<"checkpoint_size">()->get_value(),
-              "storage.checkpoint_size differs in '" + text + "'");
-    }
-    if (storage.get<"checkpoint_interval">().has_value()) {
-      const auto expected{model_unit(
-          json_at(json, "storage", "checkpoint_interval").as_string(),
-          time_symbols)};
-      require(expected == storage.get<"checkpoint_interval">()->get_value(),
-              "storage.checkpoint_interval differs in '" + text + "'");
-    }
-    require(root.get<"keyring">().has_value() == json.contains("keyring"),
-            "keyring section presence differs in '" + text + "'");
+    check_config_file(tc.draw("config", config_specs()));
   });
+}
+
+// every defect of config_specs() (each kind of source_server_uuid damage
+// separately), on a few random otherwise valid files each: the random draw
+// of ConfigFileMatchesModel can miss some of them in a nightly run
+BOOST_AUTO_TEST_CASE(ConfigFileRejectsEveryDefect) {
+  std::vector<std::string> defects;
+  for (const auto &defect : config_defects()) {
+    if (defect == "source_server_uuid") {
+      for (int damage{0}; damage < uuid_damage_kinds; ++damage) {
+        defects.push_back(defect + ':' + std::to_string(damage));
+      }
+    } else {
+      defects.push_back(defect);
+    }
+  }
+  hegel::Settings settings{};
+  settings.test_cases = 10U;
+  for (const auto &defect : defects) {
+    BOOST_TEST_CONTEXT("defect " << defect) {
+      run_property(
+          [&defect](hegel::TestCase &tc) {
+            check_config_file(tc.draw("config", config_specs(defect)));
+          },
+          settings);
+    }
+  }
 }
 
 BOOST_AUTO_TEST_CASE(ConfigDamagedFileFailsCleanly) {

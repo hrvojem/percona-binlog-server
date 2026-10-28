@@ -214,6 +214,8 @@ struct source_settings {
   bool gtid_mode;
   std::uint32_t server_id;
   std::string server_uuid;
+  // replication_source.read_timeout, in seconds
+  std::uint32_t read_timeout{60U};
 };
 
 std::ostream &operator<<(std::ostream &output, const source_settings &value) {
@@ -417,7 +419,7 @@ public:
 
     source_config_.get<"server_id">() = settings.server_id;
     source_config_.get<"server_uuid">() = settings.server_uuid;
-    source_config_.get<"read_timeout">() = 60U;
+    source_config_.get<"read_timeout">() = settings.read_timeout;
     source_config_.get<"write_timeout">() = 60U;
     source_config_.get<"authentication">().get<"user">() = replica_user;
     source_config_.get<"authentication">().get<"password">() =
@@ -1273,7 +1275,9 @@ enum class command_kind : std::uint8_t {
   query,
   ping,
   register_replica,
-  binlog_dump
+  binlog_dump,
+  reset_connection,
+  change_user
 };
 
 struct command {
@@ -1296,6 +1300,10 @@ std::ostream &operator<<(std::ostream &output, const command &value) {
     return output << "COM_PING";
   case command_kind::register_replica:
     return output << "COM_REGISTER_SLAVE";
+  case command_kind::reset_connection:
+    return output << "COM_RESET_CONNECTION";
+  case command_kind::change_user:
+    return output << "COM_CHANGE_USER";
   case command_kind::binlog_dump:
     output << "COM_BINLOG_DUMP";
     if (!value.dump_binlog.empty() ||
@@ -1313,7 +1321,8 @@ commands(gs::Generator<std::string> statements) {
     const auto kind{tc.draw(gs::sampled_from(
         {command_kind::query, command_kind::query, command_kind::query,
          command_kind::query, command_kind::ping,
-         command_kind::register_replica, command_kind::binlog_dump}))};
+         command_kind::register_replica, command_kind::reset_connection,
+         command_kind::change_user, command_kind::binlog_dump}))};
     command result{.kind = kind, .statement = {}};
     if (kind == command_kind::query) {
       result.statement = tc.draw(statements);
@@ -1338,6 +1347,19 @@ encode_command(const command &value,
         0U,
         cp::message::client::RegisterReplica{replica_server_id, "replica",
                                              "", "", replica_port, 0U, 0U},
+        capabilities);
+  }
+  case command_kind::reset_connection:
+    return encode_client_frame(0U, cp::message::client::ResetConnection{},
+                               capabilities);
+  case command_kind::change_user: {
+    // the same user again, with a made-up scramble
+    static constexpr std::uint16_t utf8mb4_collation{255U};
+    return encode_client_frame(
+        0U,
+        cp::message::client::ChangeUser{
+            std::string{replica_user}, std::string(32U, 'x'), "",
+            utf8mb4_collation, std::string{auth_method}, ""},
         capabilities);
   }
   case command_kind::binlog_dump: {
@@ -1374,8 +1396,18 @@ std::string describe(const std::vector<exchange> &transcript,
   return output.str();
 }
 
+// whether 'received' resets the session state as MySQL does: COM_RESET_CONNECTION
+// answered with OK clears the user variables (the checksum declaration
+// among them); refused with ERR, it changes nothing
+[[nodiscard]] bool resets_session(const command &sent, const reply &received) {
+  return sent.kind == command_kind::reset_connection &&
+         received.kind == reply_kind::ok;
+}
+
 // connects to a new listener, authenticates and sends the commands up to and
-// including the first COM_BINLOG_DUMP (the session ends with it)
+// including the first COM_BINLOG_DUMP (the session ends with it), or up to a
+// COM_CHANGE_USER that is not refused (the model does not follow the
+// re-authentication it starts)
 [[nodiscard]] std::vector<exchange> run_session(const source_settings &settings,
                                                 const std::vector<command> &cmds) {
   const replication_source source{settings};
@@ -1398,6 +1430,10 @@ std::string describe(const std::vector<exchange> &transcript,
       break;
     }
     transcript.push_back({.sent = sent, .received = client.read_reply()});
+    if (sent.kind == command_kind::change_user &&
+        transcript.back().received.kind != reply_kind::error) {
+      break;
+    }
   }
   return transcript;
 }
@@ -1411,6 +1447,19 @@ void require_reply_class(const std::vector<exchange> &transcript,
       sent.kind == command_kind::register_replica) {
     require(received.kind == reply_kind::ok,
             "not answered with OK:" + describe(transcript, index));
+  }
+  // MySQL answers COM_RESET_CONNECTION with OK; refusing it with ERR (as an
+  // unsupported command) is acceptable, ending the session is not
+  if (sent.kind == command_kind::reset_connection) {
+    require(received.kind == reply_kind::ok ||
+                received.kind == reply_kind::error,
+            "neither OK nor ERR:" + describe(transcript, index));
+  }
+  // COM_CHANGE_USER starts a re-authentication in MySQL; refused with ERR or
+  // not, the session must not just end
+  if (sent.kind == command_kind::change_user) {
+    require(received.kind != reply_kind::closed,
+            "the session ended:" + describe(transcript, index));
   }
   if (sent.kind == command_kind::query) {
     switch (classify(sent.statement)) {
@@ -1452,6 +1501,9 @@ BOOST_AUTO_TEST_CASE(ReplicationSourceChecksumVariableFollowsLastSet) {
     std::optional<std::string> model{};
     for (std::size_t index{0U}; index < std::size(transcript); ++index) {
       const auto &[sent, received] = transcript[index];
+      if (resets_session(sent, received)) {
+        model.reset();
+      }
       if (sent.kind != command_kind::query) {
         continue;
       }
@@ -1517,8 +1569,14 @@ BOOST_AUTO_TEST_CASE(ReplicationSourceDumpRequiresChecksumDeclaration) {
           checksum_set_value(sent.statement).has_value()) {
         declared = true;
       }
+      if (resets_session(sent, received)) {
+        declared = false;
+      }
     }
-    require(false, "the session ended before the dump");
+    // a COM_CHANGE_USER that was not refused ends the transcript early
+    require(!transcript.empty() &&
+                transcript.back().sent.kind == command_kind::change_user,
+            "the session ended before the dump");
   });
 }
 
@@ -2113,7 +2171,10 @@ enum class disconnect_point : std::uint8_t {
   after_server_greeting,
   inside_client_greeting,
   after_authentication,
-  inside_command
+  inside_command,
+  // not a disconnect: the client stays connected and silent until the
+  // listener's read_timeout ends the session
+  silent_after_authentication
 };
 
 [[nodiscard]] std::string_view to_string(disconnect_point point) {
@@ -2126,11 +2187,42 @@ enum class disconnect_point : std::uint8_t {
     return "after authentication";
   case disconnect_point::inside_command:
     return "inside a command";
+  case disconnect_point::silent_after_authentication:
+    return "silent after authentication";
   }
   return "?";
 }
 
 } // anonymous namespace
+
+// the line network_service::handle_exception logs for a session ending
+// with any error (or std::nullopt while none)
+[[nodiscard]] std::optional<std::string>
+session_end_line(const capturing_logger &logger) {
+  for (const auto &line : logger.lines()) {
+    if (line.find("net    : session ") != std::string::npos ||
+        line.find("caught in session ") != std::string::npos) {
+      return line;
+    }
+  }
+  return std::nullopt;
+}
+
+// waits up to 'limit' for the session's end to be logged; returns the whole
+// log, indented, for messages
+std::string wait_for_session_end(const capturing_logger &logger,
+                                 std::chrono::seconds limit) {
+  const auto deadline{std::chrono::steady_clock::now() + limit};
+  while (!session_end_line(logger).has_value() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  }
+  std::string log;
+  for (const auto &line : logger.lines()) {
+    log += "\n  " + line;
+  }
+  return log;
+}
 
 // a client that goes away at any point of a session (an orderly close or a
 // reset) ends only that session, which the listener reports as "connection
@@ -2138,80 +2230,147 @@ enum class disconnect_point : std::uint8_t {
 // mysqlbinlog disconnecting is routine (ticket 42, PBS-115: fails today for an
 // orderly close, which network_service::handle_exception looks for as
 // boost::asio::error::eof in the system category, while Asio reports it in
-// asio.misc; the reset is ECONNRESET in the system category and passes)
+// asio.misc; the reset is ECONNRESET in the system category and passes); a
+// client that stays silent past read_timeout is reported as a read timeout,
+// also at info level
 BOOST_AUTO_TEST_CASE(ReplicationSourceLogsDisconnectsAsRoutine) {
   run_property([](hegel::TestCase &tc) {
-    const auto settings{tc.draw("settings", source_settings_generator())};
+    auto settings{tc.draw("settings", source_settings_generator())};
     const auto point{static_cast<disconnect_point>(tc.draw(
         "point", gs::integers<std::uint8_t>(
                      {.min_value = 0U,
                       .max_value = static_cast<std::uint8_t>(
-                          disconnect_point::inside_command)})))};
-    const auto abortive{tc.draw("abortive", gs::booleans())};
-    const std::string label{std::string{"a client disconnecting "} +
-                            std::string{to_string(point)} +
-                            (abortive ? " with a reset" : " with a FIN")};
+                          disconnect_point::silent_after_authentication)})))};
+    const bool silent{point == disconnect_point::silent_after_authentication};
+    const auto abortive{!silent && tc.draw("abortive", gs::booleans())};
+    const std::string label{
+        std::string{"a client "} + std::string{to_string(point)} +
+        (silent ? "" : (abortive ? ", disconnecting with a reset"
+                                 : ", disconnecting with a FIN"))};
+    // the shortest allowed timeout for the silent client; long enough for
+    // the authentication otherwise
+    if (silent) {
+      settings.read_timeout = 1U;
+    }
 
     const auto logger{std::make_shared<capturing_logger>()};
     const replication_source source{settings, nullptr, logger};
-    {
-      mysql_client client{source.port()};
-      switch (point) {
-      case disconnect_point::after_server_greeting:
-        require(client.read_frame().has_value(), "no server greeting");
-        break;
-      case disconnect_point::inside_client_greeting:
-        require(client.read_frame().has_value(), "no server greeting");
-        // a frame header announcing 64 bytes, then only 3 of them
-        client.write_frame(network_buffer_type{"\x40\x00\x00\x01xyz", 7U});
-        break;
-      case disconnect_point::after_authentication:
-        client.authenticate(replica_user, replica_password);
-        break;
-      case disconnect_point::inside_command:
-        client.authenticate(replica_user, replica_password);
-        // COM_QUERY announcing 32 bytes, then only "SEL"
-        client.write_frame(network_buffer_type{"\x20\x00\x00\x00\x03SEL", 8U});
-        break;
-      }
+    mysql_client client{source.port()};
+    switch (point) {
+    case disconnect_point::after_server_greeting:
+      require(client.read_frame().has_value(), "no server greeting");
+      break;
+    case disconnect_point::inside_client_greeting:
+      require(client.read_frame().has_value(), "no server greeting");
+      // a frame header announcing 64 bytes, then only 3 of them
+      client.write_frame(network_buffer_type{"\x40\x00\x00\x01xyz", 7U});
+      break;
+    case disconnect_point::after_authentication:
+    case disconnect_point::silent_after_authentication:
+      client.authenticate(replica_user, replica_password);
+      break;
+    case disconnect_point::inside_command:
+      client.authenticate(replica_user, replica_password);
+      // COM_QUERY announcing 32 bytes, then only "SEL"
+      client.write_frame(network_buffer_type{"\x20\x00\x00\x00\x03SEL", 8U});
+      break;
+    }
+    if (!silent) {
       client.disconnect(abortive);
     }
 
-    // the session ends in network_service::handle_exception, which logs
-    // either outcome with the session's name
-    const auto ended{[&logger] {
-      for (const auto &line : logger->lines()) {
-        if ((line.find(": session ") != std::string::npos &&
-             line.find("connection closed by peer") != std::string::npos) ||
-            line.find("caught in session ") != std::string::npos) {
-          return true;
-        }
-      }
-      return false;
-    }};
-    const auto deadline{std::chrono::steady_clock::now() +
-                        std::chrono::seconds{10}};
-    while (!ended() && std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::sleep_for(std::chrono::milliseconds{10});
-    }
-    const auto lines{logger->lines()};
-    std::string log;
-    for (const auto &line : lines) {
-      log += "\n  " + line;
-    }
-    require(ended(), label + ": the listener logged no end of the session:" +
-                         log);
-    for (const auto &line : lines) {
+    const auto log{wait_for_session_end(*logger, std::chrono::seconds{10})};
+    const auto end{session_end_line(*logger)};
+    require(end.has_value(),
+            label + ": the listener logged no end of the session:" + log);
+    for (const auto &line : logger->lines()) {
       require(line.find("[  error]") == std::string::npos &&
                   line.find("[  fatal]") == std::string::npos,
               label + " was logged as an error:" + log);
     }
-    require(std::ranges::any_of(lines,
-                                [](const std::string &line) {
-                                  return line.find(
-                                             "connection closed by peer") !=
-                                         std::string::npos;
-                                }),
-            label + " was not logged as 'connection closed by peer':" + log);
+    const std::string_view expected{silent ? "frame header read timeout"
+                                           : "connection closed by peer"};
+    require(end->find("[   info]") != std::string::npos &&
+                end->find(expected) != std::string::npos,
+            label + " was not logged as '" + std::string{expected} +
+                "' at info level:" + log);
   });
+}
+
+// a COM_BINLOG_DUMP the sender cannot serve (a binlog name that is not
+// stored, or not a binlog name at all) ends that session with the reason in
+// the log ("exception caught in session ..."), and the listener goes on
+// accepting connections
+BOOST_AUTO_TEST_CASE(ReplicationSourceLogsAFailedDumpAndKeepsListening) {
+  const source_settings settings{.gtid_mode = false,
+                                 .server_id = 142U,
+                                 .server_uuid =
+                                     "00000000-0000-0000-0000-00000000008e"};
+  for (const std::string binlog : {"binlog.000099", "not-a-binlog-name"}) {
+    const auto logger{std::make_shared<capturing_logger>()};
+    const replication_source source{settings, nullptr, logger};
+    const std::string label{"a dump of '" + binlog + "'"};
+    {
+      mysql_client client{source.port()};
+      client.authenticate(replica_user, replica_password);
+      client.write_frame(encode_command(
+          {.kind = command_kind::query,
+           .statement = "SET @source_binlog_checksum = 'NONE', "
+                        "@master_binlog_checksum = 'NONE'"},
+          client.capabilities()));
+      BOOST_REQUIRE(client.read_reply().kind == reply_kind::ok);
+      client.write_frame(encode_command({.kind = command_kind::binlog_dump,
+                                         .statement = {},
+                                         .dump_binlog = binlog},
+                                        client.capabilities()));
+      static_cast<void>(client.read_dump_reply());
+    }
+    const auto log{wait_for_session_end(*logger, std::chrono::seconds{10})};
+    const auto end{session_end_line(*logger)};
+    BOOST_TEST_INFO(label << ", listener log:" << log);
+    BOOST_REQUIRE(end.has_value());
+    BOOST_TEST_INFO(label << ", listener log:" << log);
+    BOOST_CHECK(end->find("exception caught in session ") !=
+                std::string::npos);
+
+    mysql_client next{source.port()};
+    next.authenticate(replica_user, replica_password);
+    next.write_frame(encode_command(
+        {.kind = command_kind::ping, .statement = {}}, next.capabilities()));
+    BOOST_TEST_INFO(label);
+    BOOST_CHECK(next.read_reply().kind == reply_kind::ok);
+  }
+}
+
+// COM_RESET_CONNECTION and COM_CHANGE_USER, which a connection pool or the
+// mysql client may send, get a reply (MySQL: OK, and a re-authentication;
+// refused with ERR as unsupported is acceptable) and do not end the session:
+// a COM_PING after a refused one is still answered with OK
+BOOST_AUTO_TEST_CASE(ReplicationSourceAnswersResetConnectionAndChangeUser) {
+  const source_settings settings{.gtid_mode = false,
+                                 .server_id = 142U,
+                                 .server_uuid =
+                                     "00000000-0000-0000-0000-00000000008e"};
+  for (const auto kind :
+       {command_kind::reset_connection, command_kind::change_user}) {
+    const replication_source source{settings};
+    mysql_client client{source.port()};
+    client.authenticate(replica_user, replica_password);
+    const command sent{.kind = kind, .statement = {}};
+    client.write_frame(encode_command(sent, client.capabilities()));
+    const auto received{client.read_reply()};
+    std::ostringstream label;
+    label << sent << " -> " << received;
+    BOOST_TEST_MESSAGE(label.str());
+    BOOST_TEST_INFO(label.str());
+    BOOST_CHECK(received.kind != reply_kind::closed &&
+                received.kind != reply_kind::malformed);
+    if (received.kind == reply_kind::error ||
+        kind == command_kind::reset_connection) {
+      client.write_frame(encode_command(
+          {.kind = command_kind::ping, .statement = {}}, client.capabilities()));
+      BOOST_TEST_INFO(label.str() << ", then COM_PING");
+      BOOST_CHECK(client.read_reply().kind == reply_kind::ok);
+    }
+  }
 }

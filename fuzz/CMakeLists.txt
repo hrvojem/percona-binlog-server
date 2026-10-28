@@ -46,3 +46,39 @@ set_target_properties(listener_packet_fuzzer PROPERTIES
   CXX_STANDARD_REQUIRED YES
   CXX_EXTENSIONS NO
 )
+
+# stored binlog data read back by the replication source of 'pull'; the
+# sender is part of the executable's operations sources, so it is compiled in
+# directly, as in tests/sender_context_property_test
+add_executable(stored_binlog_fuzzer
+  stored_binlog_fuzzer.cpp
+  "${PROJECT_SOURCE_DIR}/src/operations/sender_context.cpp"
+  "${PROJECT_SOURCE_DIR}/src/operations/sender_single_file_context.cpp"
+  "${PROJECT_SOURCE_DIR}/src/operations/event_generation_helpers.cpp"
+)
+target_include_directories(stored_binlog_fuzzer PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(stored_binlog_fuzzer
+  PRIVATE
+    binlog_server_compiler_flags
+    binsrv::lib_binsrv
+)
+target_link_options(stored_binlog_fuzzer PRIVATE ${fuzzer_link_options})
+set_target_properties(stored_binlog_fuzzer PROPERTIES
+  CXX_STANDARD_REQUIRED YES
+  CXX_EXTENSIONS NO
+)
+
+# the small decoders of user and network input (GTID sets, binlog names,
+# server versions, timestamps, size and time units, heartbeat bodies)
+add_executable(decoders_fuzzer decoders_fuzzer.cpp)
+target_include_directories(decoders_fuzzer PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(decoders_fuzzer
+  PRIVATE
+    binlog_server_compiler_flags
+    binsrv::lib_binsrv
+)
+target_link_options(decoders_fuzzer PRIVATE ${fuzzer_link_options})
+set_target_properties(decoders_fuzzer PROPERTIES
+  CXX_STANDARD_REQUIRED YES
+  CXX_EXTENSIONS NO
+)

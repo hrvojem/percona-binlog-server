@@ -8,6 +8,8 @@
 # Remove a line once its bug is fixed.
 #
 # PBS-68 (ticket 1, a FORMAT_DESCRIPTION with an unparsable server version
-# terminates the process) is not listed: event_stream_fuzzer filters it (see
-# FUZZ_KEEP_PBS_68 in fuzz/event_stream_fuzzer.cpp) so that it does not drown
-# every other finding.
+# terminates the process) and PBS-112 (ticket 39, an invalid event type code
+# where the pull sender expects a header) are not listed: the targets filter
+# them (fuzz/known_bug_filters.hpp, FUZZ_KEEP_PBS_68 / FUZZ_KEEP_PBS_112) so
+# that they do not drown every other finding. A UBSan report in Boost's
+# lexical_cast is silenced by fuzz/ubsan_ignorelist.txt.

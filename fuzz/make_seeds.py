@@ -21,9 +21,17 @@ mode, a varied workload with rotations), each turned into the stream a source
 sends: the target's selector byte, an artificial ROTATE, then the binlog's
 events, cut at an event boundary to stay below MAX_SEED_SIZE.
 
+stored_binlog/: the same binlogs as stored content (after the binlog magic),
+behind the target's two selector bytes: a dump from the beginning, from a
+later event boundary, and with a switch to the next binlog.
+
 listener_packet/: client sessions in the MySQL wire format: a client
 greeting for caching_sha2_password, a request for the server's public key, an
 "encrypted password", then the statements and commands a replica sends.
+
+decoders/: one example per decoder of the decoders target (a GTID set in
+text and binary form, a binlog name, a server version, a timestamp, sizes and
+times with units, a heartbeat body), behind its selector byte.
 
 Uses the MySQL server helper of extra/qa/fetch_crash_test.py. Example:
 
@@ -77,8 +85,9 @@ def events_of(data: bytes) -> list:
     return events
 
 
-def stream_seeds(args, out: Path) -> int:
+def stream_seeds(args, out: Path, stored_out: Path) -> int:
     out.mkdir(parents=True, exist_ok=True)
+    stored_out.mkdir(parents=True, exist_ok=True)
     count = 0
     for gtid_mode in (False, True):
         server = harness.MySQLServer(args.mysql_basedir,
@@ -108,9 +117,46 @@ def stream_seeds(args, out: Path) -> int:
                            f"{int(with_checksum)}").write_bytes(
                                bytes([selector]) + stream)
                     count += 1
+                stored = b""
+                for event in events:
+                    if len(stored) + len(event) + 2 > MAX_SEED_SIZE:
+                        break
+                    stored += event
+                # flags: from a position, checksum, switch to the next
+                # binlog; the second byte picks the event boundary
+                for flags, boundary in ((0, 0), (1 | 2, 2), (4, 0)):
+                    (stored_out / f"{'gtid' if gtid_mode else 'pos'}-{name}-"
+                                  f"{flags}").write_bytes(
+                                      bytes([flags, boundary]) + stored)
+                    count += 1
         finally:
             server.stop()
     return count
+
+
+def decoder_seeds(out: Path) -> int:
+    out.mkdir(parents=True, exist_ok=True)
+    uuid = bytes.fromhex("3e11fa4771ca11e19e33c80aa9429562")
+    # a binary GTID set: number of UUIDs, then per UUID the UUID, the number
+    # of intervals and each interval [start, end)
+    binary_gtids = (struct.pack("<Q", 1) + uuid + struct.pack("<Q", 2) +
+                    struct.pack("<QQ", 1, 6) + struct.pack("<QQ", 11, 19))
+    heartbeat = (bytes([1, 13]) + b"binlog.000001" + bytes([2, 1, 4]) +
+                 bytes([0]))
+    seeds = {
+        "gtid-set-text": (0, b"3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5:11-18,"
+                             b"3e11fa47-71ca-11e1-9e33-c80aa9429563:tag_1:1-3"),
+        "gtid-set-binary": (1, binary_gtids),
+        "binlog-name": (2, b"binlog.000001"),
+        "server-version": (3, b"8.4.8-8"),
+        "timestamp": (4, b"2026-10-06T23:59:59.123"),
+        "size": (5, b"128M"),
+        "time": (6, b"30s"),
+        "heartbeat": (7, heartbeat),
+    }
+    for name, (selector, data) in seeds.items():
+        (out / name).write_bytes(bytes([selector]) + data)
+    return len(seeds)
 
 
 def frame(sequence: int, payload: bytes) -> bytes:
@@ -182,9 +228,12 @@ def main():
     args = parser.parse_args()
     args.mysql_basedir = args.mysql_basedir.expanduser()
     args.workdir.mkdir(parents=True, exist_ok=True)
-    streams = stream_seeds(args, args.out / "event_stream")
+    streams = stream_seeds(args, args.out / "event_stream",
+                           args.out / "stored_binlog")
     packets = listener_seeds(args.out / "listener_packet")
-    print(f"{streams} event stream seeds, {packets} listener packet seeds")
+    decoders = decoder_seeds(args.out / "decoders")
+    print(f"{streams} event stream and stored binlog seeds, {packets} "
+          f"listener packet seeds, {decoders} decoder seeds")
 
 
 if __name__ == "__main__":

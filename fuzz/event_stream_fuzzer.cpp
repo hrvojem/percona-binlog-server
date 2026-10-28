@@ -23,23 +23,22 @@
 // A rejection is a std::exception, on which the collector stops cleanly; a
 // crash, a std::terminate or a sanitizer report is a bug.
 //
-// Known bug filter: a FORMAT_DESCRIPTION whose server version is not
-// major.minor.patch ends the process (std::terminate from a noexcept
-// accessor, ticket 1 / PBS-68). Left in, it is found in nearly every run and
-// the fuzzer spends its time there, so such an event ends the stream like the
-// clean rejection the fix should make it. Build with -DFUZZ_KEEP_PBS_68 to
-// keep the crash, and remove the filter once PBS-68 is fixed.
+// Known bug filter (known_bug_filters.hpp): a FORMAT_DESCRIPTION whose server
+// version is not major.minor.patch ends the process (ticket 1 / PBS-68); left
+// in, it ended nearly every run, so such an event ends the stream like the
+// clean rejection the fix should make it (-DFUZZ_KEEP_PBS_68 keeps the
+// crash).
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <sstream>
-#include <string_view>
+
+#include "known_bug_filters.hpp"
 
 #include "binsrv/replication_mode_type.hpp"
 
-#include "binsrv/events/code_type.hpp"
 #include "binsrv/events/common_header_view.hpp"
 #include "binsrv/events/event.hpp"
 #include "binsrv/events/event_view.hpp"
@@ -71,33 +70,6 @@ constexpr std::array<util::semantic_version, 3> server_versions{
              : std::size(rest);
 }
 
-// whether 'event' is a FORMAT_DESCRIPTION whose server version the decoder
-// cannot parse (PBS-68): the 50-byte field after the 2-byte binlog version,
-// cut at its first NUL, as util::semantic_version reads it
-[[nodiscard]] bool has_unparsable_server_version(util::const_byte_span event) {
-  using header = binsrv::events::common_header_view_base;
-  static constexpr std::size_t binlog_version_size{2U};
-  static constexpr std::size_t server_version_size{50U};
-  if (std::size(event) < header::size_in_bytes + binlog_version_size +
-                             server_version_size ||
-      std::to_integer<std::uint8_t>(event[header::type_code_offset]) !=
-          static_cast<std::uint8_t>(
-              binsrv::events::code_type::format_description)) {
-    return false;
-  }
-  std::string_view version{
-      reinterpret_cast<const char *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-          std::data(event) + header::size_in_bytes + binlog_version_size),
-      server_version_size};
-  version = version.substr(0U, version.find('\0'));
-  try {
-    [[maybe_unused]] const util::semantic_version parsed{version};
-  } catch (const std::exception &) {
-    return true;
-  }
-  return false;
-}
-
 } // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *data,
@@ -126,7 +98,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *data,
       const auto portion{rest.subspan(0U, event_size)};
       rest = rest.subspan(event_size);
 #ifndef FUZZ_KEEP_PBS_68
-      if (has_unparsable_server_version(portion)) {
+      if (fuzz_filters::has_unparsable_server_version(portion)) {
         break;
       }
 #endif

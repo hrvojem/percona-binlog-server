@@ -1,0 +1,13 @@
+# UndefinedBehaviorSanitizer ignore list of the fuzz build
+# (-fsanitize-ignorelist=fuzz/ubsan_ignorelist.txt): reports in third-party
+# code that the fuzz targets reach and that are not PBS bugs.
+
+# Boost 1.90, boost/lexical_cast/detail/lcast_unsigned_converters.hpp:267:
+# for an unsigned short target, 'm_multiplier * dig_value' is computed in int
+# and overflows (signed, so undefined) on a long run of digits; the function
+# is already marked no_sanitize("unsigned-integer-overflow"), and the result
+# is rejected by the overflow check that follows. Reached through
+# util::ctime_timestamp (boost::posix_time::from_iso_extended_string parsing
+# the date with lexical_cast<unsigned short>), found by decoders_fuzzer.
+[undefined]
+fun:*lcast_ret_unsigned*main_convert_iteration*

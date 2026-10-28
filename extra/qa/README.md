@@ -391,7 +391,7 @@ server rather than starting one.
   5. **Fuzzing** (`fuzz`), last: the libFuzzer targets of
      [`fuzz/`](../../fuzz) in their own Clang 20 build
      (`$WS/percona-binlog-server-build-fuzz_clang20`, configured by the
-     nightly the first time), each for 15 min (`FUZZ_SECONDS`) with 12
+     nightly the first time), each for 10 min (`FUZZ_SECONDS`) with 12
      workers (`FUZZ_JOBS`) against a corpus kept between nights. Each
      distinct finding is a case `<target>/<signature>` of the build `fuzz`,
      compared with `fuzz_known_failures.txt`; see

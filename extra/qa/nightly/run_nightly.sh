@@ -90,8 +90,8 @@ MTR_PARALLEL=${MTR_PARALLEL:-4}
 # fuzzing stage: the libFuzzer targets of fuzz/, each run for FUZZ_SECONDS
 # with FUZZ_JOBS workers against its corpus in $WS/fuzz/corpus (kept between
 # nights, started from $WS/fuzz/seeds, written by fuzz/make_seeds.py)
-FUZZ_TARGETS=${FUZZ_TARGETS:-"event_stream_fuzzer listener_packet_fuzzer"}
-FUZZ_SECONDS=${FUZZ_SECONDS:-900}
+FUZZ_TARGETS=${FUZZ_TARGETS:-"event_stream_fuzzer listener_packet_fuzzer stored_binlog_fuzzer decoders_fuzzer"}
+FUZZ_SECONDS=${FUZZ_SECONDS:-600}
 FUZZ_JOBS=${FUZZ_JOBS:-12}
 # QA-harness stage: one MySQL version, the Python libraries, a port range
 QA_DIST=${QA_DIST:-8.4:mysql-8.4.8-$MYSQL_SUFFIX-minimal}
@@ -626,7 +626,7 @@ if want fuzz; then
   stage_started=$(date +%s)
   if [ ! -f "$fuzz_build/CMakeCache.txt" ]; then
     log "configuring fuzz_clang20"
-    fuzz_flags="-fsanitize=fuzzer-no-link,address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -O1 -g"
+    fuzz_flags="-fsanitize=fuzzer-no-link,address,undefined -fno-sanitize-recover=undefined -fsanitize-ignorelist=$SRC/fuzz/ubsan_ignorelist.txt -fno-omit-frame-pointer -O1 -g"
     cmake -S "$SRC" -B "$fuzz_build" -DCMAKE_BUILD_TYPE=Debug \
       -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 \
       -DWITH_STDLIB_LIBCXX=OFF -DCPP_STANDARD=23 -DBUILD_TESTING=OFF \

@@ -1,0 +1,28 @@
+# Mutants that survive every test and were triaged as harmless:
+# <file relative to src/>:<line>:<column> <mutator>  # why
+# combine_mull_reports.py --known reports them separately. Line numbers move
+# with the code: re-triage after changes to these files.
+
+# equivalent: only the capacity passed to reserve() changes
+binsrv/gtids/gtid.cpp:37:38 cxx_add_to_sub
+binsrv/gtids/gtid.cpp:37:69 cxx_add_to_sub
+binsrv/gtids/gtid.cpp:37:80 cxx_add_to_sub
+binsrv/gtids/gtid.cpp:38:21 cxx_add_to_sub
+binsrv/gtids/gtid_set.cpp:426:13 cxx_pre_inc_to_pre_dec
+binsrv/gtids/gtid_set.cpp:429:66 cxx_mul_to_div
+# equivalent: equal bounds returned earlier, so '<' and '<=' agree
+binsrv/gtids/gtid_set.cpp:618:27 cxx_lt_to_le
+binsrv/gtids/gtid_set.cpp:679:27 cxx_lt_to_le
+# equivalent: one more tag character is read, and the tag length check
+# rejects the tag either way
+binsrv/gtids/gtid_set.cpp:188:30 cxx_lt_to_le
+# equivalent: for num_bytes == 8 the shift is by 0
+util/byte_span_inserters.hpp:262:17 cxx_lt_to_le
+util/byte_span_extractors.hpp:215:17 cxx_lt_to_le
+# unreachable: a count of exactly SIZE_MAX (64-bit), rejected later anyway
+binsrv/gtids/gtid_set.cpp:354:15 cxx_gt_to_ge
+binsrv/gtids/gtid_set.cpp:781:39 cxx_gt_to_ge
+# unreachable in tests: a set of exactly 2^56 (untagged) or 2^48 (tagged)
+# TSIDs
+binsrv/gtids/gtid_set.cpp:508:27 cxx_ge_to_gt
+binsrv/gtids/gtid_set.cpp:519:25 cxx_ge_to_gt

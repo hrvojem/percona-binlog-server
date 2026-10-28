@@ -1,0 +1,7 @@
+# Mull configuration of the mutation testing trial (see README.md): only the
+# GTID and util libraries are mutated. The compiler plugin and mull-runner
+# find it through MULL_CONFIG.
+includePaths:
+  - ".*/src/binsrv/gtids/.*"
+  - ".*/src/util/.*"
+quiet: true

@@ -1,0 +1,76 @@
+#
+# Checks that the Binlog Server Utility can connect without SSL as a
+# 'caching_sha2_password' user, as 'mysql --ssl-mode=DISABLED
+# --get-server-public-key' and a replica with GET_SOURCE_PUBLIC_KEY=1 can
+# (ticket 23). Over an unencrypted connection the full authentication sends
+# the password encrypted with the server's RSA public key, which the client
+# has to ask for. The server's authentication cache is emptied first, so that
+# the fast path (a password hash cached by an earlier login) cannot hide the
+# problem; on MySQL 9.x there is no 'mysql_native_password' to fall back to.
+#
+
+--source ../include/have_binsrv.inc
+
+--source ../include/v80_v84_compatibility_defines.inc
+
+# in case of --repeat=N, we need to start from a fresh binary log to make
+# this test deterministic
+--echo *** Resetting replication at the very beginning of the test.
+--disable_query_log
+eval $stmt_reset_binary_logs_and_gtids;
+--enable_query_log
+
+# identifying backend storage type ('file' or 's3')
+--source ../include/identify_storage_backend.inc
+
+--let $localhost_ip = 127.0.0.1
+--let $user_name = sha2_user
+--let $user_password = strong_password
+
+--echo
+--echo *** Creating a caching_sha2_password user with replication privileges.
+eval CREATE USER '$user_name'@'$localhost_ip' IDENTIFIED WITH caching_sha2_password BY '$user_password';
+eval GRANT REPLICATION SLAVE ON *.* TO '$user_name'@'$localhost_ip';
+
+--echo
+--echo *** Writing some binlog events.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(1);
+
+--let $binsrv_connection_host = $localhost_ip
+--let $binsrv_connection_user = $user_name
+--let $binsrv_connection_password = $user_password
+--let $binsrv_connect_timeout = 20
+--let $binsrv_read_timeout = 60
+--let $binsrv_idle_time = 10
+--let $binsrv_verify_checksum = TRUE
+--let $binsrv_replication_mode = position
+--let $binsrv_ssl_mode = disabled
+--source ../include/set_up_binsrv_environment.inc
+
+--echo
+--echo *** Emptying the server's authentication cache.
+--disable_warnings
+FLUSH PRIVILEGES;
+--enable_warnings
+
+--echo
+--echo *** The mysql client connects without SSL, fetching the server's public key.
+--exec $MYSQL --ssl-mode=DISABLED --get-server-public-key --host=$localhost_ip --user=$user_name --password=$user_password -e "SELECT CURRENT_USER() AS user" 2> /dev/null
+
+--echo
+--echo *** Emptying the server's authentication cache again.
+--disable_warnings
+FLUSH PRIVILEGES;
+--enable_warnings
+
+--echo
+--echo *** Executing the Binlog Server Utility with SSL disabled.
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null
+
+--source ../include/tear_down_binsrv_environment.inc
+
+--echo
+--echo *** Dropping the table and the user.
+DROP TABLE t1;
+eval DROP USER '$user_name'@'$localhost_ip';

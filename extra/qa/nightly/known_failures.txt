@@ -26,7 +26,7 @@ StorageConcurrentQueriesSucceed  ticket 29: a query next to a writer fails stat(
 StorageSurvivesAFaultAtAnyBackendCall  ticket 18 (PBS-83): a failed metadata save makes the final flush write the data twice
 StorageSurvivesAFaultAtAnyBackendCallOnS3  ticket 18 (PBS-83): a failed metadata save makes the final flush write the data twice (S3 backend variant)
 StorageNeverReusesKeystreamAfterCrashRecovery  ticket 32: CTR keystream reuse after crash truncation (recovery truncates the unrecorded tail and the next write reuses the file's key/IV at the same offsets)
-ReplicationSourceMatchesStatementsExactlyOrByPrefix  ticket 31: listener prefix match ignores the delimiter ('SET @source_heartbeat_period', 'SET @slave_uuidx = 1' answered OK, network_service.cpp known_prefix_queries)
+ReplicationSourceMatchesStatementsExactlyOrByPrefix  ticket 31: since PBS-30's regexes ('\b' also matches at the end and before any non-word character) 'SET @slave_uuid', 'SET @replica_uuid', 'SET NAMES' with nothing or anything after them are answered OK (network_service.cpp, handshake_query_patterns.hpp)
 ReplicationSourceDumpGtidSendsTheMissingTransactions  ticket 20: COM_BINLOG_DUMP_GTID is answered with "unknown command" (ERR 1047) until PBS-29 part 2
 # Release build (release_gcc14, assertions compiled out): how a known bug
 # fails differently there. '<build>:<test case>' lines win for that build.

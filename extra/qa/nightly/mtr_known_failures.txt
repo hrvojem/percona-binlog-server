@@ -17,3 +17,4 @@
 * rs_position_based_replica_gtid_source  ticket 30 (PBS-102): a position-mode PBS of a GTID source reports GTID_MODE = OFF, so no replica can follow it
 * encryption_keyring_removed  ticket 35: list / search_by_* report success with no binlogs when the keyring no longer holds the KEK
 * rs_misaligned_dump_position  ticket 39 (PBS-112): a dump from a position inside an event terminates pull (std::terminate from a noexcept indexed_event_block accessor)
+* fetch_ssl_disabled_caching_sha2  ticket 23: fetch cannot authenticate without SSL as a caching_sha2_password user (no MYSQL_OPT_GET_SERVER_PUBLIC_KEY)

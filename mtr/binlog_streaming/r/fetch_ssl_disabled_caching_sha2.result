@@ -1,0 +1,39 @@
+*** Resetting replication at the very beginning of the test.
+
+*** Creating a caching_sha2_password user with replication privileges.
+CREATE USER 'sha2_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'strong_password';
+GRANT REPLICATION SLAVE ON *.* TO 'sha2_user'@'127.0.0.1';
+
+*** Writing some binlog events.
+CREATE TABLE t1(id INT UNSIGNED NOT NULL PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(1);
+
+*** Generating a configuration file in JSON format for the Binlog
+*** Server utility.
+
+*** Determining binlog file directory from the server.
+
+*** Creating a temporary directory <BINSRV_STORAGE_PATH> for storing
+*** binlog files downloaded via the Binlog Server utility.
+
+*** Emptying the server's authentication cache.
+FLUSH PRIVILEGES;
+
+*** The mysql client connects without SSL, fetching the server's public key.
+user
+sha2_user@127.0.0.1
+
+*** Emptying the server's authentication cache again.
+FLUSH PRIVILEGES;
+
+*** Executing the Binlog Server Utility with SSL disabled.
+
+*** Removing the Binlog Server utility storage directory.
+
+*** Removing the Binlog Server utility log file.
+
+*** Removing the Binlog Server utility configuration file.
+
+*** Dropping the table and the user.
+DROP TABLE t1;
+DROP USER 'sha2_user'@'127.0.0.1';

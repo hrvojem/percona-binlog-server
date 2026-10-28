@@ -8,7 +8,7 @@ GtidSetParseRejectsOutOfRangeGno  ticket 3: gtid_set GNO bounds
 GtidSetAddIntervalRejectsOutOfRangeUpperBound  ticket 3: gtid_set GNO bounds
 GtidSetSubtractIntervalBeyondMaxGnoRemovesTail  ticket 3: gtid_set GNO bounds
 GtidSetDecodedFromBinaryIsPrintable  ticket 3: gtid_set GNO bounds
-IndexedEventBlockIndexesOnlyCompleteEvents  tickets 7/39: since PBS-29 an invalid type code in the unparsed tail terminates (noexcept extract_event_size_internal); before, a small event size looped
+IndexedEventBlockIndexesOnlyCompleteEvents  tickets 7/39 (PBS-112): since PBS-29 an invalid type code in the unparsed tail terminates (noexcept extract_event_size_internal); before, a small event size looped
 CipherContextOffsetMatchesCounterReference  ticket 8: CTR counter carry in create_with_offset
 CipherContextDecryptionAtOffsetsRoundTrips  ticket 8: CTR counter carry in create_with_offset
 CipherContextSplitEncryptionMatchesWhole  ticket 8: CTR counter carry (split encryption variant)
@@ -18,7 +18,7 @@ FilesystemStorageUriMatchesModel  ticket 12: file URI with %00 opens the directo
 StorageOpeningOfDamagedFilesFailsCleanly  ticket 36: startup deletes a complete binlog as interrupted-creation garbage when binlog.index is missing or lost its last entry
 StorageOpeningOfDamagedFilesFailsCleanlyOnS3  ticket 36: startup deletes a complete binlog as interrupted-creation garbage when binlog.index is missing or lost its last entry (S3 backend variant)
 EmptyStorageIsPolledUntilTheBinlogArrivesFromPosition  ticket 26 (PBS-96): resuming from a position on an empty storage disconnects the client
-MisalignedDumpPositionNeverStreamsGarbage  tickets 7/39: since PBS-29 a dump at a misaligned position terminates the process (std::terminate from a noexcept indexed_event_block accessor)
+MisalignedDumpPositionNeverStreamsGarbage  tickets 7/39 (PBS-112): since PBS-29 a dump at a misaligned position terminates the process (std::terminate from a noexcept indexed_event_block accessor)
 StorageQueryingLeavesItUnchanged  ticket 28: querying_only open rewrites metadata.json when the config adds encryption (storage_core.cpp:174-178)
 StorageQueryingLeavesItUnchangedOnS3  ticket 28: querying_only open rewrites metadata.json when the config adds encryption (S3 backend variant)
 StorageClosingMidTransactionDropsIt  ticket 6: closing a binlog mid-transaction keeps the dropped events' timestamps (assert at storage.cpp:138)
@@ -35,4 +35,4 @@ StorageRestartSurvivesAFaultOnS3  ticket 37: a failed delete during the startup 
 StorageQueryingReportsKeyringErrors  ticket 35: querying_only skips every encrypted binlog when the keyring lacks the KEK or is not configured, and reports success with no binlogs
 EmptyStorageIsPolledUntilTheBinlogArrives  ticket 38: since PBS-29 a dump naming a binlog on an empty storage is refused instead of polled, which reopens the PBS-91 startup race
 IdleHeartbeatReportsTheReplicaCoordinates  ticket 40 (PBS-113): no heartbeat while a caught-up reader waits in a new binlog that holds only the magic (PBS-30 generate_heartbeat() before the preamble), which lasts until the next checkpoint or rotation
-ReplicationSourceSurvivesAnyDumpPosition  ticket 39: a dump from a position inside an event terminates the listener process (std::terminate from a noexcept indexed_event_block accessor)
+ReplicationSourceSurvivesAnyDumpPosition  ticket 39 (PBS-112): a dump from a position inside an event terminates the listener process (std::terminate from a noexcept indexed_event_block accessor)

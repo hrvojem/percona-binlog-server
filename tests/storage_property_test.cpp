@@ -121,6 +121,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 // needed for binsrv::gtids::gtid_set_storage
@@ -135,6 +136,7 @@
 
 #include <hegel/hegel.h>
 
+#include "heartbeat_test_helpers.hpp"
 #include "property_test_helpers.hpp"
 
 #include "binsrv/basic_storage_backend.hpp"
@@ -1870,6 +1872,9 @@ enum class checked_properties : std::uint8_t {
 // thread and read only after it has been joined
 struct concurrent_read_result {
   event_list received;
+  // the heartbeats the reader generated while idle (PBS-30), each with the
+  // number of events it had received by then
+  std::vector<std::pair<std::size_t, std::vector<std::byte>>> heartbeats;
   std::string error;
 };
 
@@ -1884,6 +1889,8 @@ void read_concurrently(const std::stop_token &stop,
   static constexpr auto max_duration{std::chrono::seconds{60}};
   const auto deadline{std::chrono::steady_clock::now() + max_duration};
   bool final_pass{false};
+  // the number of received events at the last heartbeat attempt (none yet)
+  std::size_t heartbeat_after{std::numeric_limits<std::size_t>::max()};
   util::const_byte_span event{};
   try {
     while (true) {
@@ -1901,7 +1908,19 @@ void read_concurrently(const std::stop_token &stop,
         }
         continue;
       }
-      // end of the data
+      // end of the data: where a blocking dump sends heartbeats (PBS-30),
+      // taken once per idle period after new events, while the writer keeps
+      // going
+      if (std::size(result.received) != heartbeat_after) {
+        heartbeat_after = std::size(result.received);
+        util::const_byte_span heartbeat{};
+        if (reader.generate_heartbeat(heartbeat)) {
+          result.heartbeats.emplace_back(
+              heartbeat_after,
+              std::vector<std::byte>{std::cbegin(heartbeat),
+                                     std::cend(heartbeat)});
+        }
+      }
       if (final_pass) {
         return;
       }
@@ -1917,6 +1936,30 @@ void read_concurrently(const std::stop_token &stop,
     }
   } catch (const std::exception &e) {
     result.error = std::string{"exception in the reader: "} + e.what();
+  }
+}
+
+// every heartbeat a concurrent reader generated while idle reports the
+// coordinates the replica had reached at that moment (the binlog of the last
+// artificial ROTATE, the end of the last event received in it) - checked
+// against the stream it received, while the writer kept appending and
+// rotating. Whether a heartbeat is available at every idle point is checked
+// by IdleHeartbeatReportsTheReplicaCoordinates (sender_context_property_test)
+void require_heartbeats_match_stream(const concurrent_read_result &result,
+                                     bool session_checksum,
+                                     std::string_view label) {
+  heartbeat_testing::replica_coordinates coordinates;
+  std::size_t followed{0U};
+  for (const auto &[received_count, heartbeat] : result.heartbeats) {
+    for (; followed < received_count; ++followed) {
+      heartbeat_testing::follow(coordinates, result.received[followed],
+                                session_checksum,
+                                /*format_description_checksum=*/true);
+    }
+    const auto error{heartbeat_testing::heartbeat_error(
+        heartbeat, coordinates, fde_server_id, /*with_checksum=*/true)};
+    require(error.empty(), std::string{label} + ": after event " +
+                               std::to_string(received_count) + ", " + error);
   }
 }
 
@@ -2052,10 +2095,16 @@ public:
                    .transactions_before = 0U,
                    .position = binsrv::events::magic_binlog_offset},
         settings_.reader_checksum, "concurrent reader");
+    require_heartbeats_match_stream(concurrent_result_,
+                                    settings_.reader_checksum,
+                                    "concurrent reader");
     if (resuming_reader_ != nullptr) {
       require_stream_matches_disk(resuming_result_.received, model_, state,
                                   resuming_start_, settings_.reader_checksum,
                                   "resuming reader");
+      require_heartbeats_match_stream(resuming_result_,
+                                      settings_.reader_checksum,
+                                      "resuming reader");
     }
   }
 
@@ -3656,7 +3705,8 @@ BOOST_AUTO_TEST_CASE(StorageReadBackMatchesDisk) {
 // connects mid-run and resumes at the end of what is on disk, while the
 // writer writes, checkpoints and rotates: each stream is exactly what is on
 // disk, every binlog announced by one artificial ROTATE (plus an artificial
-// FORMAT_DESCRIPTION when resuming), with the session's checksum setting
+// FORMAT_DESCRIPTION when resuming), with the session's checksum setting,
+// and every heartbeat taken while idle reports where the reader had got to
 BOOST_AUTO_TEST_CASE(StorageConcurrentReadBackMatchesDisk) {
   run_property([](hegel::TestCase &tc) {
     run_storage_property(tc, checked_properties::concurrent_read_back);

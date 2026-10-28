@@ -50,6 +50,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -62,6 +63,7 @@
 
 #include <hegel/hegel.h>
 
+#include "heartbeat_test_helpers.hpp"
 #include "property_test_helpers.hpp"
 
 #include "operations/event_generation_helpers.hpp"
@@ -1050,6 +1052,82 @@ BOOST_AUTO_TEST_CASE(SwitchToTheNextBinlogEmitsArtificialRotate) {
       require(emitted[switch_index + 1U + index] == next->events[index],
               "event " + std::to_string(index) +
                   " of the next binlog was not streamed byte for byte");
+    }
+  });
+}
+
+// while a dump sits idle, the heartbeat the listener sends (PBS-30) reports
+// the replica's current coordinates, as a MySQL source does: the binlog named
+// by the last artificial ROTATE and the end of the last event sent in it -
+// also when the stream resumed from a position, after a switch to the next
+// binlog, and while the next binlog has been created but holds only the
+// binlog magic (the collector opens the file before its first flush)
+BOOST_AUTO_TEST_CASE(IdleHeartbeatReportsTheReplicaCoordinates) {
+  run_property([](hegel::TestCase &tc) {
+    const temp_dir directory;
+    const bool from_position{tc.draw("from_position", gs::booleans())};
+    auto sizes{tc.draw("sizes", event_size_lists())};
+    if (from_position && sizes.empty()) {
+      sizes.push_back(events::common_header_view_base::size_in_bytes);
+    }
+    const bool session_checksum{tc.draw("checksum", gs::booleans())};
+    const auto block_size{tc.draw("block", block_sizes())};
+    // 0: no next binlog; 1: the next binlog holds only the magic; 2: it is
+    // filled before the reader reaches it; 3: it is filled after the reader
+    // has been idle at the end of the first binlog
+    const auto next_state{tc.draw(
+        "next_state",
+        gs::integers<std::size_t>({.min_value = 0U, .max_value = 3U}))};
+    const auto next_sizes{tc.draw("next_sizes", event_size_lists())};
+
+    const auto seeded{seed(directory.path(), sizes)};
+    std::size_t start_index{0U};
+    if (from_position) {
+      start_index = tc.draw(
+          "resume",
+          gs::integers<std::size_t>(
+              {.min_value = 1U, .max_value = std::size(seeded.events) - 1U}));
+    }
+    if (next_state != 0U) {
+      seeded.storage->close_binlog();
+      require(seeded.storage->open_binlog(the_next_binlog) ==
+                  binsrv::open_binlog_status::created,
+              "the next binlog was not created");
+    }
+    if (next_state == 2U) {
+      std::ignore = fill_open_binlog(seeded.storage, next_sizes, 1'000'000U);
+    }
+
+    operations::sender_context reader{
+        std::make_shared<binsrv::null_logger>(),
+        seeded.storage,
+        block_size,
+        from_position ? the_binlog.str() : std::string{},
+        seeded.offsets[start_index],
+        session_checksum};
+
+    heartbeat_testing::replica_coordinates coordinates;
+    const auto limit{std::size(seeded.events) + std::size(next_sizes) + 6U};
+    const auto read_until_idle{[&](std::string_view phase) {
+      for (const auto &event : drain(reader, limit)) {
+        heartbeat_testing::follow(coordinates, event, session_checksum,
+                                  /*format_description_checksum=*/true);
+      }
+      util::const_byte_span heartbeat;
+      require(reader.generate_heartbeat(heartbeat),
+              std::string{phase} + ": no heartbeat while idle at " +
+                  coordinates.binlog + ":" +
+                  std::to_string(coordinates.position));
+      const auto error{heartbeat_testing::heartbeat_error(
+          byte_vector{std::cbegin(heartbeat), std::cend(heartbeat)},
+          coordinates, server_id, /*with_checksum=*/true)};
+      require(error.empty(), std::string{phase} + ": " + error);
+    }};
+
+    read_until_idle("idle after the first binlog");
+    if (next_state == 3U) {
+      std::ignore = fill_open_binlog(seeded.storage, next_sizes, 1'000'000U);
+      read_until_idle("idle after the next binlog");
     }
   });
 }

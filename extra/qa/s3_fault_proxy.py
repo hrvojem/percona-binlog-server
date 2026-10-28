@@ -25,10 +25,12 @@ on the same port, which S3 never uses (bucket names cannot contain '_'):
   PUT /__faults__   body: {"rules": [<rule>, ...]}   replaces the rules
                     (and with "reset_traffic": true, zeroes the counters)
   GET /__faults__   returns the rules, per-rule statistics and traffic
-                    counters: requests and request / response body bytes
-                    per method, and the body bytes of PUT requests for
-                    binlog files (object names containing "binlog.0" and
-                    not ending with ".json")
+                    counters: requests, request / response body bytes and
+                    the largest request body per method, multipart part
+                    uploads (requests with a partNumber) per method, and
+                    the body bytes of PUT requests for binlog files
+                    (object names containing "binlog.0" and not ending
+                    with ".json")
 
 A rule applies to requests whose method matches "method" (or any method for
 "*") and whose path contains "match" (empty matches every path). It skips
@@ -79,10 +81,15 @@ class FaultRules:
         with self.lock:
             entry = self.traffic.setdefault(
                 method, {"requests": 0, "request_bytes": 0,
-                         "response_bytes": 0})
+                         "response_bytes": 0, "max_request_bytes": 0,
+                         "part_requests": 0})
             entry["requests"] += 1
             entry["request_bytes"] += request_bytes
             entry["response_bytes"] += response_bytes
+            entry["max_request_bytes"] = max(entry["max_request_bytes"],
+                                             request_bytes)
+            if "partNumber=" in path:
+                entry["part_requests"] += 1
             object_name = path.split("?")[0].rsplit("/", 1)[-1]
             if method == "PUT" and "binlog.0" in object_name and \
                     not object_name.endswith(".json"):

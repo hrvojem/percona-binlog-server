@@ -300,6 +300,11 @@ def harness_command(args, workdir: Path) -> list:
     if args.harness == "listener_fuzz_test":
         return script + common + mode + [
             "--connections", str(args.connections), "--seed", str(args.seed)]
+    if args.harness == "large_binlog_test" and args.storage == "s3":
+        return script + common + mode + [
+            "--storage", "s3", "--s3-endpoint", args.s3_endpoint,
+            "--s3-proxy-port", str(args.s3_proxy_port),
+            "--s3-bucket-dir", str(args.s3_bucket_dir)]
     if args.harness in ("source_change_test", "large_binlog_test",
                         "pull_load_test"):
         return script + common + mode
@@ -336,11 +341,15 @@ def harness_cases(args, returncode: int, output: str, lines: list,
             if not result.get("ok") and not reason:
                 failed_checks = [check for check in (
                     "fetch_copies_match", "refetch", "list_size",
-                    "pull_raw_copy") if not result.get(check)]
+                    "pull_raw_copy", "s3_put_size")
+                    if check in result and not result[check]]
                 reason = ("failed: " + ", ".join(failed_checks) +
                           f" (fetch exit {result.get('fetch_exit')})")
-            cases.append((f"{mode}/{result['case']}", not result.get("ok"),
-                          reason[:240], None, None, None))
+            # cases on S3 storage: '<mode>/<case>/s3'
+            suffix = "/s3" if result.get("storage") == "s3" else ""
+            cases.append((f"{mode}/{result['case']}{suffix}",
+                          not result.get("ok"), reason[:240], None, None,
+                          None))
         return cases
     if args.harness == "pull_heartbeat_test":
         cases = []
@@ -830,14 +839,16 @@ def main():
     parser.add_argument("--runs", type=int, default=500)
     parser.add_argument("--timeout", type=int, default=1800, help="seconds")
     parser.add_argument("--storage", choices=["file", "s3"], default="file",
-                        help="fetch_crash_test's storage")
+                        help="fetch_crash_test's and large_binlog_test's "
+                             "storage")
     parser.add_argument("--s3-endpoint", default="127.0.0.1:9000",
                         help="the S3 server (fetch_crash_test --storage s3, "
                              "and s3_fault_sweep's proxy backend)")
     parser.add_argument("--s3-bucket-dir", type=Path,
                         help="the directory of the S3 server's bucket")
     parser.add_argument("--s3-proxy-port", type=int, default=24590,
-                        help="where s3_fault_sweep's fault proxy listens")
+                        help="where s3_fault_sweep's fault proxy (or "
+                             "large_binlog_test's counting one) listens")
     parser.add_argument("--fsfault-lib", type=Path,
                         help="disk_fault_sweep's LD_PRELOAD library")
     parser.add_argument("--toxiproxy-api", default="http://127.0.0.1:8474")

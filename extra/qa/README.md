@@ -115,7 +115,7 @@ JSON and exits non-zero on a failure.
 | `source_change_test.py` | changes the source under a running backup: `RESET BINARY LOGS`, a different server (failover), binlogs purged before fetch, a mid-stream restart | ticket 25 |
 | `event_variety_test.py` | drives less common event types — transaction compression, `binlog_row_image=MINIMAL`, partial JSON, XA, tagged GTIDs — through a full fetch and a kill/resume | — (no bug) |
 | `query_race_test.py` | runs `binlog_server list` `--runs` times (default 500) next to a `pull` writing a filesystem storage with `checkpoint_size` `"1K"` while the source gets small inserts and a `FLUSH BINARY LOGS` every 20 of them; reports the failed `list` runs and each distinct error message | ticket 29 |
-| `large_binlog_test.py` | binlogs and transactions past 4 GiB, where positions no longer fit the protocol's 32-bit fields. Case `binlog_over_4gib`: about 1 GB of 1 MiB transactions and one of about 3.5 GB leave a 4.5 GB binlog; `fetch` must store it byte for byte, a second `fetch` reopen the storage, `list` report its size, and `mysqlbinlog --raw` through `pull` copy it exactly (passes). Case `transaction_over_4gib`: one transaction of about 4.7 GB. Needs about 20 GB of disk; `--keep` keeps the data, `--cases` picks the cases | ticket 41 (PBS-114) |
+| `large_binlog_test.py` | binlogs and transactions past 4 GiB, where positions no longer fit the protocol's 32-bit fields. Case `binlog_over_4gib`: about 1 GB of 1 MiB transactions and one of about 3.5 GB leave a 4.5 GB binlog; `fetch` must store it byte for byte, a second `fetch` reopen the storage, `list` report its size, and `mysqlbinlog --raw` through `pull` copy it exactly (passes). Case `transaction_over_4gib`: one transaction of about 4.7 GB. Needs about 20 GB of disk; `--keep` keeps the data, `--cases` picks the cases. With `--storage s3 --s3-bucket-dir <dir>` the storage is in the S3 bucket, behind a counting `s3_fault_proxy.py` the harness starts (`--s3-proxy-port`), and a further check `s3_put_size` requires that no request uploads more than 5 GiB, the AWS limit for a single PUT, which local S3 servers do not enforce (only `binlog_over_4gib` by default; about 30 GB of disk). First run (2026-10-28, debug build): passes; the 4.5 GB binlog goes up as a multipart upload of 8 MiB parts (largest request 8 MiB), and `pull` streams it back from S3 byte for byte. Versity S3 Gateway 1.8.0 takes about a minute to join the parts, and the AWS SDK's CRT client repeats the CompleteMultipartUpload after about 5 s, which the gateway confirms at once, before the object exists; the harness therefore waits up to 5 min for the objects (`s3_object_late_seconds`, 54 s) before comparing. AWS S3 confirms a completion only once the object exists | ticket 41 (PBS-114) |
 
 Examples:
 
@@ -139,6 +139,11 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/query_race_test.py \
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/large_binlog_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/large-binlog \
   --cases binlog_over_4gib
+
+# the same on S3 storage (the local S3 server must be running)
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/large_binlog_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/large-binlog-s3 \
+  --storage s3 --s3-bucket-dir ~/ws/s3/data/pbs-mtr
 ```
 
 `query_race_test.py` prints one JSON line: `runs`, `failed`, and `errors`, a
@@ -330,7 +335,7 @@ server rather than starting one.
      | Tue | `disk_fault_sweep.py` (position) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first) |
      | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end) | ASan |
      | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid) | ASan |
-     | Fri | `s3_fault_sweep.py` (gtid) | ASan |
+     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`) | ASan |
      | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position) | debug / ASan |
      | Sun | `network_fault_test.py` (gtid) | ASan |
 

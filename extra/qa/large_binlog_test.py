@@ -42,15 +42,31 @@ For each case:
                        'pull' copies every closed binlog byte for byte,
                        streaming through the 4 GiB mark in one dump.
 
+With '--storage s3' the storage is a prefix in a bucket of an
+S3-compatible server whose objects are files under '--s3-bucket-dir' (as
+with the POSIX backend of Versity S3 Gateway). The harness puts
+s3_fault_proxy.py (no faults) between binlog_server and the server to count
+the requests, and adds:
+
+  s3_put_size          no request uploads more than 5 GiB, the limit of a
+                       single PUT on AWS S3 (a larger object must go up as a
+                       multipart upload, whose parts the proxy sees as PUTs
+                       with a partNumber); local servers do not enforce it.
+
+With S3 storage only binlog_over_4gib runs by default: the large
+transaction fails in the collector before the storage is involved.
+
 Resuming inside such a binlog is not covered: it is closed when the
 transaction commits, and the 32-bit COM_BINLOG_DUMP position could not
-express the offset anyway. Needs about 20 GB of free disk space. Uses the
+express the offset anyway. Needs about 20 GB of free disk space (30 GB with
+S3 storage, which also keeps a local buffer of the open binlog). Uses the
 helpers of fetch_crash_test.py and pull_replica_test.py. Example:
 
   PYTHONPATH=~/ws/qa/pylib python3 large_binlog_test.py \\
     --mysql-basedir ~/ws/dist/mysql-8.4.8-linux-glibc2.28-x86_64-minimal \\
     --binsrv ~/ws/percona-binlog-server-build-debug_gcc14/binlog_server \\
     --workdir ~/ws/qa/large-binlog
+  (add '--storage s3 --s3-bucket-dir ~/ws/s3/data/pbs-mtr' for S3 storage)
 """
 
 import argparse
@@ -61,6 +77,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -73,7 +90,16 @@ ROWS = 100
 ROW_SIZE = 1 << 20
 # case: (1 MiB transactions before the large one, UPDATEs in the large one)
 CASES = {"transaction_over_4gib": (0, 22), "binlog_over_4gib": (1000, 16)}
+CHECKS = {"file": ("fetch_copies_match", "refetch", "list_size",
+                   "pull_raw_copy")}
+CHECKS["s3"] = CHECKS["file"] + ("s3_put_size",)
 REQUIRED_FREE_BYTES = 20 * GIB
+REQUIRED_FREE_BYTES_S3 = 30 * GIB
+# the largest object a single PUT may upload to AWS S3
+MAX_SINGLE_PUT = 5 * GIB
+# how long the local S3 server may take to finish a multipart upload it has
+# already confirmed (see wait_for_objects)
+S3_SETTLE_SECONDS = 300
 COMMAND_TIMEOUT = 1800
 AUTH_RSA_PUBLIC_KEY = (Path(__file__).resolve().parents[2] / "mtr" /
                        "binlog_streaming" / "std_data" /
@@ -107,6 +133,29 @@ def compare(source, names: list, copy_dir: Path) -> list:
     return mismatches
 
 
+def wait_for_objects(source, names: list, bucket_dir: Path) -> float:
+    """Waits until every closed binlog's object file in the bucket has the
+    source's size, for up to S3_SETTLE_SECONDS; returns how long that took
+    (0 if they were complete at once).
+
+    Versity S3 Gateway 1.8.0 needs about a minute to join the parts of a
+    4.5 GB multipart upload. The AWS SDK's CRT client sends the
+    CompleteMultipartUpload again after a few seconds, and the gateway
+    answers that duplicate with 200 at once, before the object exists, so
+    'fetch' can finish before the object is complete. AWS S3 itself confirms
+    a completion only once the object exists."""
+    started = time.monotonic()
+    while True:
+        complete = all(
+            (bucket_dir / name).exists() and
+            (bucket_dir / name).stat().st_size ==
+            source.binlog_path(name).stat().st_size for name in names)
+        elapsed = time.monotonic() - started
+        if complete or elapsed > S3_SETTLE_SECONDS:
+            return round(elapsed, 1) if elapsed >= 1 else 0
+        time.sleep(1)
+
+
 def run_binsrv(binsrv, mode: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [str(binsrv.binary), mode, str(binsrv.config_path)],
@@ -114,23 +163,75 @@ def run_binsrv(binsrv, mode: str) -> subprocess.CompletedProcess:
         env=dict(os.environ, AWS_EC2_METADATA_DISABLED="true"))
 
 
-def run_case(args, case: str) -> dict:
+class S3Proxy:
+    """s3_fault_proxy.py in front of the S3 server, counting requests."""
+
+    def __init__(self, args, log_path: Path):
+        self.endpoint = f"127.0.0.1:{args.s3_proxy_port}"
+        self.control = f"http://{self.endpoint}/__faults__"
+        self.log = log_path.open("w")
+        self.process = subprocess.Popen(
+            [sys.executable,
+             str(Path(__file__).resolve().parent / "s3_fault_proxy.py"),
+             "--listen", self.endpoint, "--backend", args.s3_endpoint],
+            stdout=self.log, stderr=subprocess.STDOUT)
+        deadline = time.monotonic() + 20
+        while True:
+            try:
+                self.stats()
+                return
+            except OSError:
+                if self.process.poll() is not None or \
+                        time.monotonic() > deadline:
+                    self.stop()
+                    raise RuntimeError(f"s3_fault_proxy.py did not come up "
+                                       f"(see {log_path})")
+                time.sleep(0.3)
+
+    def stats(self) -> dict:
+        with urllib.request.urlopen(self.control, timeout=10) as response:
+            return json.loads(response.read())
+
+    def reset(self):
+        request = urllib.request.Request(
+            self.control, method="PUT",
+            data=json.dumps({"rules": [], "reset_traffic": True}).encode())
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+
+    def stop(self):
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+        self.log.close()
+
+
+def run_case(args, case: str, proxy: "S3Proxy | None") -> dict:
     fill_transactions, updates = CASES[case]
     work = args.workdir / case
     work.mkdir(parents=True, exist_ok=True)
-    result = {"case": case}
+    result = {"case": case, "storage": args.storage}
+    required = REQUIRED_FREE_BYTES if proxy is None else REQUIRED_FREE_BYTES_S3
     free = shutil.disk_usage(work).free
-    if free < REQUIRED_FREE_BYTES:
+    if free < required:
         result.update(ok=False, skipped=True,
                       reason=f"only {free // GIB} GiB free, "
-                             f"{REQUIRED_FREE_BYTES // GIB} needed")
+                             f"{required // GIB} needed")
         return result
     harness.MAX_BINLOG_SIZE = GIB
+    s3 = None
+    if proxy is not None:
+        s3 = harness.S3Storage(proxy.endpoint, args.s3_bucket,
+                               args.s3_bucket_dir, args.s3_access_key,
+                               args.s3_secret_key, f"large-binlog-{case}")
     source = harness.MySQLServer(args.mysql_basedir, work / "source",
                                  args.port, False, server_id=1)
     harness.SERVER = source
     harness.BINSRV = binsrv = harness.BinlogServer(
-        args.binsrv, work / "binsrv", args.port, False)
+        args.binsrv, work / "binsrv", args.port, False, s3)
     source.start()
     pull = None
     try:
@@ -187,10 +288,27 @@ def run_case(args, case: str) -> dict:
             return result
 
         binsrv.write_config()
+        if proxy is not None:
+            proxy.reset()
         started = time.monotonic()
         fetch = run_binsrv(binsrv, "fetch")
         result["fetch_seconds"] = round(time.monotonic() - started)
         result["fetch_exit"] = fetch.returncode
+        if fetch.returncode != 0:
+            result["fetch_error"] = fetch.stderr.strip()[-300:]
+        if proxy is not None:
+            put = proxy.stats()["traffic"].get("PUT", {})
+            result["s3_put_requests"] = put.get("requests", 0)
+            result["s3_put_bytes"] = put.get("request_bytes", 0)
+            result["s3_largest_put"] = put.get("max_request_bytes", 0)
+            result["s3_part_uploads"] = put.get("part_requests", 0)
+            result["s3_put_size"] = (put.get("requests", 0) > 0 and
+                                     result["s3_largest_put"] <=
+                                     MAX_SINGLE_PUT)
+        if proxy is not None:
+            late = wait_for_objects(source, closed, binsrv.storage)
+            if late:
+                result["s3_object_late_seconds"] = late
         mismatches = compare(source, closed, binsrv.storage)
         result["fetch_copies_match"] = (fetch.returncode == 0 and
                                         not mismatches)
@@ -236,8 +354,7 @@ def run_case(args, case: str) -> dict:
             result["raw_mismatches"] = raw_mismatches
             result["raw_error"] = raw.stderr.strip()[-300:]
 
-        result["ok"] = all(result[check] for check in (
-            "fetch_copies_match", "refetch", "list_size", "pull_raw_copy"))
+        result["ok"] = all(result[check] for check in CHECKS[args.storage])
     finally:
         if pull is not None:
             pull.terminate()
@@ -247,6 +364,7 @@ def run_case(args, case: str) -> dict:
             shutil.rmtree(work / "source", ignore_errors=True)
             shutil.rmtree(work / "binsrv", ignore_errors=True)
             shutil.rmtree(work / "raw", ignore_errors=True)
+            shutil.rmtree(binsrv.storage, ignore_errors=True)
     return result
 
 
@@ -258,14 +376,39 @@ def main():
     parser.add_argument("--port", type=int, default=23500)
     # position only: the size of a binlog does not depend on the mode
     parser.add_argument("--mode", choices=["position"], default="position")
-    parser.add_argument("--cases", default=",".join(CASES))
+    parser.add_argument("--cases",
+                        help="default: all, binlog_over_4gib with S3 storage")
     parser.add_argument("--keep", action="store_true",
                         help="keep the multi-GB data directories")
+    parser.add_argument("--storage", choices=["file", "s3"], default="file")
+    parser.add_argument("--s3-endpoint", default="127.0.0.1:9000",
+                        help="host:port of the S3 server")
+    parser.add_argument("--s3-proxy-port", type=int, default=24595,
+                        help="where the counting s3_fault_proxy.py listens")
+    parser.add_argument("--s3-bucket", default="pbs-mtr")
+    parser.add_argument("--s3-bucket-dir", type=Path,
+                        help="the directory of the S3 server's bucket")
+    parser.add_argument("--s3-access-key", default="pbsaccesskey")
+    parser.add_argument("--s3-secret-key", default="pbs/secret+key=1")
     args = parser.parse_args()
     args.mysql_basedir = args.mysql_basedir.expanduser()
     args.binsrv = args.binsrv.expanduser()
     args.workdir.mkdir(parents=True, exist_ok=True)
-    results = [run_case(args, case) for case in args.cases.split(",")]
+    if args.cases is None:
+        args.cases = ("binlog_over_4gib" if args.storage == "s3"
+                      else ",".join(CASES))
+    proxy = None
+    if args.storage == "s3":
+        if args.s3_bucket_dir is None:
+            parser.error("--storage s3 needs --s3-bucket-dir")
+        args.s3_bucket_dir = args.s3_bucket_dir.expanduser()
+        proxy = S3Proxy(args, args.workdir / "s3_fault_proxy.log")
+    try:
+        results = [run_case(args, case, proxy)
+                   for case in args.cases.split(",")]
+    finally:
+        if proxy is not None:
+            proxy.stop()
     for result in results:
         print(json.dumps(result), flush=True)
     (args.workdir / "results.json").write_text(json.dumps(results, indent=2))

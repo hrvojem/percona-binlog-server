@@ -104,7 +104,7 @@ QA_S3_EXAMPLES=${QA_S3_EXAMPLES:-5}
 S3_BUCKET_DIR=${S3_BUCKET_DIR:-$WS/s3/data/pbs-mtr}
 # the rotation of the heavier QA harnesses: '<weekday>:<harness>/<mode>'
 # (weekday 1-7 is Monday-Sunday, date +%u); 4-15 min a night (README.md)
-QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 2:disk_fault_sweep/position 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 5:s3_fault_sweep/gtid 6:disk_fault_sweep/gtid 6:pull_load_test/position 7:network_fault_test/gtid"}
+QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 2:disk_fault_sweep/position 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 7:network_fault_test/gtid"}
 QA_ROTATION_DAY=${QA_ROTATION_DAY:-$(date -u +%u)}
 # each fuzz connection takes about 1 s since the listener always does full
 # caching_sha2_password authentication (PBS-10), 3000 would take 50 min
@@ -591,6 +591,14 @@ if want qa; then
         qa_run large_binlog_test "large_binlog_test ($mode)" \
           "${common[@]}" --workdir "$out/qa/lb-$mode" \
           --port $((QA_PORT + 140)) --timeout 5400 ;;
+      large_binlog_test_s3)
+        # the 4.5 GB binlog on S3 storage, with a counting proxy checking
+        # that no PUT exceeds the 5 GiB AWS limit; about 30 GB of disk
+        qa_run large_binlog_test "large_binlog_test ($mode, S3 storage)" \
+          "${common[@]}" --workdir "$out/qa/lbs-$mode" \
+          --port $((QA_PORT + 160)) --storage s3 \
+          --s3-proxy-port $((QA_PORT + 165)) --s3-bucket-dir "$S3_BUCKET_DIR" \
+          --timeout 5400 ;;
       pull_load_test)
         # 30 mysqlbinlog clients and 2 replicas of pull under load, one
         # reader frozen, then SIGTERM with everyone connected

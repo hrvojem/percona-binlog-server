@@ -300,7 +300,8 @@ def harness_command(args, workdir: Path) -> list:
     if args.harness == "listener_fuzz_test":
         return script + common + mode + [
             "--connections", str(args.connections), "--seed", str(args.seed)]
-    if args.harness in ("source_change_test", "large_binlog_test"):
+    if args.harness in ("source_change_test", "large_binlog_test",
+                        "pull_load_test"):
         return script + common + mode
     raise SystemExit(f"unknown harness {args.harness}")
 
@@ -313,6 +314,19 @@ def harness_cases(args, returncode: int, output: str, lines: list,
     wall-clock times of a case that has its own JSON line."""
     objects = json_lines(lines)
     mode = args.mode or "position"
+    if args.harness == "pull_load_test":
+        cases = []
+        for result, _ in objects:
+            if "case" not in result:
+                continue
+            reason = ""
+            if not result.get("ok"):
+                details = {key: value for key, value in result.items()
+                           if key not in ("case", "ok")}
+                reason = json.dumps(details)
+            cases.append((f"{mode}/{result['case']}", not result.get("ok"),
+                          reason[:240], None, None, None))
+        return cases
     if args.harness == "large_binlog_test":
         cases = []
         for result, _ in objects:

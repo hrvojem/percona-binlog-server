@@ -262,7 +262,21 @@ binlog holds only the binlog magic until its first transaction (ticket 40,
 PBS-113). It prints the heartbeats, the replica's reconnections and the
 connections `pull` saw during the quiet time.
 
-Both harnesses start `pull` and point the replica at it through the same
+`pull_load_test.py` puts `pull` under load: a steady insert workload with a
+binlog rotation every few seconds, `--clients` (default 30)
+`mysqlbinlog --raw --stop-never` copies and two MySQL replicas with heartbeats.
+One client is frozen (`SIGSTOP`) for the middle half of the run. Then `pull`
+gets `SIGTERM` with everyone connected. Cases: `many_readers` (every client's
+copy of every closed binlog is exact), `slow_reader` (the others keep
+receiving while one is frozen, and it catches up), `replicas` (both replicas
+match the source) and `shutdown` (`pull` exits 0 within 10 s, every connection
+closes, and a `fetch` on the same storage resumes to exact copies). The first
+three pass (30 clients, 316 binlogs). `shutdown` fails: with the source idle,
+`pull` exits only when its blocking read from the source times out
+(`connection.read_timeout`), and the clients stay connected until then
+(ticket 43); the storage is left consistent.
+
+All three harnesses start `pull` and point the replica at it through the same
 helpers in `pull_replica_test.py` (`start_pull()`, `replicate_from_pull()`).
 
 ```sh
@@ -270,6 +284,8 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_replica_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/pull-replica
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_heartbeat_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/pull-heartbeat
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_load_test.py \
+  --mysql-basedir <dist> --binsrv <asan-binary> --workdir ~/ws/qa/pull-load
 ```
 
 `repro_broken_checkpointing.py` is a self-contained reproducer kept from an
@@ -315,7 +331,7 @@ server rather than starting one.
      | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end) | ASan |
      | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid) | ASan |
      | Fri | `s3_fault_sweep.py` (gtid) | ASan |
-     | Sat | `disk_fault_sweep.py` (gtid) | debug |
+     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position) | debug / ASan |
      | Sun | `network_fault_test.py` (gtid) | ASan |
 
      `QA_ROTATION_DAY` overrides the day (`1`-`7`, a comma list such as
@@ -388,7 +404,7 @@ server rather than starting one.
   build harnesses are skipped when the debug build fails, `fetch_crash_test`
   when the ASan build fails, the release `fetch_crash_test` when the release
   build fails. Tonight's whole run takes about 40-50 min for the
-  C++ stage plus 35-50 min of MTR (9-26 min per version) and 20-35 min of QA harnesses: about 11 min for `pull_replica_test`, `query_race_test` and `fetch_crash_test` on file storage, about 5 min for `pull_heartbeat_test`, about 7 min for `fetch_crash_test` on S3 (mostly Hypothesis shrinking the known ticket 14 failure in `gtid/s3`), plus the night's rotation (measured on MySQL 8.4.8: `s3_fault_sweep` 15 min per mode, 84 cases; `disk_fault_sweep` 3-6 min, 80 cases (plus 6 recovery cases, about 1.5 min); `network_fault_test` 4-5 min, 37 cases; `source_change_test` 3-4 min per mode, 4 cases; `large_binlog_test` about 20 min on the debug build, mostly MySQL writing the large transactions; `listener_fuzz_test` about 11 min per mode at 600 connections: about 1 s per connection since the listener always does full `caching_sha2_password` authentication (PBS-10), 2-3 min for 3000 before).
+  C++ stage plus 35-50 min of MTR (9-26 min per version) and 20-35 min of QA harnesses: about 11 min for `pull_replica_test`, `query_race_test` and `fetch_crash_test` on file storage, about 5 min for `pull_heartbeat_test`, about 7 min for `fetch_crash_test` on S3 (mostly Hypothesis shrinking the known ticket 14 failure in `gtid/s3`), plus the night's rotation (measured on MySQL 8.4.8: `s3_fault_sweep` 15 min per mode, 84 cases; `disk_fault_sweep` 3-6 min, 80 cases (plus 6 recovery cases, about 1.5 min); `network_fault_test` 4-5 min, 37 cases; `source_change_test` 3-4 min per mode, 4 cases; `large_binlog_test` about 20 min on the debug build, mostly MySQL writing the large transactions; `pull_load_test` about 6 min, 4 cases; `listener_fuzz_test` about 11 min per mode at 600 connections: about 1 s per connection since the listener always does full `caching_sha2_password` authentication (PBS-10), 2-3 min for 3000 before).
 
   To try a stage without touching the nightly's own results, select stages
   with `STAGES` (default `cpp mtr qa release`; without `cpp` the debug,
@@ -432,7 +448,8 @@ server rather than starting one.
   `pull_replica_test gtid` (ticket 20),
   `query_race_test list_next_to_pull` (ticket 29),
   `pull_heartbeat_test quiet_after_rotation` (ticket 40, PBS-113),
-  `large_binlog_test position/transaction_over_4gib` (ticket 41, PBS-114) and
+  `large_binlog_test position/transaction_over_4gib` (ticket 41, PBS-114),
+  `pull_load_test position/shutdown` (ticket 43) and
   `fetch_crash_test gtid` (ticket 14, when the run generates a fetch /
   `FLUSH BINARY LOGS` / fetch sequence).
 - **`ci_property_tests.sh`** — what the CI job *GCC 14 Debug Property Tests*

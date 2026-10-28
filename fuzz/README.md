@@ -107,5 +107,9 @@ rejection the fix should make it, so the fuzzer explores past it. Build with
 
 | Target | Inputs | Coverage (edges) | Findings |
 | --- | --- | --- | --- |
-| `event_stream_fuzzer` | 3.4 million (before the filter) | 962 seeds → 1,439 | PBS-68 only |
+| `event_stream_fuzzer`, before the filter | 3.4 million | 962 seeds → 1,439 | PBS-68 only (26,205 inputs) |
+| `event_stream_fuzzer`, with the filter | 75.6 million | 1,439 → 1,491 | none |
 | `listener_packet_fuzzer` | 6.0 million | 1,948 seeds → 3,208 | none |
+
+With PBS-68 filtered, the event stream target runs about 20 times as many
+inputs in the same time, and finds nothing else so far.

@@ -296,7 +296,27 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_soak_test.py \
   --duration 900
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_tls_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/pull-tls
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_gtid_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/pull-gtid
 ```
+
+`pull_gtid_test.py` drives GTID auto-position replicas (PBS-29 part 2,
+`SOURCE_AUTO_POSITION=1`) of `pull` at the edges. `catch_up`: `pull` starts
+on an empty storage and the replica connects at once while the source
+writes for `--duration` seconds (default 60) with a `FLUSH BINARY LOGS`
+every 25 transactions; the replica must end with the source's data.
+`restart`: during that workload the replica is stopped and started twice;
+it must still end with the source's data and GTID_EXECUTED. `purged`: `pull`
+is stopped, `purge_binlogs` removes the older half of its binlogs (nothing
+else uses the storage, see PBS-75), `pull` is restarted and a replica with
+an empty GTID set connects. `ahead`: a replica holding every GTID the
+source wrote plus one of its UUID beyond them (`:1000000`) connects. In both
+of the last two cases a MySQL source refuses the replica with ER 1236 (the
+replica reports 13114). On 2026-10-29 the first two pass; `pull` accepts
+both of the others (ticket 20): the purged replica is silently streamed
+what is left (transactions 80-104 of 1-104, so its SQL thread fails on a
+missing table), the replica that is ahead waits for transactions that
+never come. The nightly runs it every night (`QA_PORT`+230, about 3 min).
 
 `pull_tls_test.py` checks TLS on the listener (PBS-31). It starts `pull`
 with one `replication_source` configuration after another on the same
@@ -358,9 +378,11 @@ server rather than starting one.
      (`QA_PORT`): `pull_replica_test.py` (cases `position` and `gtid`),
      `query_race_test.py` (case `list_next_to_pull`, 500 `list` runs,
      `QA_RUNS`), `pull_heartbeat_test.py` (cases `quiet` and
-     `quiet_after_rotation`, port `QA_PORT`+120) and `pull_tls_test.py`
-     (TLS on the listener, 13 cases, port `QA_PORT`+190), all with the
-     debug build,
+     `quiet_after_rotation`, port `QA_PORT`+120), `pull_tls_test.py`
+     (TLS on the listener, 13 cases, port `QA_PORT`+190) and
+     `pull_gtid_test.py` (GTID auto-position replicas, cases
+     `gtid/catch_up`, `gtid/restart`, `gtid/purged` and `gtid/ahead`, port
+     `QA_PORT`+230), all with the debug build,
      and a short
      `fetch_crash_test.py` run per mode (cases `gtid` and `position`,
      10 examples of 8 steps, `QA_EXAMPLES` / `QA_STEPS`) with the ASan build,
@@ -518,7 +540,9 @@ server rather than starting one.
   `large_binlog_test position/transaction_over_4gib` (ticket 41, PBS-114),
   `pull_load_test position/shutdown` (ticket 43, PBS-116),
   `pull_soak_test position/log` (ticket 45, PBS-118: info-level log volume),
-  seven `pull_tls_test` cases (ticket 46, PBS-119: no TLS handshake yet) and
+  seven `pull_tls_test` cases (ticket 46, PBS-119: no TLS handshake yet),
+  `pull_gtid_test gtid/purged` and `gtid/ahead` (ticket 20: no ER 1236 for
+  a replica lacking purged GTIDs or ahead of the source) and
   `fetch_crash_test gtid` (ticket 14, when the run generates a fetch /
   `FLUSH BINARY LOGS` / fetch sequence).
 - **`ci_property_tests.sh`** — what the CI job *GCC 14 Debug Property Tests*

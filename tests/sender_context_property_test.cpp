@@ -1575,47 +1575,43 @@ gtid_event_with_length(gtid_kind kind, const binsrv::gtids::gtid &gtid,
   return result;
 }
 
-// writes 'binlogs' (each a list of transactions) into a fresh storage: per
-// binlog a FORMAT_DESCRIPTION, a PREVIOUS_GTIDS_LOG holding the GTIDs of
-// the binlogs before it, then the transactions; every binlog but the last is
-// closed. GTIDs are numbered per UUID and tag from 1. 'damage' applies to
-// transaction 'damaged_index' of the last binlog ('overrun': the bytes a
-// length_long transaction_length is too long by).
-[[nodiscard]] std::vector<stored_gtid_binlog>
-store_gtid_binlogs(binsrv::storage &storage,
-                   const std::vector<std::vector<transaction_spec>> &binlogs,
-                   transaction_damage damage = transaction_damage::none,
-                   std::size_t damaged_index = 0U, std::size_t overrun = 7U) {
-  std::vector<stored_gtid_binlog> result;
-  std::map<std::pair<std::size_t, std::size_t>, binsrv::gtids::gno_t> next_gno;
-  binsrv::gtids::gtid_set previous;
-  std::uint32_t event_id{1U};
-  events::seq_no_t sequence_number{1U};
-  auto name{the_binlog};
-  for (std::size_t binlog_index{0U}; binlog_index != std::size(binlogs);
-       ++binlog_index) {
-    if (binlog_index != 0U) {
-      storage.close_binlog();
-      name = name.next();
+// writes binlogs of transactions into a storage one after another: per
+// binlog a FORMAT_DESCRIPTION, a PREVIOUS_GTIDS_LOG holding the GTIDs of the
+// binlogs before it, then the transactions; writing a binlog closes the one
+// before it. GTIDs are numbered per UUID and tag from 1. 'damage' applies to
+// transaction 'damaged_index' of the binlog being written ('overrun': the
+// bytes a length_long transaction_length is too long by).
+class gtid_binlog_writer {
+public:
+  explicit gtid_binlog_writer(binsrv::storage &storage) : storage_{&storage} {}
+
+  [[nodiscard]] stored_gtid_binlog
+  write(const std::vector<transaction_spec> &specs,
+        transaction_damage damage = transaction_damage::none,
+        std::size_t damaged_index = 0U, std::size_t overrun = 7U) {
+    if (written_ != 0U) {
+      storage_->close_binlog();
+      name_ = name_.next();
     }
-    require(storage.open_binlog(name) == binsrv::open_binlog_status::created,
+    ++written_;
+    require(storage_->open_binlog(name_) ==
+                binsrv::open_binlog_status::created,
             "a binlog was not created");
     std::uint64_t offset{events::magic_binlog_offset};
     const auto store{[&](const byte_vector &bytes, bool at_boundary) {
-      storage.write_event(util::const_byte_span{bytes}, at_boundary,
-                          binsrv::gtids::gtid{},
-                          util::ctime_timestamp{std::time_t{1}}, 0ULL);
+      storage_->write_event(util::const_byte_span{bytes}, at_boundary,
+                            binsrv::gtids::gtid{},
+                            util::ctime_timestamp{std::time_t{1}}, 0ULL);
       offset += std::size(bytes);
     }};
-    stored_gtid_binlog binlog{.name = name,
+    stored_gtid_binlog binlog{.name = name_,
                               .format_description = make_fde(),
                               .previous_gtids_log = {},
                               .transactions = {}};
     store(binlog.format_description, true);
     binlog.previous_gtids_log =
-        make_previous_gtids_log(offset, server_id, previous);
+        make_previous_gtids_log(offset, server_id, previous_);
     store(binlog.previous_gtids_log, true);
-    const auto &specs{binlogs[binlog_index]};
     for (std::size_t index{0U}; index != std::size(specs); ++index) {
       const auto &spec{specs[index]};
       stored_transaction transaction{.gtid = {}, .events = {}};
@@ -1624,22 +1620,21 @@ store_gtid_binlogs(binsrv::storage &storage,
         const auto tag{spec.kind == gtid_kind::tagged
                            ? binsrv::gtids::tag{tag_pool.at(spec.tag_index)}
                            : binsrv::gtids::tag{}};
-        auto &gno{next_gno[{spec.uuid_index, spec.kind == gtid_kind::tagged
-                                                 ? spec.tag_index + 1U
-                                                 : 0U}]};
+        auto &gno{next_gno_[{spec.uuid_index, spec.kind == gtid_kind::tagged
+                                                  ? spec.tag_index + 1U
+                                                  : 0U}]};
         ++gno;
         transaction.gtid = binsrv::gtids::gtid{uuid, tag, gno};
-        previous.add(transaction.gtid);
+        previous_.add(transaction.gtid);
       }
       std::size_t other_size{0U};
       for (const auto size : spec.other_event_sizes) {
         other_size += size;
       }
       const bool damaged{damage != transaction_damage::none &&
-                         binlog_index + 1U == std::size(binlogs) &&
                          index == damaged_index};
       auto gtid_event{make_gtid_event(spec.kind, transaction.gtid, offset,
-                                      other_size, sequence_number)};
+                                      other_size, sequence_number_)};
       if (damaged && (damage == transaction_damage::length_short ||
                       damage == transaction_damage::length_long)) {
         const auto actual{std::size(gtid_event) + other_size};
@@ -1648,7 +1643,7 @@ store_gtid_binlogs(binsrv::storage &storage,
                               : actual + overrun};
         if (auto patched{gtid_event_with_length(
                 spec.kind, transaction.gtid, offset, std::size(gtid_event),
-                wanted, sequence_number)};
+                wanted, sequence_number_)};
             patched.has_value()) {
           gtid_event = std::move(*patched);
         }
@@ -1658,21 +1653,48 @@ store_gtid_binlogs(binsrv::storage &storage,
         // before the 4-byte footer)
         gtid_event[std::size(gtid_event) - 6U] ^= std::byte{0x5A};
       }
-      ++sequence_number;
+      ++sequence_number_;
       if (!(damaged && damage == transaction_damage::missing_gtid_event)) {
         store(gtid_event, false);
         transaction.events.push_back(std::move(gtid_event));
       }
       for (std::size_t event{0U}; event != std::size(spec.other_event_sizes);
            ++event) {
-        auto bytes{make_event(spec.other_event_sizes[event], event_id++)};
+        auto bytes{make_event(spec.other_event_sizes[event], event_id_++)};
         store(bytes, event + 1U == std::size(spec.other_event_sizes));
         transaction.events.push_back(std::move(bytes));
       }
       binlog.transactions.push_back(std::move(transaction));
     }
-    storage.flush_event_buffer();
-    result.push_back(std::move(binlog));
+    storage_->flush_event_buffer();
+    return binlog;
+  }
+
+private:
+  binsrv::storage *storage_;
+  std::size_t written_{0U};
+  events::composite_binlog_name name_{the_binlog};
+  std::map<std::pair<std::size_t, std::size_t>, binsrv::gtids::gno_t>
+      next_gno_;
+  binsrv::gtids::gtid_set previous_;
+  std::uint32_t event_id_{1U};
+  events::seq_no_t sequence_number_{1U};
+};
+
+// writes 'binlogs' into a fresh storage with a gtid_binlog_writer; every
+// binlog but the last is closed, and 'damage' applies to the last one
+[[nodiscard]] std::vector<stored_gtid_binlog>
+store_gtid_binlogs(binsrv::storage &storage,
+                   const std::vector<std::vector<transaction_spec>> &binlogs,
+                   transaction_damage damage = transaction_damage::none,
+                   std::size_t damaged_index = 0U, std::size_t overrun = 7U) {
+  gtid_binlog_writer writer{storage};
+  std::vector<stored_gtid_binlog> result;
+  for (std::size_t index{0U}; index != std::size(binlogs); ++index) {
+    const bool last{index + 1U == std::size(binlogs)};
+    result.push_back(writer.write(binlogs[index],
+                                  last ? damage : transaction_damage::none,
+                                  damaged_index, overrun));
   }
   return result;
 }
@@ -2065,5 +2087,69 @@ BOOST_AUTO_TEST_CASE(CorruptedPreviousGtidsLogFailsCleanly) {
                 " event(s) streamed)");
     require(outcome.events.empty(),
             "events were streamed before the damaged preamble was refused");
+  });
+}
+
+// a GTID-mode dump that has streamed everything stored and waits at the end
+// of the active binlog follows the next binlog when it arrives: an
+// artificial ROTATE naming it, its FORMAT_DESCRIPTION (create_timestamp
+// zeroed) and PREVIOUS_GTIDS_LOG, then exactly the new transactions the
+// replica lacks
+BOOST_AUTO_TEST_CASE(GtidModeFollowsANewBinlog) {
+  run_property([](hegel::TestCase &tc) {
+    const temp_dir directory;
+    const auto first{tc.draw(
+        "first", gs::vectors(transaction_specs(),
+                             {.min_size = 0U, .max_size = 4U}))};
+    const auto second{tc.draw(
+        "second", gs::vectors(transaction_specs(),
+                              {.min_size = 0U, .max_size = 4U}))};
+    const bool session_checksum{tc.draw("checksum", gs::booleans())};
+    const auto block_size{tc.draw("block", block_sizes())};
+
+    const auto storage{make_storage(write_config(directory.path()))};
+    gtid_binlog_writer writer{*storage};
+    std::vector<stored_gtid_binlog> stored{writer.write(first)};
+    // the replica's set is drawn over both binlogs' GTIDs, so write the
+    // second binlog's specs into a scratch storage first to learn them
+    const temp_dir scratch_directory;
+    const auto scratch{make_storage(write_config(scratch_directory.path()))};
+    const auto both{store_gtid_binlogs(*scratch, {first, second})};
+    const auto replica{draw_replica_set(tc, both)};
+
+    operations::sender_context reader{std::make_shared<binsrv::null_logger>(),
+                                      storage,
+                                      block_size,
+                                      binsrv::replication_mode_type::gtid,
+                                      std::string_view{},
+                                      events::magic_binlog_offset,
+                                      replica,
+                                      session_checksum};
+    const auto expected_first{expected_gtid_stream(stored, replica)};
+    const auto before{stream_until_end(
+        reader, 1U + std::size(expected_first.front()) + 1U)};
+    require(!before.failed && std::size(before.events) ==
+                                  1U + std::size(expected_first.front()),
+            "the dump did not stream the first binlog and wait (" +
+                std::to_string(std::size(before.events)) + " event(s))");
+
+    stored.push_back(writer.write(second));
+    const auto expected{expected_gtid_stream(stored, replica)};
+    const auto after{
+        stream_until_end(reader, 1U + std::size(expected.back()) + 1U)};
+    require(!after.failed, "the dump failed after the next binlog arrived");
+    require(std::size(after.events) == 1U + std::size(expected.back()),
+            std::to_string(std::size(after.events)) +
+                " event(s) after the next binlog arrived, expected " +
+                std::to_string(1U + std::size(expected.back())));
+    require(is_artificial_rotate_to(after.events.front(), stored.back().name,
+                                    events::magic_binlog_offset),
+            "the next binlog did not start with an artificial ROTATE to it");
+    for (std::size_t index{0U}; index != std::size(expected.back());
+         ++index) {
+      require(after.events[index + 1U] == expected.back()[index],
+              "event " + std::to_string(index + 1U) +
+                  " of the next binlog differs from the stored data");
+    }
   });
 }

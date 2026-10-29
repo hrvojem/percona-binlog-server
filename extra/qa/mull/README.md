@@ -80,20 +80,51 @@ triaged ones in `mull_known_survivors.txt` and reports listed ones that no
 longer survive as stale. The per-binary reports are `<binary>.txt` (IDE
 format: file, line, column and the change) and `<binary>.sqlite`.
 
-## First results (2026-10-28)
+## Results
+
+### 2026-10-28: the GTID and util libraries
 
 Six test binaries, about 15 s in all (12 workers): 118 mutants on covered
-lines, 96 killed (81.4%), 22 surviving every test. Per binary:
-`gtid_set_test` 72% (81 covered), `gtid_set_property_test` 76% (85),
-`gtid_test` 35% (14), `byte_span_encoding_test` 89% (46), `tag_test` 100%,
-`uuid_test` covers none.
+lines, 96 killed (81.4%), 22 surviving every test. 15 of the survivors are
+harmless (11 equivalent, 4 unreachable boundaries) and 7 were test gaps,
+all closed the next day by tests in `gtid_set_test` and
+`byte_span_encoding_test` (103 of 118 killed, 87.3%, afterwards):
 
-Of the 22 survivors, 15 are harmless (`mull_known_survivors.txt`: 11
-equivalent, 4 unreachable boundaries) and 7 are test gaps:
+| Mutant | Gap | Closed by |
+| --- | --- | --- |
+| `binsrv/gtids/gtid_set.cpp:133` `>=` → `>` | an upper-case `A` in the hex of a UUID was never parsed (it would be read as a digit) | `GtidSetParsesUpperCaseHex` |
+| `binsrv/gtids/gtid_set.cpp:768` `<=` → `<` | a binary GTID set with an empty interval (upper == lower) was never decoded | `GtidSetBinaryRejectsEmptyInterval` |
+| `util/byte_span_extractors.hpp:116`, `:138` `>` → `>=` | the checked byte span / byte array extractors never got exactly as many bytes as they need | `CheckedByteExtractionAtExactSize` |
+| `util/byte_span_inserters.hpp:165`, `:173`, `:181` `<` → `<=` | the checked packed-integer inserter never got a buffer of exactly the encoded size | `PackedIntEncoding` (exact and one-byte-short buffers) |
 
-| Mutant | Gap |
-| --- | --- |
-| `binsrv/gtids/gtid_set.cpp:133` `>=` → `>` | an upper-case `A` in the hex of a UUID is never parsed (it would be read as a digit) |
-| `binsrv/gtids/gtid_set.cpp:768` `<=` → `<` | a binary GTID set with an empty interval (upper == lower) is never decoded; the check that rejects it goes untested (`GtidSetDecodedFromBinaryIsPrintable`, a known failure of ticket 3 left out of the run, may reach it) |
-| `util/byte_span_extractors.hpp:116`, `:138` `>` → `>=` | the checked byte span / byte array extractors never get exactly as many bytes as they need |
-| `util/byte_span_inserters.hpp:165`, `:173`, `:181` `<` → `<=` | the checked packed-integer inserter never gets a buffer of exactly the encoded size (1, 3 or 4 bytes) |
+### 2026-10-29: the event library, validators and units added
+
+15 test binaries (`run_mull.sh`), about 25 min, most of it
+`sender_context_property_test`: 414 mutants on covered lines, 356 killed
+(86.0%), 58 surviving every test. Per binary, from 35% (`gtid_test`) to
+100% (`tag_test`); `reader_context_property_test` 80%,
+`event_property_test` 74%, `config_value_property_test` 90%,
+`sender_context_property_test` 71%. `indexed_event_block_property_test`
+does not run: its only test case is a known failure (tickets 7 / 39).
+
+All 58 survivors are triaged in `mull_known_survivors.txt`: 23 harmless
+(equivalent, or a boundary no input can reach) and 35 open test gaps,
+listed so that the weekly run reports only new survivors:
+
+- **Text output no test compares (10):** the names of checksum
+  algorithms and common header flags, `flag_set` printing, the
+  post-header length table.
+- **Boundaries no test reaches (15):** a binlog sequence number of exactly
+  1,000,000, an FDE checksum byte equal to the first invalid value, a
+  repeated field id in a tagged GTID body, the largest representable size
+  and time, a server version exactly at the protocol table switch,
+  `last_committed` equal to `sequence_number` and a transaction length
+  equal to the event size in the rewriter, encoding into exact-size buffers,
+  a post-header length lookup past a version's table.
+- **Behaviour no test in the run checks (5):** `next_event_position` of an
+  artificial ROTATE built through `common_header`, resuming at position 4
+  of the same binlog, an artificial ROTATE in the middle of a stream,
+  `event_size` after a rewrite that changes the size, `is_epoch()`.
+- **Storage reads (5):** `byte_range` text and `file_operations_helpers`
+  boundaries, covered by `storage_property_test`, which is not in the run
+  (minutes per run, and its S3 cases need the S3 server).

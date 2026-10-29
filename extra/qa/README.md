@@ -250,11 +250,11 @@ and GTID auto-position mode, and requires the replica's data to match the
 source's. When it does not, it reports the replica's I/O-thread error and the
 statements `pull` rejected. It is the end-to-end check behind tickets 20-22;
 tickets 21 (resuming from a position) and 22 (`mysqlbinlog --raw`) are fixed
-upstream in `a338dde` (PBS-42 part 5). Ticket 20 is open for GTID
-auto-position (`COM_BINLOG_DUMP_GTID` is answered with "unknown command"
-until PBS-29 part 2) and TLS on the listener; heartbeats exist since PBS-30.
-The nightly runs it (see below); its `gtid` case is listed as a known
-failure (ticket 20), while the `position` case must pass.
+upstream in `a338dde` (PBS-42 part 5). Since PBS-29 part 2 (`7cd6e24`) a
+GTID auto-position replica replicates too, so both cases must pass. Ticket 20
+stays open for a replica that lacks GTIDs `pull` no longer holds (it gets
+EOF where MySQL answers ER 1236) and for TLS on the listener; heartbeats
+exist since PBS-30. The nightly runs it (see below).
 
 `pull_heartbeat_test.py` checks the heartbeats of PBS-30 with a real replica:
 `SOURCE_HEARTBEAT_PERIOD=1`, `replica_net_timeout=4`, `pull` checkpointing
@@ -301,7 +301,7 @@ server rather than starting one.
 
 [`nightly/`](nightly) holds the nightly test runner and its data:
 
-- **`run_nightly.sh`** — runs five stages:
+- **`run_nightly.sh`** — runs six stages:
   1. **C++** (`cpp`): builds the `debug_gcc14`, `asan_gcc14` and
      `tsan_gcc14` trees in place, runs the unit tests, then runs **every
      Hegel property-test case separately** with many more cases than the
@@ -401,6 +401,16 @@ server rather than starting one.
      distinct finding is a case `<target>/<signature>` of the build `fuzz`,
      compared with `fuzz_known_failures.txt`; see
      [`fuzz/README.md`](../../fuzz/README.md).
+  6. **Mutation testing** (`mull`), weekly on Sundays (`MULL_DAY`, `all` for
+     every run): [Mull](https://github.com/mull-project/mull) builds the
+     unit and property tests of the GTID, util and event libraries, the
+     configuration validators and the units with its compiler plugin in
+     `$WS/percona-binlog-server-build-mull_clang20` (rebuilt from clean each
+     time), then `mull/run_mull.sh` runs them once per mutant. The case
+     `mull/run` of the build `mull` records the mutation score; each mutant
+     no test kills that is not triaged in `mull/mull_known_survivors.txt` is
+     a new case `mull/<file>:<line>:<column>-<mutator>`. About 30 min; see
+     [`mull/README.md`](mull/README.md).
 
   Results go to `$WS/nightly/runs/<date>/` (and the `latest` symlink):
   `summary.txt`, one log per failing case (`<build>-<test case>.log`; for MTR
@@ -420,7 +430,7 @@ server rather than starting one.
   C++ stage plus 35-50 min of MTR (9-26 min per version) and 20-35 min of QA harnesses: about 11 min for `pull_replica_test`, `query_race_test` and `fetch_crash_test` on file storage, about 5 min for `pull_heartbeat_test`, about 7 min for `fetch_crash_test` on S3 (mostly Hypothesis shrinking the known ticket 14 failure in `gtid/s3`), plus the night's rotation (measured on MySQL 8.4.8: `s3_fault_sweep` 15 min per mode, 84 cases; `disk_fault_sweep` 3-6 min, 80 cases (plus 6 recovery cases, about 1.5 min); `network_fault_test` 4-5 min, 37 cases; `source_change_test` 3-4 min per mode, 4 cases; `large_binlog_test` about 20 min on the debug build, mostly MySQL writing the large transactions; `pull_load_test` about 6 min, 4 cases; `listener_fuzz_test` about 11 min per mode at 600 connections: about 1 s per connection since the listener always does full `caching_sha2_password` authentication (PBS-10), 2-3 min for 3000 before).
 
   To try a stage without touching the nightly's own results, select stages
-  with `STAGES` (default `cpp mtr qa release fuzz`; without `cpp` the debug,
+  with `STAGES` (default `cpp mtr qa release fuzz mull`; without `cpp` the debug,
   ASan and TSan trees are not built) and
   write elsewhere with `OUT_DIR` (then `history.tsv`, `latest` and old runs
   are left alone):
@@ -428,9 +438,10 @@ server rather than starting one.
   ```sh
   STAGES="mtr qa" OUT_DIR=~/ws/qa/nightly-try ~/ws/nightly/run_nightly.sh
   ```
-- **`nightly_stages.py`** — runs one MTR suite or one QA harness for
-  `run_nightly.sh`, parses its outcome into cases, matches them against the
-  stage's known-failure list and appends the result lines.
+- **`nightly_stages.py`** — runs one MTR suite, one QA harness, one fuzz
+  target or the mutation testing for `run_nightly.sh`, parses its outcome
+  into cases, matches them against the stage's known-failure list and
+  appends the result lines.
 - **`hegel.toml`** — the Hegel settings profiles (`nightly_debug`,
   `nightly_asan`, `nightly_tsan`, `nightly_release`) selected per build via
   `HEGEL_DEFAULT_PROFILE`; each has its own failure database so a failure found
@@ -453,12 +464,14 @@ server rather than starting one.
 - **`mtr_known_failures.txt`** — the same for the MTR stage, one line per
   `<series> <test>  ticket N: ...`, where `<series>` is `8.0`, `8.4`, `9.7` or
   `*` (every version) and `<test>` is a test name (every combination) or
-  `<test>/<combination>`.
+  `<test>/<combination>`; e.g. `9.7 rs_heartbeat` (ticket 44, PBS-117: the
+  test leaves `SOURCE_SSL` at its default, which a 9.7 replica takes as
+  required, so it never connects and the test waits for its 30-minute
+  timeout).
 - **`qa_known_failures.txt`** — the same for the QA-harness stage:
   `<harness> <case>  ticket N: ...` (`<case>` may be `*` or a shell-style
   pattern such as `position/PUT-*/reset_after/*`; a name without `/` also
   covers every `<name>/...` case), e.g.
-  `pull_replica_test gtid` (ticket 20),
   `query_race_test list_next_to_pull` (ticket 29),
   `pull_heartbeat_test quiet_after_rotation` (ticket 40, PBS-113),
   `large_binlog_test position/transaction_over_4gib` (ticket 41, PBS-114),

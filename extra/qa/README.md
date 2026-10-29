@@ -312,7 +312,7 @@ a certificate that is not PEM: it must exit at once, naming the file. On
 2026-10-29 (PBS-31 part 1) the startup checks and plain clients pass, while
 every TLS client fails with `SSL connection error: wrong version number`:
 the listener advertises TLS but performs no handshake yet, and it does not
-enforce `require_secure_transport` (ticket 46). The nightly runs it every
+enforce `require_secure_transport` (ticket 46, PBS-119). The nightly runs it every
 night.
 
 `pull_soak_test.py` runs `pull` for a long time (`--duration`, 2 h by
@@ -518,7 +518,7 @@ server rather than starting one.
   `large_binlog_test position/transaction_over_4gib` (ticket 41, PBS-114),
   `pull_load_test position/shutdown` (ticket 43, PBS-116),
   `pull_soak_test position/log` (ticket 45, PBS-118: info-level log volume),
-  seven `pull_tls_test` cases (ticket 46: no TLS handshake yet) and
+  seven `pull_tls_test` cases (ticket 46, PBS-119: no TLS handshake yet) and
   `fetch_crash_test gtid` (ticket 14, when the run generates a fetch /
   `FLUSH BINARY LOGS` / fetch sequence).
 - **`ci_property_tests.sh`** — what the CI job *GCC 14 Debug Property Tests*

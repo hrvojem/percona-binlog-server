@@ -3,7 +3,7 @@
 # When 'fetch' cannot connect to the MySQL source, the log must say why: the
 # MySQL client library's error (wrong password, TLS verification failure),
 # not only that the connection failed. collector_context logs a fixed
-# message and drops the error text (ticket 47).
+# message and drops the error text (ticket 47, PBS-121).
 #
 #   1. a wrong password: the log names "Access denied";
 #   2. VERIFY_CA with a CA that did not sign the server certificate: the log

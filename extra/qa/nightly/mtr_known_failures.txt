@@ -23,4 +23,4 @@
 # and the SOURCE_POS_WAIT that follows hangs until the 30-minute test case
 # timeout. The other rs_* tests set SOURCE_SSL=0
 9.7 rs_heartbeat  ticket 44 (PBS-117): the test does not set SOURCE_SSL=0, so the 9.7 replica refuses pull's listener ("SSL is required but the server doesn't support it")
-* fetch_connection_error_reason  ticket 47: when fetch cannot connect, collector_context logs only 'unable to establish connection to mysql server' and drops the client library's error (wrong password, certificate verification failure)
+* fetch_connection_error_reason  ticket 47 (PBS-121): when fetch cannot connect, collector_context logs only 'unable to establish connection to mysql server' and drops the client library's error (wrong password, certificate verification failure)

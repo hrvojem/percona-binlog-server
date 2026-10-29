@@ -3,7 +3,7 @@
 # TLS failures on the 'fetch' side (the connection to the MySQL source):
 # the binlog utility must refuse to connect and exit with 1, rather than
 # fall back to an unverified or plain connection. (That the log names the
-# reason is fetch_connection_error_reason, ticket 47.)
+# reason is fetch_connection_error_reason, ticket 47, PBS-121.)
 #
 #   1. VERIFY_CA with the right CA connects (the control);
 #   2. VERIFY_CA with a CA that did not sign the server certificate fails;

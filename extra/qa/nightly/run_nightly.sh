@@ -517,6 +517,9 @@ if want qa; then
     qa_run pull_heartbeat_test pull_heartbeat_test \
       --binsrv "$debug_binsrv" --workdir "$out/qa/hb" \
       --port $((QA_PORT + 120)) --timeout 900
+    qa_run pull_tls_test pull_tls_test \
+      --binsrv "$debug_binsrv" --workdir "$out/qa/tls" \
+      --port $((QA_PORT + 190)) --timeout 1200
   fi
   # the crash/resume test runs against the ASan build to catch memory errors
   if [ -n "${build_failed[asan_gcc14]:-}" ]; then

@@ -294,7 +294,26 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_load_test.py \
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_soak_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/pull-soak \
   --duration 900
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_tls_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/pull-tls
 ```
+
+`pull_tls_test.py` checks TLS on the listener (PBS-31). It starts `pull`
+with one `replication_source` configuration after another on the same
+storage (no `ssl` section; the MTR suite's test certificate `rs_cert.pem` /
+`rs_priv.pem`; `require_secure_transport`; no RSA key) and connects
+`mysqlbinlog --raw` clients with `--ssl-mode` DISABLED, the default
+(PREFERRED), REQUIRED and VERIFY_CA (against `rs_ca_cert.pem`), and a MySQL
+replica with `SOURCE_SSL=1`; each must copy every closed binlog exactly, and
+under `require_secure_transport` a plain client must be refused with an
+error while `pull` keeps serving. Four more cases start `pull` with a
+missing certificate, a missing key, a key that is not the certificate's and
+a certificate that is not PEM: it must exit at once, naming the file. On
+2026-10-29 (PBS-31 part 1) the startup checks and plain clients pass, while
+every TLS client fails with `SSL connection error: wrong version number`:
+the listener advertises TLS but performs no handshake yet, and it does not
+enforce `require_secure_transport` (ticket 46). The nightly runs it every
+night.
 
 `pull_soak_test.py` runs `pull` for a long time (`--duration`, 2 h by
 default) under churn: a steady workload with rotations and an occasional
@@ -338,8 +357,10 @@ server rather than starting one.
   3. **QA harnesses** (`qa`), against MySQL 8.4 (`QA_DIST`), ports from 24470
      (`QA_PORT`): `pull_replica_test.py` (cases `position` and `gtid`),
      `query_race_test.py` (case `list_next_to_pull`, 500 `list` runs,
-     `QA_RUNS`) and `pull_heartbeat_test.py` (cases `quiet` and
-     `quiet_after_rotation`, port `QA_PORT`+120), all with the debug build,
+     `QA_RUNS`), `pull_heartbeat_test.py` (cases `quiet` and
+     `quiet_after_rotation`, port `QA_PORT`+120) and `pull_tls_test.py`
+     (TLS on the listener, 13 cases, port `QA_PORT`+190), all with the
+     debug build,
      and a short
      `fetch_crash_test.py` run per mode (cases `gtid` and `position`,
      10 examples of 8 steps, `QA_EXAMPLES` / `QA_STEPS`) with the ASan build,
@@ -496,7 +517,8 @@ server rather than starting one.
   `pull_heartbeat_test quiet_after_rotation` (ticket 40, PBS-113),
   `large_binlog_test position/transaction_over_4gib` (ticket 41, PBS-114),
   `pull_load_test position/shutdown` (ticket 43, PBS-116),
-  `pull_soak_test position/log` (ticket 45, PBS-118: info-level log volume) and
+  `pull_soak_test position/log` (ticket 45, PBS-118: info-level log volume),
+  seven `pull_tls_test` cases (ticket 46: no TLS handshake yet) and
   `fetch_crash_test gtid` (ticket 14, when the run generates a fetch /
   `FLUSH BINARY LOGS` / fetch sequence).
 - **`ci_property_tests.sh`** — what the CI job *GCC 14 Debug Property Tests*

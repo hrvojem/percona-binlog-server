@@ -280,7 +280,8 @@ def harness_command(args, workdir: Path) -> list:
             "--workdir", str(workdir)]
     common = base + ["--port", str(args.port)]
     mode = ["--mode", args.mode] if args.mode else []
-    if args.harness in ("pull_replica_test", "pull_heartbeat_test"):
+    if args.harness in ("pull_replica_test", "pull_heartbeat_test",
+                        "pull_tls_test"):
         return script + common
     if args.harness == "fetch_crash_test":
         command = script + common + [
@@ -329,7 +330,7 @@ def harness_cases(args, returncode: int, output: str, lines: list,
     wall-clock times of a case that has its own JSON line."""
     objects = json_lines(lines)
     mode = args.mode or "position"
-    if args.harness in ("pull_load_test", "pull_soak_test"):
+    if args.harness in ("pull_load_test", "pull_soak_test", "pull_tls_test"):
         cases = []
         for result, _ in objects:
             if "case" not in result:

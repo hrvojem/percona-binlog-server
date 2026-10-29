@@ -313,7 +313,7 @@ an empty GTID set connects. `ahead`: a replica holding every GTID the
 source wrote plus one of its UUID beyond them (`:1000000`) connects. In both
 of the last two cases a MySQL source refuses the replica with ER 1236 (the
 replica reports 13114). On 2026-10-29 the first two pass; `pull` accepts
-both of the others (ticket 20): the purged replica is silently streamed
+both of the others (ticket 20, PBS-120): the purged replica is silently streamed
 what is left (transactions 80-104 of 1-104, so its SQL thread fails on a
 missing table), the replica that is ahead waits for transactions that
 never come. The nightly runs it every night (`QA_PORT`+230, about 3 min).
@@ -541,7 +541,7 @@ server rather than starting one.
   `pull_load_test position/shutdown` (ticket 43, PBS-116),
   `pull_soak_test position/log` (ticket 45, PBS-118: info-level log volume),
   seven `pull_tls_test` cases (ticket 46, PBS-119: no TLS handshake yet),
-  `pull_gtid_test gtid/purged` and `gtid/ahead` (ticket 20: no ER 1236 for
+  `pull_gtid_test gtid/purged` and `gtid/ahead` (ticket 20, PBS-120: no ER 1236 for
   a replica lacking purged GTIDs or ahead of the source) and
   `fetch_crash_test gtid` (ticket 14, when the run generates a fetch /
   `FLUSH BINARY LOGS` / fetch sequence).

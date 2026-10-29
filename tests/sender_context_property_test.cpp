@@ -1988,3 +1988,82 @@ BOOST_AUTO_TEST_CASE(GtidModeSkipsATooLongTransactionWithoutTerminating) {
     }
   }
 }
+
+// a closed binlog whose PREVIOUS_GTIDS_LOG is damaged (its event_size claims
+// 1-50000 bytes more than are stored, or the binlog ends inside its common
+// header) makes a dump fail with an exception before streaming anything,
+// from the beginning or from a position, whatever the size of the event (the
+// sender's first preamble read may or may not hold it; when it does not, the
+// sender reads the rest by the event's size: 'Failed to fetch the remainder
+// of PREVIOUS_GTIDS_LOG event' / 'Failed to determine size of
+// PREVIOUS_GTIDS_LOG event')
+BOOST_AUTO_TEST_CASE(CorruptedPreviousGtidsLogFailsCleanly) {
+  run_property([](hegel::TestCase &tc) {
+    const temp_dir directory;
+    const auto previous_gtids{
+        tc.draw("previous_gtids", previous_gtid_sets())};
+    const bool truncate_header{tc.draw("truncate_header", gs::booleans())};
+    const auto excess{tc.draw(
+        "excess",
+        gs::integers<std::uint32_t>({.min_value = 1U, .max_value = 50'000U}))};
+    const auto kept_header_bytes{tc.draw(
+        "kept_header_bytes",
+        gs::integers<std::size_t>(
+            {.min_value = 1U,
+             .max_value = events::common_header_view_base::size_in_bytes -
+                          1U}))};
+    const bool from_position{tc.draw("from_position", gs::booleans())};
+    const bool session_checksum{tc.draw("checksum", gs::booleans())};
+    const auto block_size{tc.draw("block", block_sizes())};
+
+    const auto storage{make_storage(write_config(directory.path()))};
+    require(storage->open_binlog(the_binlog) ==
+                binsrv::open_binlog_status::created,
+            "the binlog was not created");
+    const auto fde{make_fde()};
+    append_flushed(*storage, util::const_byte_span{fde});
+    auto previous_gtids_log{make_previous_gtids_log(
+        events::magic_binlog_offset + std::size(fde), server_id,
+        previous_gtids)};
+    const auto stored_end{events::magic_binlog_offset + std::size(fde) +
+                          std::size(previous_gtids_log)};
+    if (truncate_header) {
+      previous_gtids_log.resize(kept_header_bytes);
+    } else {
+      util::byte_span size_field{
+          std::next(std::data(previous_gtids_log),
+                    static_cast<std::ptrdiff_t>(
+                        events::common_header_view_base::event_size_offset)),
+          sizeof(std::uint32_t)};
+      util::insert_fixed_int_to_byte_span(
+          size_field,
+          static_cast<std::uint32_t>(std::size(previous_gtids_log) + excess));
+    }
+    append_flushed(*storage, util::const_byte_span{previous_gtids_log});
+    storage->close_binlog();
+    require(storage->open_binlog(the_next_binlog) ==
+                binsrv::open_binlog_status::created,
+            "the next binlog was not created");
+
+    operations::sender_context reader{
+        std::make_shared<binsrv::null_logger>(),
+        storage,
+        block_size,
+        binsrv::replication_mode_type::position,
+        from_position ? the_binlog.str() : std::string{},
+        from_position ? stored_end : events::magic_binlog_offset,
+        binsrv::gtids::gtid_set{},
+        session_checksum};
+    const auto outcome{stream_until_end(reader, 4U)};
+    require(outcome.failed,
+            std::string{truncate_header ? "a PREVIOUS_GTIDS_LOG cut inside its "
+                                          "header"
+                                        : "a PREVIOUS_GTIDS_LOG longer than "
+                                          "the binlog"} +
+                " did not fail the dump (" +
+                std::to_string(std::size(outcome.events)) +
+                " event(s) streamed)");
+    require(outcome.events.empty(),
+            "events were streamed before the damaged preamble was refused");
+  });
+}

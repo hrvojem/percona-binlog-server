@@ -845,8 +845,21 @@ public:
   // does it: "perform full authentication", a request for the server's RSA
   // public key, the password XOR the scramble encrypted with that key
   // (RSA-OAEP), and OK
-  [[nodiscard]] auth_outcome try_authenticate(std::string_view user,
-                                             std::string_view password) {
+  // how try_authenticate() damages the RSA-encrypted password of a full
+  // authentication
+  enum class password_garbling : std::uint8_t {
+    none,
+    // random bytes of the key's size: RSA-OAEP decryption fails
+    random_bytes,
+    // half of the encrypted password
+    truncated,
+    // a correct encryption of the password without its terminating NUL
+    not_terminated
+  };
+
+  [[nodiscard]] auth_outcome
+  try_authenticate(std::string_view user, std::string_view password,
+                   password_garbling garbling = password_garbling::none) {
     const auto greeting{read_frame()};
     require(greeting.has_value(), "no server greeting");
     // the greeting can be decoded with any capabilities that include
@@ -915,14 +928,23 @@ public:
         std::string_view{*public_key}.substr(frame_header_size + 1U))};
     // the null-terminated password, XOR the scramble (repeated)
     std::string plain{password};
-    plain.push_back('\0');
+    if (garbling != password_garbling::not_terminated) {
+      plain.push_back('\0');
+    }
     for (std::size_t index{0U}; index < std::size(plain); ++index) {
       plain[index] = static_cast<char>(
           plain[index] ^ challenge[index % std::size(challenge)]);
     }
-    const auto encrypted{opensslpp::evp_key_encrypt(
+    auto encrypted{opensslpp::evp_key_encrypt(
         util::as_const_byte_span(plain), key,
         opensslpp::encryption_padding::pkcs1_oaep)};
+    if (garbling == password_garbling::random_bytes) {
+      for (std::size_t index{0U}; index < std::size(encrypted); ++index) {
+        encrypted[index] = static_cast<std::byte>((index * 37U + 11U) & 0xFFU);
+      }
+    } else if (garbling == password_garbling::truncated) {
+      encrypted.resize(std::size(encrypted) / 2U);
+    }
     write_frame(raw_client_frame(
         5U, std::string_view{reinterpret_cast<const char *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
                                  std::data(encrypted)),
@@ -2372,5 +2394,37 @@ BOOST_AUTO_TEST_CASE(ReplicationSourceAnswersResetConnectionAndChangeUser) {
       BOOST_TEST_INFO(label.str() << ", then COM_PING");
       BOOST_CHECK(client.read_reply().kind == reply_kind::ok);
     }
+  }
+}
+
+// a full authentication whose RSA-encrypted password is garbled (random
+// bytes of the key's size, which do not decrypt; half of a correct
+// encryption; a correct encryption of the password without its terminating
+// NUL) is refused like a wrong password, the listener keeps serving, and the
+// failed attempt does not fill the authentication cache: the next login with
+// the right password still takes the full path and succeeds
+BOOST_AUTO_TEST_CASE(ReplicationSourceRefusesGarbledEncryptedPasswords) {
+  const source_settings settings{.gtid_mode = false,
+                                 .server_id = 142U,
+                                 .server_uuid =
+                                     "00000000-0000-0000-0000-00000000008e"};
+  using garbling = mysql_client::password_garbling;
+  for (const auto kind : {garbling::random_bytes, garbling::truncated,
+                          garbling::not_terminated}) {
+    const replication_source source{settings};
+    BOOST_TEST_INFO("garbling " << static_cast<int>(kind));
+    {
+      mysql_client client{source.port()};
+      const auto outcome{
+          client.try_authenticate(replica_user, replica_password, kind)};
+      BOOST_CHECK(outcome.path == auth_path::full);
+      BOOST_CHECK(!outcome.ok);
+    }
+    mysql_client next{source.port()};
+    const auto outcome{next.try_authenticate(replica_user, replica_password)};
+    BOOST_TEST_INFO("garbling " << static_cast<int>(kind));
+    BOOST_CHECK(outcome.path == auth_path::full);
+    BOOST_TEST_INFO("garbling " << static_cast<int>(kind));
+    BOOST_CHECK(outcome.ok);
   }
 }

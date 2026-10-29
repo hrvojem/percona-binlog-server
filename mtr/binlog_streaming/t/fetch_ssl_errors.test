@@ -1,0 +1,97 @@
+# ==== Purpose ====
+#
+# TLS failures on the 'fetch' side (the connection to the MySQL source):
+# the binlog utility must refuse to connect and exit with 1, rather than
+# fall back to an unverified or plain connection. (That the log names the
+# reason is fetch_connection_error_reason, ticket 47.)
+#
+#   1. VERIFY_CA with the right CA connects (the control);
+#   2. VERIFY_CA with a CA that did not sign the server certificate fails;
+#   3. a CA file that does not exist fails;
+#   4. an invalid TLS version fails;
+#   5. a user that REQUIRE X509 connecting without a client certificate
+#      fails.
+
+--source ../include/have_binsrv.inc
+
+--source ../include/v80_v84_compatibility_defines.inc
+
+--let $localhost_ip = 127.0.0.1
+--let $ssl_user_name = ssl_user
+--let $x509_user_name = x509_user
+--let $user_password = strong_password
+
+--echo
+--echo *** Creating auxiliary users
+eval CREATE USER '$ssl_user_name'@'$localhost_ip' IDENTIFIED BY '$user_password' REQUIRE SSL;
+eval CREATE USER '$x509_user_name'@'$localhost_ip' REQUIRE X509;
+eval GRANT REPLICATION SLAVE ON *.* TO '$ssl_user_name'@'$localhost_ip';
+eval GRANT REPLICATION SLAVE ON *.* TO '$x509_user_name'@'$localhost_ip';
+
+--source ../include/identify_storage_backend.inc
+
+--let $ca_cert = $MYSQL_TEST_DIR/std_data/ca-cert-verify-san.pem
+# a CA that did not sign server-cert-verify-san.pem
+--let $other_ca_cert = $MYSQL_TEST_DIR/std_data/cacert.pem
+
+--let $binsrv_connection_host = $localhost_ip
+--let $binsrv_connect_timeout = 20
+--let $binsrv_read_timeout = 60
+--let $binsrv_idle_time = 10
+--let $binsrv_verify_checksum = TRUE
+--let $binsrv_replication_mode = position
+--let $binsrv_connection_user = $ssl_user_name
+--let $binsrv_connection_password = $user_password
+
+--echo
+--echo *** 1. VERIFY_CA with the right CA connects
+--let $binsrv_ssl_mode = verify_ca
+--let $binsrv_ssl_ca = $ca_cert
+--source ../include/set_up_binsrv_environment.inc
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null
+--source ../include/tear_down_binsrv_environment.inc
+
+--echo
+--echo *** 2. VERIFY_CA with a CA that did not sign the server certificate
+--let $binsrv_ssl_ca = $other_ca_cert
+--source ../include/set_up_binsrv_environment.inc
+--error 1
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null 2>&1
+--exec grep --silent "unable to establish connection to mysql server" $binsrv_log_path
+--source ../include/tear_down_binsrv_environment.inc
+
+--echo
+--echo *** 3. A CA file that does not exist
+--let $binsrv_ssl_ca = $MYSQL_TMP_DIR/no_such_ca.pem
+--source ../include/set_up_binsrv_environment.inc
+--error 1
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null 2>&1
+--exec grep --silent "unable to establish connection to mysql server" $binsrv_log_path
+--source ../include/tear_down_binsrv_environment.inc
+
+--echo
+--echo *** 4. An invalid TLS version
+--let $binsrv_ssl_mode = required
+--let $binsrv_ssl_ca =
+--let $binsrv_tls_version = TLSv9.9
+--source ../include/set_up_binsrv_environment.inc
+--error 1
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null 2>&1
+--exec grep --silent "unable to establish connection to mysql server" $binsrv_log_path
+--source ../include/tear_down_binsrv_environment.inc
+--let $binsrv_tls_version =
+
+--echo
+--echo *** 5. A REQUIRE X509 user without a client certificate
+--let $binsrv_connection_user = $x509_user_name
+--let $binsrv_connection_password =
+--source ../include/set_up_binsrv_environment.inc
+--error 1
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null 2>&1
+--exec grep --silent "unable to establish connection to mysql server" $binsrv_log_path
+--source ../include/tear_down_binsrv_environment.inc
+
+--echo
+--echo *** Dropping auxiliary users
+eval DROP USER '$x509_user_name'@'$localhost_ip';
+eval DROP USER '$ssl_user_name'@'$localhost_ip';

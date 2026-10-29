@@ -45,6 +45,10 @@ the first "nth" - 1 matching requests, then applies "action" to the next
   stall           wait "seconds", then forward
   truncate_body   forward, then send only half of the response body and
                   close the connection
+  shrink_body     forward; a partial-content answer (206, a ranged GET)
+                  is relayed with only half of its body and a matching
+                  Content-Length, a well-formed answer that is shorter than
+                  the range asked for (other answers pass unchanged)
 
 Example:
   python3 s3_fault_proxy.py --listen 127.0.0.1:9100 --backend 127.0.0.1:9000
@@ -61,7 +65,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CONTROL_PATH = "/__faults__"
 ACTIONS = {"error500", "error503", "reset_before", "reset_after", "stall",
-           "truncate_body"}
+           "truncate_body", "shrink_body"}
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection", "te",
               "trailer", "upgrade"}
 
@@ -247,6 +251,9 @@ def make_handler(backend_host, backend_port, rules):
             except OSError as error:
                 self._send(502, str(error).encode(), "text/plain")
                 return
+            if action == "shrink_body" and response.status == 206 and \
+                    len(data) > 1:
+                data = data[:len(data) // 2]
             rules.count(self.command, self.path, len(body), len(data))
             if action == "reset_after":
                 self._reset()

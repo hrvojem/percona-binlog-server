@@ -34,6 +34,12 @@ a third 'fetch' without a fault must still recover and leave exact copies
 (ticket 37). Only the metadata delete is failed: a 'binlog.0' match would
 hit both objects.
 
+Last, one read case: 'pull' serves its S3 storage while the proxy answers
+every ranged GET of binlog data with half of the range (shrink_body, a
+well-formed but short answer): a mysqlbinlog client must fail rather than
+receive wrong bytes, 'pull' must keep running, and with the fault cleared a
+client must copy every closed binlog exactly.
+
 The result of every case (whether the fault was hit, the exit code of the
 faulty fetch, and any failure) is printed as one JSON line and collected in
 '<workdir>/sweep.json'. Uses the helpers of fetch_crash_test.py.
@@ -42,12 +48,20 @@ faulty fetch, and any failure) is printed as one JSON line and collected in
 import argparse
 import itertools
 import json
+import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fetch_crash_test as harness  # noqa: E402
+import pull_replica_test as replication  # noqa: E402
+
+AUTH_RSA_PUBLIC_KEY = (Path(__file__).resolve().parents[2] / "mtr" /
+                       "binlog_streaming" / "std_data" /
+                       "caching_sha2_rsa_pub.pem")
 
 ACTIONS = ["error500", "error503", "reset_before", "reset_after", "stall",
            "truncate_body"]
@@ -93,6 +107,80 @@ def run_recovery_case(first: dict, faults, fault_log: Path) -> dict:
         result["failure"] = harness.describe_failure(error)
     finally:
         faults.set_rules([])
+    return result
+
+
+def run_pull_read_case(args, faults) -> dict:
+    """pull serving its S3 storage while the proxy shrinks every ranged GET
+    of binlog data (shrink_body): a client must fail rather than receive
+    wrong bytes, pull must keep running, and once the fault is cleared a
+    client must copy every closed binlog exactly."""
+    fault = {"action": "shrink_body", "method": "GET", "match": "binlog.0",
+             "nth": 1, "count": 1000}
+    result = {"case": "pull_read_shrunk_range", "fault": fault}
+    pull = None
+    try:
+        machine = harness.FetchCrashMachine()
+        machine.start_from_scratch()
+        machine.run_workload(WORKLOAD)
+        machine.flush_binary_logs()
+        machine.run_workload(WORKLOAD)
+        machine.fetch_to_the_end()
+        names = harness.SERVER.binlog_names()
+        closed = names[:-1]
+        pull_port = args.port + 2
+        pull = replication.start_pull(harness.BINSRV, pull_port)
+
+        def copy(directory: Path) -> subprocess.CompletedProcess:
+            shutil.rmtree(directory, ignore_errors=True)
+            directory.mkdir(parents=True)
+            try:
+                return subprocess.run(
+                    [str(args.mysql_basedir.expanduser() / "bin" /
+                         "mysqlbinlog"),
+                     "--no-defaults", "--read-from-remote-server",
+                     "--host=127.0.0.1", f"--port={pull_port}",
+                     f"--user={replication.PULL_USER}",
+                     f"--password={replication.PULL_PASSWORD}",
+                     f"--server-public-key-path={AUTH_RSA_PUBLIC_KEY}",
+                     "--ssl-mode=DISABLED", "--raw", "--to-last-log",
+                     f"--result-file={directory}/", names[0]],
+                    capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired as error:
+                return subprocess.CompletedProcess(error.cmd, 124, "",
+                                                   "timed out")
+
+        def exact(directory: Path) -> bool:
+            return all((directory / name).exists() and
+                       (directory / name).read_bytes() ==
+                       harness.SERVER.binlog_as_sent(name)
+                       for name in closed)
+
+        faults.set_rules([fault])
+        shrunk = copy(args.workdir / "pull-copy-shrunk")
+        applied = faults.stats()["rules"][0]["applied"]
+        faults.set_rules([])
+        result.update(hit=applied > 0, client_exit=shrunk.returncode,
+                      client_error=shrunk.stderr.strip()[-200:],
+                      wrong_bytes_streamed=shrunk.returncode == 0 and
+                      not exact(args.workdir / "pull-copy-shrunk"),
+                      pull_alive=pull.poll() is None)
+        time.sleep(1)
+        clean = copy(args.workdir / "pull-copy-clean")
+        result.update(clean_client_exit=clean.returncode,
+                      clean_copy_exact=exact(args.workdir /
+                                             "pull-copy-clean"))
+        if not (applied > 0 and not result["wrong_bytes_streamed"] and
+                result["pull_alive"] and clean.returncode == 0 and
+                result["clean_copy_exact"]):
+            result["failure"] = "see the fields"
+    except Exception as error:  # every case is reported
+        result["failure"] = harness.describe_failure(error)
+    finally:
+        faults.set_rules([])
+        if pull is not None and pull.poll() is None:
+            pull.kill()
+            pull.wait()
     return result
 
 
@@ -162,6 +250,9 @@ def main():
                                        args.workdir / "fault_outcomes.jsonl")
             print(json.dumps(result), flush=True)
             results.append(result)
+        result = run_pull_read_case(args, faults)
+        print(json.dumps(result), flush=True)
+        results.append(result)
     finally:
         harness.SERVER.stop()
     (args.workdir / "sweep.json").write_text(json.dumps(results, indent=2))

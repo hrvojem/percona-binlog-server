@@ -427,6 +427,9 @@ def harness_cases(args, returncode: int, output: str, lines: list,
             fault = result["fault"]
             name = (f"{mode}/{fault['method']}-{slug(fault['match'])}/"
                     f"{fault['action']}/x{fault['count']}")
+            if "case" in result:
+                # a named case (the pull read case)
+                name = f"{mode}/{result['case']}"
             if "recovery_fault" in result:
                 second = result["recovery_fault"]
                 name += (f"/then/{second['method']}-{slug(second['match'])}/"

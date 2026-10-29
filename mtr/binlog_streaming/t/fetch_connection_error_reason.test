@@ -1,0 +1,54 @@
+# ==== Purpose ====
+#
+# When 'fetch' cannot connect to the MySQL source, the log must say why: the
+# MySQL client library's error (wrong password, TLS verification failure),
+# not only that the connection failed. collector_context logs a fixed
+# message and drops the error text (ticket 47).
+#
+#   1. a wrong password: the log names "Access denied";
+#   2. VERIFY_CA with a CA that did not sign the server certificate: the log
+#      names the certificate verification failure.
+
+--source ../include/have_binsrv.inc
+
+--source ../include/v80_v84_compatibility_defines.inc
+
+--let $localhost_ip = 127.0.0.1
+--let $ssl_user_name = ssl_user
+--let $user_password = strong_password
+
+eval CREATE USER '$ssl_user_name'@'$localhost_ip' IDENTIFIED BY '$user_password' REQUIRE SSL;
+eval GRANT REPLICATION SLAVE ON *.* TO '$ssl_user_name'@'$localhost_ip';
+
+--source ../include/identify_storage_backend.inc
+
+--let $binsrv_connection_host = $localhost_ip
+--let $binsrv_connect_timeout = 20
+--let $binsrv_read_timeout = 60
+--let $binsrv_idle_time = 10
+--let $binsrv_verify_checksum = TRUE
+--let $binsrv_replication_mode = position
+--let $binsrv_connection_user = $ssl_user_name
+--let $binsrv_ssl_mode = required
+
+--echo
+--echo *** 1. A wrong password
+--let $binsrv_connection_password = wrong_password
+--source ../include/set_up_binsrv_environment.inc
+--error 1
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null 2>&1
+--exec grep --silent "Access denied" $binsrv_log_path
+--source ../include/tear_down_binsrv_environment.inc
+
+--echo
+--echo *** 2. VERIFY_CA with a CA that did not sign the server certificate
+--let $binsrv_connection_password = $user_password
+--let $binsrv_ssl_mode = verify_ca
+--let $binsrv_ssl_ca = $MYSQL_TEST_DIR/std_data/cacert.pem
+--source ../include/set_up_binsrv_environment.inc
+--error 1
+--exec $BINSRV fetch $binsrv_config_file_path > /dev/null 2>&1
+--exec grep --silent -i "certificate verify failed" $binsrv_log_path
+--source ../include/tear_down_binsrv_environment.inc
+
+eval DROP USER '$ssl_user_name'@'$localhost_ip';

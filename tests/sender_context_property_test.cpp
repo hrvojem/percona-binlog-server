@@ -36,6 +36,7 @@
 // what was stored).
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -43,9 +44,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <optional>
+#include <ostream>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -95,14 +99,19 @@
 #include "binsrv/events/composite_binlog_name.hpp"
 #include "binsrv/events/event_fwd.hpp"
 #include "binsrv/events/generic_post_header.hpp"
+#include "binsrv/events/gtid_log_body.hpp"
+#include "binsrv/events/gtid_log_flag_type.hpp"
+#include "binsrv/events/gtid_log_post_header.hpp"
 #include "binsrv/events/protocol_traits_fwd.hpp"
 #include "binsrv/events/rotate_post_header_impl.hpp"
 
 #include "util/byte_span.hpp"
 #include "util/byte_span_fwd.hpp"
 #include "util/byte_span_inserters.hpp"
+#include "util/crc_helpers.hpp"
 #include "util/ctime_timestamp.hpp"
 #include "util/semantic_version.hpp"
+#include "util/timestamp_helpers.hpp"
 
 namespace {
 
@@ -1401,3 +1410,580 @@ BOOST_AUTO_TEST_CASE(MisalignedDumpPositionNeverStreamsGarbage) {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// GTID mode (COM_BINLOG_DUMP_GTID, PBS-29 part 2)
+//
+// In GTID mode the sender starts at the first stored binlog and, after the
+// artificial ROTATE, always sends the FORMAT_DESCRIPTION and the
+// PREVIOUS_GTIDS_LOG. It then streams whole transactions: a transaction is a
+// GTID event (GTID_LOG, GTID_TAGGED_LOG or ANONYMOUS_GTID_LOG) and the events
+// its transaction_length covers; one whose GTID the replica has is skipped
+// whole, every other one (anonymous ones included) is streamed byte for byte.
+// A transaction larger than the read block is fetched whole by its
+// transaction_length (indexed_event_block, mode by_transaction).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+enum class gtid_kind : std::uint8_t { untagged, tagged, anonymous };
+
+constexpr std::array<std::string_view, 2> uuid_pool{
+    "3e11fa47-71ca-11e1-9e33-c80aa9429562",
+    "11111111-2222-3333-4444-555555555555"};
+constexpr std::array<std::string_view, 2> tag_pool{"alpha", "beta"};
+const binsrv::gtids::uuid foreign_uuid{"77777777-8888-9999-aaaa-bbbbccccdddd"};
+
+struct transaction_spec {
+  gtid_kind kind;
+  std::size_t uuid_index;
+  std::size_t tag_index;
+  // the events after the GTID event (synthetic, only their size matters)
+  std::vector<std::size_t> other_event_sizes;
+  friend bool operator==(const transaction_spec &,
+                         const transaction_spec &) = default;
+};
+
+std::ostream &operator<<(std::ostream &output, const transaction_spec &value) {
+  static constexpr std::array<std::string_view, 3> kinds{"untagged", "tagged",
+                                                         "anonymous"};
+  output << kinds.at(static_cast<std::size_t>(value.kind)) << " uuid "
+         << value.uuid_index << " tag " << value.tag_index << " events [";
+  for (const auto size : value.other_event_sizes) {
+    output << ' ' << size;
+  }
+  return output << " ]";
+}
+
+// the GTID event of a transaction at 'offset', its transaction_length
+// (which counts the GTID event itself) consistent with the other events
+[[nodiscard]] byte_vector make_gtid_event(gtid_kind kind,
+                                          const binsrv::gtids::gtid &gtid,
+                                          std::uint64_t offset,
+                                          std::size_t other_events_size,
+                                          events::seq_no_t sequence_number) {
+  const auto timestamp{
+      util::microseconds_to_high_resolution_time_point(1700000000000000ULL)};
+  const util::ctime_timestamp header_timestamp{1700000000};
+  const events::seq_no_t last_committed{sequence_number - 1U};
+  std::uint64_t transaction_length{other_events_size};
+  for (std::size_t iteration{0U}; iteration < 10U; ++iteration) {
+    events::event_storage buffer;
+    std::size_t event_size{};
+    if (kind == gtid_kind::tagged) {
+      const events::generic_body<code_type::gtid_tagged_log> body{
+          events::gtid_log_flag_set{},
+          gtid.get_uuid(),
+          gtid.get_gno(),
+          gtid.get_tag(),
+          last_committed,
+          sequence_number,
+          timestamp,
+          std::nullopt,
+          transaction_length,
+          server_version,
+          std::nullopt,
+          std::nullopt};
+      event_size = events::event::create_event<code_type::gtid_tagged_log>(
+                       static_cast<std::uint32_t>(offset), header_timestamp,
+                       server_id, {}, {}, body, /*include_checksum=*/true,
+                       buffer)
+                       .calculate_encoded_size();
+    } else {
+      const bool anonymous{kind == gtid_kind::anonymous};
+      const events::gtid_log_post_header post_header{
+          events::gtid_log_flag_set{},
+          anonymous ? binsrv::gtids::uuid{} : gtid.get_uuid(),
+          anonymous ? binsrv::gtids::gno_t{0U} : gtid.get_gno(),
+          events::gtid_log_post_header::known_logical_ts_code,
+          last_committed,
+          sequence_number};
+      const events::gtid_log_body body{timestamp,          std::nullopt,
+                                       transaction_length, server_version,
+                                       std::nullopt,       std::nullopt};
+      if (anonymous) {
+        event_size =
+            events::event::create_event<code_type::anonymous_gtid_log>(
+                static_cast<std::uint32_t>(offset), header_timestamp,
+                server_id, {}, post_header, body, /*include_checksum=*/true,
+                buffer)
+                .calculate_encoded_size();
+      } else {
+        event_size = events::event::create_event<code_type::gtid_log>(
+                         static_cast<std::uint32_t>(offset), header_timestamp,
+                         server_id, {}, post_header, body,
+                         /*include_checksum=*/true, buffer)
+                         .calculate_encoded_size();
+      }
+    }
+    if (transaction_length == event_size + other_events_size) {
+      return {std::cbegin(buffer), std::cend(buffer)};
+    }
+    transaction_length = event_size + other_events_size;
+  }
+  throw std::logic_error{"transaction_length did not converge"};
+}
+
+struct stored_transaction {
+  // empty for an anonymous transaction
+  binsrv::gtids::gtid gtid;
+  // the GTID event (if any) first, as stored
+  std::vector<byte_vector> events;
+};
+
+struct stored_gtid_binlog {
+  events::composite_binlog_name name;
+  byte_vector format_description;
+  byte_vector previous_gtids_log;
+  std::vector<stored_transaction> transactions;
+};
+
+// a damage to one transaction, for GtidModeRejectsDamagedTransactionsCleanly
+enum class transaction_damage : std::uint8_t {
+  none,
+  // transaction_length one event short / a few bytes too long
+  length_short,
+  length_long,
+  // the transaction starts with an ordinary event: its GTID event is missing
+  missing_gtid_event,
+  // a byte of the GTID event's body flipped: its CRC32 does not match
+  bad_checksum
+};
+
+// changes 'transaction_length' of an encoded GTID event (re-encoding it with
+// a different length could change the event's size, so the field is patched
+// in place: it is the varlen / 8-byte field the body codec reads; the
+// simplest exact way is to rebuild the event with the wanted length and keep
+// it only if its size did not change)
+[[nodiscard]] std::optional<byte_vector>
+gtid_event_with_length(gtid_kind kind, const binsrv::gtids::gtid &gtid,
+                       std::uint64_t offset, std::size_t original_size,
+                       std::uint64_t transaction_length,
+                       events::seq_no_t sequence_number) {
+  // make_gtid_event() derives the length from the other events' size, so ask
+  // for the one that yields 'transaction_length'
+  if (transaction_length < original_size) {
+    return std::nullopt;
+  }
+  auto result{make_gtid_event(kind, gtid, offset,
+                              transaction_length - original_size,
+                              sequence_number)};
+  if (std::size(result) != original_size) {
+    return std::nullopt;
+  }
+  return result;
+}
+
+// writes 'binlogs' (each a list of transactions) into a fresh storage: per
+// binlog a FORMAT_DESCRIPTION, a PREVIOUS_GTIDS_LOG holding the GTIDs of
+// the binlogs before it, then the transactions; every binlog but the last is
+// closed. GTIDs are numbered per UUID and tag from 1. 'damage' applies to
+// transaction 'damaged_index' of the last binlog ('overrun': the bytes a
+// length_long transaction_length is too long by).
+[[nodiscard]] std::vector<stored_gtid_binlog>
+store_gtid_binlogs(binsrv::storage &storage,
+                   const std::vector<std::vector<transaction_spec>> &binlogs,
+                   transaction_damage damage = transaction_damage::none,
+                   std::size_t damaged_index = 0U, std::size_t overrun = 7U) {
+  std::vector<stored_gtid_binlog> result;
+  std::map<std::pair<std::size_t, std::size_t>, binsrv::gtids::gno_t> next_gno;
+  binsrv::gtids::gtid_set previous;
+  std::uint32_t event_id{1U};
+  events::seq_no_t sequence_number{1U};
+  auto name{the_binlog};
+  for (std::size_t binlog_index{0U}; binlog_index != std::size(binlogs);
+       ++binlog_index) {
+    if (binlog_index != 0U) {
+      storage.close_binlog();
+      name = name.next();
+    }
+    require(storage.open_binlog(name) == binsrv::open_binlog_status::created,
+            "a binlog was not created");
+    std::uint64_t offset{events::magic_binlog_offset};
+    const auto store{[&](const byte_vector &bytes, bool at_boundary) {
+      storage.write_event(util::const_byte_span{bytes}, at_boundary,
+                          binsrv::gtids::gtid{},
+                          util::ctime_timestamp{std::time_t{1}}, 0ULL);
+      offset += std::size(bytes);
+    }};
+    stored_gtid_binlog binlog{.name = name,
+                              .format_description = make_fde(),
+                              .previous_gtids_log = {},
+                              .transactions = {}};
+    store(binlog.format_description, true);
+    binlog.previous_gtids_log =
+        make_previous_gtids_log(offset, server_id, previous);
+    store(binlog.previous_gtids_log, true);
+    const auto &specs{binlogs[binlog_index]};
+    for (std::size_t index{0U}; index != std::size(specs); ++index) {
+      const auto &spec{specs[index]};
+      stored_transaction transaction{.gtid = {}, .events = {}};
+      if (spec.kind != gtid_kind::anonymous) {
+        const binsrv::gtids::uuid uuid{uuid_pool.at(spec.uuid_index)};
+        const auto tag{spec.kind == gtid_kind::tagged
+                           ? binsrv::gtids::tag{tag_pool.at(spec.tag_index)}
+                           : binsrv::gtids::tag{}};
+        auto &gno{next_gno[{spec.uuid_index, spec.kind == gtid_kind::tagged
+                                                 ? spec.tag_index + 1U
+                                                 : 0U}]};
+        ++gno;
+        transaction.gtid = binsrv::gtids::gtid{uuid, tag, gno};
+        previous.add(transaction.gtid);
+      }
+      std::size_t other_size{0U};
+      for (const auto size : spec.other_event_sizes) {
+        other_size += size;
+      }
+      const bool damaged{damage != transaction_damage::none &&
+                         binlog_index + 1U == std::size(binlogs) &&
+                         index == damaged_index};
+      auto gtid_event{make_gtid_event(spec.kind, transaction.gtid, offset,
+                                      other_size, sequence_number)};
+      if (damaged && (damage == transaction_damage::length_short ||
+                      damage == transaction_damage::length_long)) {
+        const auto actual{std::size(gtid_event) + other_size};
+        const auto wanted{damage == transaction_damage::length_short
+                              ? actual - spec.other_event_sizes.back()
+                              : actual + overrun};
+        if (auto patched{gtid_event_with_length(
+                spec.kind, transaction.gtid, offset, std::size(gtid_event),
+                wanted, sequence_number)};
+            patched.has_value()) {
+          gtid_event = std::move(*patched);
+        }
+      }
+      if (damaged && damage == transaction_damage::bad_checksum) {
+        // a byte of the body (after the common header and the post header,
+        // before the 4-byte footer)
+        gtid_event[std::size(gtid_event) - 6U] ^= std::byte{0x5A};
+      }
+      ++sequence_number;
+      if (!(damaged && damage == transaction_damage::missing_gtid_event)) {
+        store(gtid_event, false);
+        transaction.events.push_back(std::move(gtid_event));
+      }
+      for (std::size_t event{0U}; event != std::size(spec.other_event_sizes);
+           ++event) {
+        auto bytes{make_event(spec.other_event_sizes[event], event_id++)};
+        store(bytes, event + 1U == std::size(spec.other_event_sizes));
+        transaction.events.push_back(std::move(bytes));
+      }
+      binlog.transactions.push_back(std::move(transaction));
+    }
+    storage.flush_event_buffer();
+    result.push_back(std::move(binlog));
+  }
+  return result;
+}
+
+// the FORMAT_DESCRIPTION a GTID-mode dump sends for a stored one: the same,
+// with the post header's create_timestamp zeroed (the simplified rule of
+// sender_single_file_context::process_format_description(); MySQL clears it
+// when auto-positioning chose the file) and the CRC32 footer recomputed
+[[nodiscard]] byte_vector gtid_mode_format_description(byte_vector fde) {
+  // binlog_version (2 bytes) and server_version (50 bytes) come first
+  static constexpr std::size_t create_timestamp_offset{
+      events::common_header_view_base::size_in_bytes + 2U + 50U};
+  static constexpr std::size_t footer_size{4U};
+  for (std::size_t index{0U}; index != 4U; ++index) {
+    fde[create_timestamp_offset + index] = std::byte{0};
+  }
+  const auto payload_size{std::size(fde) - footer_size};
+  const auto crc{util::calculate_crc32(
+      util::const_byte_span{std::data(fde), payload_size})};
+  for (std::size_t index{0U}; index != footer_size; ++index) {
+    fde[payload_size + index] =
+        static_cast<std::byte>((crc >> (8U * index)) & 0xFFU);
+  }
+  return fde;
+}
+
+// what a GTID-mode dump for 'replica' must stream, after each binlog's
+// artificial ROTATE: the FORMAT_DESCRIPTION (see
+// gtid_mode_format_description()), the PREVIOUS_GTIDS_LOG, then every
+// transaction the replica lacks (anonymous ones always)
+[[nodiscard]] std::vector<std::vector<byte_vector>>
+expected_gtid_stream(const std::vector<stored_gtid_binlog> &binlogs,
+                     const binsrv::gtids::gtid_set &replica) {
+  std::vector<std::vector<byte_vector>> result;
+  for (const auto &binlog : binlogs) {
+    std::vector<byte_vector> events{
+        gtid_mode_format_description(binlog.format_description),
+        binlog.previous_gtids_log};
+    for (const auto &transaction : binlog.transactions) {
+      if (transaction.gtid.is_empty() || !replica.contains(transaction.gtid)) {
+        events.insert(std::end(events), std::cbegin(transaction.events),
+                      std::cend(transaction.events));
+      }
+    }
+    result.push_back(std::move(events));
+  }
+  return result;
+}
+
+// small events, and now and then one larger than any block, so that some
+// transactions are larger than the sender's read block
+[[nodiscard]] gs::Generator<std::size_t> other_event_sizes() {
+  return gs::one_of(
+      {gs::integers<std::size_t>(
+           {.min_value = events::common_header_view_base::size_in_bytes,
+            .max_value = 300U}),
+       gs::integers<std::size_t>(
+           {.min_value = events::common_header_view_base::size_in_bytes,
+            .max_value = 300U}),
+       gs::integers<std::size_t>({.min_value = 3000U, .max_value = 9000U})});
+}
+
+[[nodiscard]] gs::Generator<transaction_spec> transaction_specs() {
+  return gs::compose([](const hegel::TestCase &tc) {
+    return transaction_spec{
+        .kind = tc.draw(gs::sampled_from<gtid_kind>(
+            {gtid_kind::untagged, gtid_kind::untagged, gtid_kind::tagged,
+             gtid_kind::anonymous})),
+        .uuid_index = tc.draw(gs::integers<std::size_t>(
+            {.min_value = 0U, .max_value = std::size(uuid_pool) - 1U})),
+        .tag_index = tc.draw(gs::integers<std::size_t>(
+            {.min_value = 0U, .max_value = std::size(tag_pool) - 1U})),
+        .other_event_sizes = tc.draw(
+            gs::vectors(other_event_sizes(), {.min_size = 1U, .max_size = 4U}))};
+  });
+}
+
+// the replica's executed GTIDs: any subset of the stored ones, sometimes
+// with GTIDs of another server
+[[nodiscard]] binsrv::gtids::gtid_set
+draw_replica_set(hegel::TestCase &tc,
+                 const std::vector<stored_gtid_binlog> &binlogs) {
+  binsrv::gtids::gtid_set replica;
+  for (const auto &binlog : binlogs) {
+    for (const auto &transaction : binlog.transactions) {
+      if (!transaction.gtid.is_empty() && tc.draw(gs::booleans())) {
+        replica.add(transaction.gtid);
+      }
+    }
+  }
+  const auto foreign{tc.draw(
+      "foreign_gtids",
+      gs::integers<binsrv::gtids::gno_t>({.min_value = 0U, .max_value = 3U}))};
+  for (binsrv::gtids::gno_t gno{1U}; gno <= foreign; ++gno) {
+    replica.add(foreign_uuid, binsrv::gtids::tag{}, gno);
+  }
+  return replica;
+}
+
+} // anonymous namespace
+
+// a GTID-mode dump streams, per binlog, an artificial ROTATE (at the magic
+// offset; its checksum per the session for the first binlog, per the
+// previous FORMAT_DESCRIPTION after that), the FORMAT_DESCRIPTION (its
+// create_timestamp zeroed, CRC32 valid) and the PREVIOUS_GTIDS_LOG as
+// stored, then exactly the transactions the replica
+// lacks, whole and in stored order: anonymous ones always, ones whose GTID
+// (untagged or tagged) the replica has never, also when a transaction is
+// larger than the read block
+BOOST_AUTO_TEST_CASE(GtidModeStreamsExactlyTheMissingTransactions) {
+  run_property([](hegel::TestCase &tc) {
+    const temp_dir directory;
+    const auto binlogs{tc.draw(
+        "binlogs", gs::vectors(gs::vectors(transaction_specs(),
+                                           {.min_size = 0U, .max_size = 6U}),
+                               {.min_size = 1U, .max_size = 3U}))};
+    const bool session_checksum{tc.draw("checksum", gs::booleans())};
+    const auto block_size{tc.draw("block", block_sizes())};
+
+    const auto storage{make_storage(write_config(directory.path()))};
+    const auto stored{store_gtid_binlogs(*storage, binlogs)};
+    const auto replica{draw_replica_set(tc, stored)};
+    const auto expected{expected_gtid_stream(stored, replica)};
+    std::size_t expected_count{0U};
+    for (const auto &binlog : expected) {
+      expected_count += 1U + std::size(binlog);
+    }
+
+    std::ostringstream label;
+    label << "replica has '" << replica << "', block " << block_size;
+    operations::sender_context reader{std::make_shared<binsrv::null_logger>(),
+                                      storage,
+                                      block_size,
+                                      binsrv::replication_mode_type::gtid,
+                                      std::string_view{},
+                                      events::magic_binlog_offset,
+                                      replica,
+                                      session_checksum};
+    const auto outcome{stream_until_end(reader, expected_count + 1U)};
+    require(!outcome.failed, label.str() + ": the GTID dump failed after " +
+                                 std::to_string(std::size(outcome.events)) +
+                                 " event(s)");
+    require(std::size(outcome.events) == expected_count,
+            label.str() + ": " + std::to_string(std::size(outcome.events)) +
+                " event(s) streamed, expected " +
+                std::to_string(expected_count));
+    std::size_t index{0U};
+    for (std::size_t binlog{0U}; binlog != std::size(expected); ++binlog) {
+      const auto &rotate{outcome.events[index]};
+      require(is_artificial_rotate_to(rotate, stored[binlog].name,
+                                      events::magic_binlog_offset),
+              label.str() + ": event " + std::to_string(index) +
+                  " is not the artificial ROTATE to " +
+                  stored[binlog].name.str());
+      require(rotate_has_checksum(rotate) ==
+                  (binlog == 0U ? session_checksum : true),
+              label.str() + ": the artificial ROTATE to " +
+                  stored[binlog].name.str() + " has the wrong checksum");
+      ++index;
+      for (std::size_t event{0U}; event != std::size(expected[binlog]);
+           ++event, ++index) {
+        require(outcome.events[index] == expected[binlog][event],
+                label.str() + ": event " + std::to_string(index) + " (" +
+                    stored[binlog].name.str() + ", expected event " +
+                    std::to_string(event) +
+                    ") differs from the stored transaction data");
+      }
+    }
+  });
+}
+
+// a damaged transaction in the storage (a transaction_length one event
+// short or 1-64 bytes too long, a missing GTID event, a GTID event whose
+// checksum does not match) never makes a GTID-mode dump stream anything but
+// stored events (the FORMAT_DESCRIPTION as a GTID-mode dump sends it), nor
+// end the process: the dump either fails with an
+// exception or streams exactly what it would without the damage
+BOOST_AUTO_TEST_CASE(GtidModeRejectsDamagedTransactionsCleanly) {
+  run_property([](hegel::TestCase &tc) {
+    const temp_dir directory;
+    auto transactions{tc.draw(
+        "transactions",
+        gs::vectors(transaction_specs(), {.min_size = 1U, .max_size = 6U}))};
+    const auto damaged_index{tc.draw(
+        "damaged_index",
+        gs::integers<std::size_t>(
+            {.min_value = 0U, .max_value = std::size(transactions) - 1U}))};
+    const auto damage{tc.draw(
+        "damage", gs::sampled_from<transaction_damage>(
+                      {transaction_damage::length_short,
+                       transaction_damage::length_long,
+                       transaction_damage::missing_gtid_event,
+                       transaction_damage::bad_checksum}))};
+    if (damage == transaction_damage::length_short &&
+        std::size(transactions[damaged_index].other_event_sizes) < 2U) {
+      // a transaction one event short must keep at least one other event
+      transactions[damaged_index].other_event_sizes.push_back(
+          events::common_header_view_base::size_in_bytes);
+    }
+    const auto overrun{tc.draw(
+        "overrun",
+        gs::integers<std::size_t>({.min_value = 1U, .max_value = 64U}))};
+    const bool session_checksum{tc.draw("checksum", gs::booleans())};
+    const auto block_size{tc.draw("block", block_sizes())};
+
+    // the undamaged stream, from a storage of its own
+    const temp_dir clean_directory;
+    const auto clean_storage{make_storage(write_config(clean_directory.path()))};
+    const auto clean{store_gtid_binlogs(*clean_storage, {transactions})};
+
+    const auto storage{make_storage(write_config(directory.path()))};
+    const auto stored{
+        store_gtid_binlogs(*storage, {transactions}, damage, damaged_index,
+                           overrun)};
+    const auto replica{draw_replica_set(tc, clean)};
+    // the undamaged transactions with the damaged storage's own preamble
+    // (the FORMAT_DESCRIPTION carries the time it was generated at)
+    auto undamaged{clean};
+    undamaged.front().format_description = stored.front().format_description;
+    undamaged.front().previous_gtids_log = stored.front().previous_gtids_log;
+    const auto expected{expected_gtid_stream(undamaged, replica)};
+
+    std::vector<byte_vector> stored_events{
+        gtid_mode_format_description(stored.front().format_description),
+        stored.front().previous_gtids_log};
+    for (const auto &transaction : stored.front().transactions) {
+      stored_events.insert(std::end(stored_events),
+                           std::cbegin(transaction.events),
+                           std::cend(transaction.events));
+    }
+    std::ostringstream label;
+    label << "damage " << static_cast<int>(damage) << " to transaction "
+          << damaged_index << ", replica has '" << replica << "', block "
+          << block_size;
+    operations::sender_context reader{std::make_shared<binsrv::null_logger>(),
+                                      storage,
+                                      block_size,
+                                      binsrv::replication_mode_type::gtid,
+                                      std::string_view{},
+                                      events::magic_binlog_offset,
+                                      replica,
+                                      session_checksum};
+    const auto outcome{stream_until_end(reader, std::size(stored_events) + 1U)};
+    for (std::size_t index{1U}; index < std::size(outcome.events); ++index) {
+      require(std::ranges::find(stored_events, outcome.events[index]) !=
+                  std::cend(stored_events),
+              label.str() + ": event " + std::to_string(index) +
+                  " is not a stored event");
+    }
+    if (!outcome.failed) {
+      const auto &clean_events{expected.front()};
+      bool same{std::size(outcome.events) == std::size(clean_events) + 1U};
+      for (std::size_t index{0U}; same && index != std::size(clean_events);
+           ++index) {
+        same = outcome.events[index + 1U] == clean_events[index];
+      }
+      require(same, label.str() + ": the dump accepted the damage and "
+                                  "streamed " +
+                        std::to_string(std::size(outcome.events)) +
+                        " event(s) that differ from the undamaged stream (" +
+                        std::to_string(std::size(clean_events) + 1U) + ")");
+    }
+  });
+}
+
+// what GtidModeRejectsDamagedTransactionsCleanly found, made deterministic:
+// a transaction the replica already has, whose transaction_length is too
+// long, is skipped by that length to a point inside the next transaction's
+// GTID event, whose bytes are then read as an event header. With an invalid
+// type code there, the exception escapes a noexcept accessor of
+// indexed_event_block and the process terminates (ticket 39, PBS-112). Every
+// overrun of 1-64 bytes into a following untagged, tagged or anonymous
+// transaction must instead fail the dump with an exception, or (when the
+// bytes happen to line up) stream what the undamaged binlog holds
+BOOST_AUTO_TEST_CASE(GtidModeSkipsATooLongTransactionWithoutTerminating) {
+  for (const auto next_kind :
+       {gtid_kind::untagged, gtid_kind::tagged, gtid_kind::anonymous}) {
+    for (std::size_t overrun{1U}; overrun <= 64U; ++overrun) {
+      const temp_dir directory;
+      const std::vector<transaction_spec> transactions{
+          {.kind = gtid_kind::untagged,
+           .uuid_index = 0U,
+           .tag_index = 0U,
+           .other_event_sizes = {100U}},
+          {.kind = next_kind,
+           .uuid_index = 1U,
+           .tag_index = 0U,
+           .other_event_sizes = {100U}}};
+      const auto storage{make_storage(write_config(directory.path()))};
+      const auto stored{store_gtid_binlogs(*storage, {transactions},
+                                           transaction_damage::length_long,
+                                           0U, overrun)};
+      binsrv::gtids::gtid_set replica;
+      replica.add(stored.front().transactions.front().gtid);
+      operations::sender_context reader{
+          std::make_shared<binsrv::null_logger>(),
+          storage,
+          operations::sender_single_file_context::min_allowed_block_size,
+          binsrv::replication_mode_type::gtid,
+          std::string_view{},
+          events::magic_binlog_offset,
+          replica,
+          /*session_source_binlog_checksum=*/true};
+      const auto outcome{stream_until_end(reader, 8U)};
+      const auto &second{stored.front().transactions.back().events};
+      BOOST_TEST_INFO("overrun " << overrun << " into a "
+                                 << static_cast<int>(next_kind)
+                                 << " transaction");
+      BOOST_CHECK(outcome.failed ||
+                  (std::size(outcome.events) == 3U + std::size(second) &&
+                   std::equal(std::cbegin(second), std::cend(second),
+                              std::next(std::cbegin(outcome.events), 3))));
+    }
+  }
+}

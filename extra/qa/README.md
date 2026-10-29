@@ -234,7 +234,7 @@ bucket). The `--s3-*` options default to that server and bucket.
 
 - **`s3_upload_volume.py`** — measures how much data `fetch` uploads to S3 for
   one binlog of a given size across several `storage.checkpoint_size` values,
-  through the proxy's byte counters (this measurement surfaced ticket 17, the
+  through the proxy's byte counters (this measurement surfaced ticket 17, PBS-82, the
   whole-binlog re-upload at every checkpoint).
 
 The `fetch_crash_test.py` state machine also runs against S3 with

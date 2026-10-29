@@ -109,11 +109,13 @@ QA_S3_EXAMPLES=${QA_S3_EXAMPLES:-5}
 S3_BUCKET_DIR=${S3_BUCKET_DIR:-$WS/s3/data/pbs-mtr}
 # the rotation of the heavier QA harnesses: '<weekday>:<harness>/<mode>'
 # (weekday 1-7 is Monday-Sunday, date +%u); 4-15 min a night (README.md)
-QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 2:disk_fault_sweep/position 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 7:network_fault_test/gtid"}
+QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 2:disk_fault_sweep/position 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 7:network_fault_test/gtid 7:pull_soak_test/position"}
 QA_ROTATION_DAY=${QA_ROTATION_DAY:-$(date -u +%u)}
 # each fuzz connection takes about 1 s since the listener always does full
 # caching_sha2_password authentication (PBS-10), 3000 would take 50 min
 QA_FUZZ_CONNECTIONS=${QA_FUZZ_CONNECTIONS:-600}
+# pull_soak_test: seconds of load (the run takes about 10 min more)
+QA_SOAK_SECONDS=${QA_SOAK_SECONDS:-7200}
 # release stage: one short fetch_crash_test run with the release binary
 RELEASE_QA_EXAMPLES=${RELEASE_QA_EXAMPLES:-5}
 export PYTHONPATH=${PYTHONPATH:-$WS/qa/pylib}
@@ -552,7 +554,9 @@ if want qa; then
     # library list)
     build=asan_gcc14
     binsrv=$asan_binsrv
-    if [ "$harness" = disk_fault_sweep ]; then
+    # the soak test watches pull's memory: ASan's quarantine would hide
+    # the trend, so it uses the debug build too
+    if [ "$harness" = disk_fault_sweep ] || [ "$harness" = pull_soak_test ]; then
       build=debug_gcc14
       binsrv=$debug_binsrv
     fi
@@ -610,6 +614,13 @@ if want qa; then
         qa_run pull_load_test "pull_load_test ($mode)" \
           "${common[@]}" --workdir "$out/qa/pl-$mode" \
           --port $((QA_PORT + 150)) --timeout 1800 ;;
+      pull_soak_test)
+        # pull for QA_SOAK_SECONDS under churn: memory, descriptors,
+        # threads and log growth, exact copies at the end
+        qa_run pull_soak_test "pull_soak_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/ps-$mode" \
+          --port $((QA_PORT + 170)) --duration "$QA_SOAK_SECONDS" \
+          --timeout $((QA_SOAK_SECONDS + 3600)) ;;
       *) log "unknown QA_ROTATION harness $harness" ;;
     esac
     log "$harness ($mode) done in $(( ($(date +%s) - stage_started) / 60 )) min"

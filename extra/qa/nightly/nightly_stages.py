@@ -313,6 +313,8 @@ def harness_command(args, workdir: Path) -> list:
             "--storage", "s3", "--s3-endpoint", args.s3_endpoint,
             "--s3-proxy-port", str(args.s3_proxy_port),
             "--s3-bucket-dir", str(args.s3_bucket_dir)]
+    if args.harness == "pull_soak_test":
+        return script + common + mode + ["--duration", str(args.duration)]
     if args.harness in ("source_change_test", "large_binlog_test",
                         "pull_load_test"):
         return script + common + mode
@@ -327,7 +329,7 @@ def harness_cases(args, returncode: int, output: str, lines: list,
     wall-clock times of a case that has its own JSON line."""
     objects = json_lines(lines)
     mode = args.mode or "position"
-    if args.harness == "pull_load_test":
+    if args.harness in ("pull_load_test", "pull_soak_test"):
         cases = []
         for result, _ in objects:
             if "case" not in result:
@@ -908,6 +910,8 @@ def main():
                         help="listener_fuzz_test connections")
     parser.add_argument("--seed", type=int, default=1,
                         help="listener_fuzz_test seed")
+    parser.add_argument("--duration", type=int, default=7200,
+                        help="pull_soak_test seconds of load")
     # fuzz
     parser.add_argument("--target", help="the libFuzzer target's name")
     parser.add_argument("--binary", type=Path, help="the libFuzzer target")

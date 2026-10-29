@@ -291,7 +291,27 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_heartbeat_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/pull-heartbeat
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_load_test.py \
   --mysql-basedir <dist> --binsrv <asan-binary> --workdir ~/ws/qa/pull-load
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_soak_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/pull-soak \
+  --duration 900
 ```
+
+`pull_soak_test.py` runs `pull` for a long time (`--duration`, 2 h by
+default) under churn: a steady workload with rotations and an occasional
+large transaction, three long-lived `mysqlbinlog --stop-never` clients, a
+replica stopped and started every 10 minutes, and a short client every 15 s
+(most copy from a random closed binlog to the end and exit, some are killed
+during the dump). Every minute it samples `pull`'s resident memory, open
+file descriptors and threads (`/proc`), its log size and the storage size
+(`samples.json`). Cases: `alive`; `memory`, `file_descriptors`, `threads`
+(the last quarter of the run against the second, after a quarter of
+warm-up); `log` (growth per hour at info level, and no error lines but the
+known ones of ticket 42); `copies`, `replica`, `still_serving` (exact data at
+the end). The first 15-minute run (2026-10-29, debug build) was flat (about
+23 MB, 16 descriptors, 2 threads) and exact, but the log grew 67 MB per hour:
+at info level `pull` logs every event it streams, per client (89% of the
+lines; ticket 45), and a client that dies during a dump is logged as an
+error (EPIPE, part of ticket 42).
 
 `repro_broken_checkpointing.py` is a self-contained reproducer kept from an
 earlier finding (checkpoint settings having no effect); it drives an existing
@@ -337,7 +357,7 @@ server rather than starting one.
      | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid) | ASan |
      | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`) | ASan |
      | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position) | debug / ASan |
-     | Sun | `network_fault_test.py` (gtid) | ASan |
+     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default) | ASan / debug |
 
      `QA_ROTATION_DAY` overrides the day (`1`-`7`, a comma list such as
      `2,4`, `all` or `none`), e.g. to try Tuesday's set now:
@@ -475,7 +495,8 @@ server rather than starting one.
   `query_race_test list_next_to_pull` (ticket 29),
   `pull_heartbeat_test quiet_after_rotation` (ticket 40, PBS-113),
   `large_binlog_test position/transaction_over_4gib` (ticket 41, PBS-114),
-  `pull_load_test position/shutdown` (ticket 43, PBS-116) and
+  `pull_load_test position/shutdown` (ticket 43, PBS-116),
+  `pull_soak_test position/log` (ticket 45: info-level log volume) and
   `fetch_crash_test gtid` (ticket 14, when the run generates a fetch /
   `FLUSH BINARY LOGS` / fetch sequence).
 - **`ci_property_tests.sh`** — what the CI job *GCC 14 Debug Property Tests*

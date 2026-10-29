@@ -435,6 +435,7 @@ def main():
             "port": pull_port, "server_id": 142,
             "server_uuid": "00000000-0000-0000-0000-00000000008e",
             "read_timeout": 3, "write_timeout": 3,
+            "require_secure_transport": False,
             "auth_rsa_private_key": str(AUTH_RSA_PRIVATE_KEY),
             "authentication": {"user": PULL_USER, "password": PULL_PASSWORD,
                                "plugin": "caching_sha2_password"}}

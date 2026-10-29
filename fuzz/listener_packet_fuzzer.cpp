@@ -138,7 +138,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *data,
   frame_reader reader{data, size};
   minimysql::network_buffer_type frame;
   try {
-    minimysql::connection_context context{"rpl", "password"};
+    minimysql::connection_context context{false, "rpl", "password"};
     [[maybe_unused]] const auto greeting{
         context.generate_encoded_server_greeting()};
     if (!reader.next(frame)) {

@@ -73,6 +73,7 @@ def start_pull(binsrv, pull_port: int) -> subprocess.Popen:
         "port": pull_port, "server_id": 142,
         "server_uuid": "00000000-0000-0000-0000-00000000008e",
         "read_timeout": 60, "write_timeout": 60,
+        "require_secure_transport": False,
         # the listener always does caching_sha2_password full
         # authentication, which over a non-TLS connection needs its RSA
         # key (PBS-33 / PBS-34); the replica uses GET_SOURCE_PUBLIC_KEY

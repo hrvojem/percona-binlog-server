@@ -709,7 +709,8 @@ const std::vector<std::string> &config_defects() {
       "backend",             "checkpoint_size",
       "checkpoint_interval", "encryption_format",
       "encryption_cipher",   "missing_field",
-      "auth_rsa_private_key_empty"};
+      "auth_rsa_private_key_empty", "ssl_missing",
+      "ssl_cert_empty",    "ssl_key_empty"};
   return defects;
 }
 
@@ -910,12 +911,38 @@ config_specs(std::string forced_defect = {}) {
     source["write_timeout"] = is_defect("source_write_timeout")
                                   ? std::int64_t{0}
                                   : valid_uint32();
-    // the RSA key file is only read when the listener starts, so any
-    // non-empty path is valid here
+    // TLS for the listener (PBS-31): require_secure_transport needs the
+    // ssl section; without it an RSA key, if given, must not be empty; an ssl
+    // section needs a non-empty cert and key (the files are only read when
+    // the listener starts, so any non-empty path is valid here)
+    const bool ssl_defect{is_defect("ssl_missing") ||
+                          is_defect("ssl_cert_empty") ||
+                          is_defect("ssl_key_empty")};
+    bool require_secure_transport{tc.draw(gs::booleans())};
+    if (is_defect("auth_rsa_private_key_empty")) {
+      require_secure_transport = false;
+    } else if (is_defect("ssl_missing")) {
+      require_secure_transport = true;
+    }
+    source["require_secure_transport"] = require_secure_transport;
+    if (!is_defect("ssl_missing") &&
+        (require_secure_transport || ssl_defect || tc.draw(gs::booleans()))) {
+      source["ssl"] = boost::json::object{
+          {"cert", is_defect("ssl_cert_empty")
+                       ? std::string{}
+                       : std::string{"/nonexistent/source-cert.pem"}},
+          {"key", is_defect("ssl_key_empty")
+                      ? std::string{}
+                      : std::string{"/nonexistent/source-key.pem"}}};
+    }
     if (is_defect("auth_rsa_private_key_empty")) {
       source["auth_rsa_private_key"] = "";
     } else if (tc.draw(gs::booleans())) {
-      source["auth_rsa_private_key"] = "/nonexistent/private_key.pem";
+      // empty only when secure transport is required, where it is allowed
+      source["auth_rsa_private_key"] =
+          require_secure_transport && tc.draw(gs::booleans())
+              ? std::string{}
+              : std::string{"/nonexistent/private_key.pem"};
     }
     source["authentication"] = boost::json::object{
         {"user", is_defect("authentication_user") ? std::string{}
@@ -973,6 +1000,7 @@ config_specs(std::string forced_defect = {}) {
                {"replication_source", "authentication"},
                {"replication_source", "server_id"},
                {"replication_source", "server_uuid"},
+               {"replication_source", "require_secure_transport"},
                {"storage", "uri"},
                {"storage", ""},
                {"logger", ""}}))};
@@ -1726,6 +1754,13 @@ void check_config_file(const config_spec &spec) {
               source.get<"read_timeout">());
   same_number("replication_source", "write_timeout",
               source.get<"write_timeout">());
+  require(json_at(json, "replication_source", "require_secure_transport")
+                  .as_bool() == source.get<"require_secure_transport">(),
+          "replication_source.require_secure_transport differs in '" + text +
+              "'");
+  require(json_at(json, "replication_source", "ssl").is_object() ==
+              source.get<"ssl">().has_value(),
+          "replication_source.ssl presence differs in '" + text + "'");
   const auto &storage{root.get<"storage">()};
   same_string("storage", "backend",
               boost::lexical_cast<std::string>(storage.get<"backend">()));

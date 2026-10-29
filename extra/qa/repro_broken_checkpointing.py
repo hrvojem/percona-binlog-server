@@ -127,6 +127,7 @@ def write_config(args, workdir, storage_dir):
             "port": free_tcp_port(), "server_id": 142,
             "server_uuid": "00000000-0000-0000-0000-00000000008e",
             "read_timeout": 60, "write_timeout": 60,
+            "require_secure_transport": False,
             "authentication": {"user": "rpl", "password": "password",
                                "plugin": "caching_sha2_password"},
         },

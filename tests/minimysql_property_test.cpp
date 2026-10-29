@@ -203,8 +203,9 @@ std::ostream &operator<<(std::ostream &output, const credentials &value) {
     const credentials &server_credentials,
     const credentials &client_credentials,
     const std::optional<std::string> &challenge_override = std::nullopt) {
-  minimysql::connection_context context{server_credentials.username,
-                                        server_credentials.password};
+  minimysql::connection_context context{
+      /*ssl_tls_available=*/false, server_credentials.username,
+      server_credentials.password};
   const auto server_greeting{context.generate_encoded_server_greeting()};
   const auto capabilities{context.get_server_capabilities()};
   const auto challenge{decode_challenge(server_greeting, capabilities)};
@@ -244,7 +245,8 @@ struct authenticated_session {
 [[nodiscard]] authenticated_session make_authenticated_session() {
   const credentials server{.username = "rpl", .password = "password"};
   authenticated_session result{
-      .context = minimysql::connection_context{server.username,
+      .context = minimysql::connection_context{/*ssl_tls_available=*/false,
+                                               server.username,
                                                server.password},
       .capabilities = {}};
   const auto server_greeting{result.context.generate_encoded_server_greeting()};
@@ -474,7 +476,7 @@ BOOST_AUTO_TEST_CASE(MinimysqlParsesCommands) {
 BOOST_AUTO_TEST_CASE(MinimysqlRejectsCorruptedPacketsCleanly) {
   run_property([](hegel::TestCase &tc) {
     const auto corrupt_greeting{tc.draw("corrupt_greeting", gs::booleans())};
-    minimysql::connection_context context{"rpl", "password"};
+    minimysql::connection_context context{false, "rpl", "password"};
     network_buffer_type packet;
     if (corrupt_greeting) {
       const auto server_greeting{context.generate_encoded_server_greeting()};
@@ -555,7 +557,7 @@ BOOST_AUTO_TEST_CASE(MinimysqlBinlogEventFramesRoundTrip) {
       event[index] = static_cast<std::byte>((index * 31U + 7U) & 0xFFU);
     }
 
-    minimysql::connection_context context{"rpl", "password"};
+    minimysql::connection_context context{false, "rpl", "password"};
     context.enter_command_loop_iteration();
     network_buffer_type frames;
     try {

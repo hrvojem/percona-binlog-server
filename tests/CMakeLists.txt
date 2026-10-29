@@ -367,6 +367,8 @@ if(WITH_PROPERTY_TESTS)
       binsrv::lib_util
       Boost::headers Boost::asio
       MySQL::client
+      # network_service sets up TLS for the listener (PBS-31)
+      OpenSSL::SSL
       Boost::unit_test_framework
       hegel
   )

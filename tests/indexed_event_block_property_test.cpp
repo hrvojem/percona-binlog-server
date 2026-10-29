@@ -190,7 +190,7 @@ BOOST_AUTO_TEST_CASE(IndexedEventBlockIndexesOnlyCompleteEvents) {
     require(block->get_parsed_size() <= std::size(original),
             "the block is larger than the input");
     std::size_t offset{0U};
-    for (std::size_t index{0U}; index < block->get_number_of_events();
+    for (std::size_t index{0U}; index < block->get_number_of_matching_events();
          ++index) {
       const auto event{block->get_event(index)};
       const auto label{"event " + std::to_string(index + 1U) + " at offset " +

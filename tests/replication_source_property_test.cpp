@@ -2076,7 +2076,6 @@ BOOST_AUTO_TEST_CASE(ReplicationSourceDumpGtidSendsTheMissingTransactions) {
     using dump_gtid = cp::message::client::BinlogDumpGtid;
     stdx::flags<dump_gtid::Flags> flags{};
     flags |= dump_gtid::Flags::non_blocking;
-    flags |= dump_gtid::Flags::through_gtid;
     static constexpr std::uint32_t replica_server_id{2U};
     client.write_frame(encode_client_frame(
         0U,

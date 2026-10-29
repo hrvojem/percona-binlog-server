@@ -142,6 +142,7 @@
 #include "binsrv/basic_storage_backend.hpp"
 #include "binsrv/main_config.hpp"
 #include "binsrv/null_logger.hpp"
+#include "binsrv/replication_mode_type.hpp"
 #include "binsrv/storage.hpp"
 #include "binsrv/storage_backend_factory.hpp"
 #include "binsrv/storage_backend_type.hpp"
@@ -2044,9 +2045,14 @@ public:
     restart_tailing_reader();
     if (properties_ == checked_properties::concurrent_read_back) {
       concurrent_reader_ = std::make_unique<operations::sender_context>(
-          std::make_shared<binsrv::null_logger>(), storage_,
-          settings_.tailing_reader_block_size, std::string_view{},
-          binsrv::events::magic_binlog_offset, settings_.reader_checksum);
+          std::make_shared<binsrv::null_logger>(),
+          storage_,
+          settings_.tailing_reader_block_size,
+          binsrv::replication_mode_type::position,
+          std::string_view{},
+          binsrv::events::magic_binlog_offset,
+          binsrv::gtids::gtid_set{},
+          settings_.reader_checksum);
       concurrent_thread_ = std::jthread{[this](const std::stop_token &stop) {
         read_concurrently(stop, *concurrent_reader_, concurrent_result_);
       }};
@@ -2575,9 +2581,13 @@ public:
         .transactions_before = state.transactions_on_disk,
         .position = records.back().size};
     resuming_reader_ = std::make_unique<operations::sender_context>(
-        std::make_shared<binsrv::null_logger>(), storage_,
+        std::make_shared<binsrv::null_logger>(),
+        storage_,
         settings_.fresh_reader_block_size,
-        model_.get_current_binlog().name.str(), resuming_start_.position,
+        binsrv::replication_mode_type::position,
+        model_.get_current_binlog().name.str(),
+        resuming_start_.position,
+        binsrv::gtids::gtid_set{},
         settings_.reader_checksum);
     resuming_thread_ = std::jthread{[this](const std::stop_token &stop) {
       read_concurrently(stop, *resuming_reader_, resuming_result_);
@@ -2625,9 +2635,13 @@ private:
     tailing_received_.clear();
     if (properties_ == checked_properties::read_back) {
       tailing_reader_ = std::make_unique<operations::sender_context>(
-          std::make_shared<binsrv::null_logger>(), storage_,
-          settings_.tailing_reader_block_size, std::string_view{},
+          std::make_shared<binsrv::null_logger>(),
+          storage_,
+          settings_.tailing_reader_block_size,
+          binsrv::replication_mode_type::position,
+          std::string_view{},
           binsrv::events::magic_binlog_offset,
+          binsrv::gtids::gtid_set{},
           /*session_source_binlog_checksum=*/false);
     }
   }
@@ -3253,9 +3267,13 @@ private:
       require_same_events(tailing, expected, "tailing reader");
 
       operations::sender_context fresh_reader{
-          std::make_shared<binsrv::null_logger>(), storage_,
-          settings_.fresh_reader_block_size, std::string_view{},
+          std::make_shared<binsrv::null_logger>(),
+          storage_,
+          settings_.fresh_reader_block_size,
+          binsrv::replication_mode_type::position,
+          std::string_view{},
           binsrv::events::magic_binlog_offset,
+          binsrv::gtids::gtid_set{},
           /*session_source_binlog_checksum=*/false};
       event_list fresh_received;
       read_until_end(fresh_reader, fresh_received,

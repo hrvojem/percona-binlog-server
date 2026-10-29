@@ -68,6 +68,7 @@
 
 #include "operations/event_generation_helpers.hpp"
 #include "binsrv/basic_storage_backend.hpp"
+#include "binsrv/replication_mode_type.hpp"
 #include "binsrv/storage_backend_factory.hpp"
 
 #include "operations/sender_context.hpp"
@@ -580,8 +581,14 @@ BOOST_AUTO_TEST_CASE(FromBeginningStreamsPreambleAndEvents) {
         tc.draw("previous_gtids", previous_gtid_sets())};
     const auto seeded{seed(directory.path(), sizes, previous_gtids)};
     operations::sender_context reader{
-        std::make_shared<binsrv::null_logger>(), seeded.storage, block_size,
-        std::string_view{}, events::magic_binlog_offset, session_checksum};
+        std::make_shared<binsrv::null_logger>(),
+        seeded.storage,
+        block_size,
+        binsrv::replication_mode_type::position,
+        std::string_view{},
+        events::magic_binlog_offset,
+        binsrv::gtids::gtid_set{},
+        session_checksum};
 
     const auto emitted{drain(reader, std::size(seeded.events) + 1U)};
 
@@ -639,8 +646,14 @@ BOOST_AUTO_TEST_CASE(FromPositionStreamsArtificialPreambleAndRemainingEvents) {
     const auto resume_position{seeded.offsets[resume_index]};
 
     operations::sender_context reader{
-        std::make_shared<binsrv::null_logger>(), seeded.storage, block_size,
-        std::string_view{the_binlog.str()}, resume_position, session_checksum};
+        std::make_shared<binsrv::null_logger>(),
+        seeded.storage,
+        block_size,
+        binsrv::replication_mode_type::position,
+        std::string_view{the_binlog.str()},
+        resume_position,
+        binsrv::gtids::gtid_set{},
+        session_checksum};
 
     const auto remaining{std::size(seeded.events) - resume_index};
     const auto emitted{drain(reader, remaining + 2U)};
@@ -702,12 +715,15 @@ BOOST_AUTO_TEST_CASE(EveryStoredByteIsFetchedOnce) {
                                                  : the_binlog.str()};
 
     reads.ranges.clear();
-    operations::sender_context reader{std::make_shared<binsrv::null_logger>(),
-                                      seeded.storage,
-                                      block_size,
-                                      binlog_name,
-                                      start_position,
-                                      /*session_source_binlog_checksum=*/true};
+    operations::sender_context reader{
+        std::make_shared<binsrv::null_logger>(),
+        seeded.storage,
+        block_size,
+        binsrv::replication_mode_type::position,
+        binlog_name,
+        start_position,
+        binsrv::gtids::gtid_set{},
+        /*session_source_binlog_checksum=*/true};
 
     // artificial ROTATE (+ artificial FDE when resuming) + the stored events
     const auto remaining{std::size(seeded.events) - start_index};
@@ -774,8 +790,10 @@ BOOST_AUTO_TEST_CASE(PartialEventAtEofFailsCleanly) {
         std::make_shared<binsrv::null_logger>(),
         seeded.storage,
         block_size,
+        binsrv::replication_mode_type::position,
         std::string_view{},
         events::magic_binlog_offset,
+        binsrv::gtids::gtid_set{},
         /*session_source_binlog_checksum=*/true};
 
     // the limit leaves room for the partial event, so a reader that streams
@@ -832,8 +850,10 @@ BOOST_AUTO_TEST_CASE(PartialEventBeforeRotationFails) {
         std::make_shared<binsrv::null_logger>(),
         seeded.storage,
         block_size,
+        binsrv::replication_mode_type::position,
         std::string_view{},
         events::magic_binlog_offset,
+        binsrv::gtids::gtid_set{},
         /*session_source_binlog_checksum=*/true};
 
     // the limit leaves room for every event of both files, so a reader that
@@ -877,8 +897,10 @@ BOOST_AUTO_TEST_CASE(EmptyStorageIsPolledUntilTheBinlogArrives) {
         std::make_shared<binsrv::null_logger>(),
         storage,
         block_size,
+        binsrv::replication_mode_type::position,
         binlog_name,
         events::magic_binlog_offset,
+        binsrv::gtids::gtid_set{},
         /*session_source_binlog_checksum=*/true};
 
     for (std::size_t poll{0U}; poll != polls; ++poll) {
@@ -939,8 +961,10 @@ BOOST_AUTO_TEST_CASE(EmptyStorageIsPolledUntilTheBinlogArrivesFromPosition) {
         std::make_shared<binsrv::null_logger>(),
         storage,
         block_size,
+        binsrv::replication_mode_type::position,
         the_binlog.str(),
         resume_position,
+        binsrv::gtids::gtid_set{},
         /*session_source_binlog_checksum=*/true};
 
     for (std::size_t poll{0U}; poll != polls; ++poll) {
@@ -1008,8 +1032,10 @@ BOOST_AUTO_TEST_CASE(SwitchToTheNextBinlogEmitsArtificialRotate) {
         std::make_shared<binsrv::null_logger>(),
         seeded.storage,
         block_size,
+        binsrv::replication_mode_type::position,
         std::string_view{},
         events::magic_binlog_offset,
+        binsrv::gtids::gtid_set{},
         /*session_source_binlog_checksum=*/true};
 
     const auto limit{std::size(seeded.events) + std::size(next_sizes) + 4U};
@@ -1102,8 +1128,10 @@ BOOST_AUTO_TEST_CASE(IdleHeartbeatReportsTheReplicaCoordinates) {
         std::make_shared<binsrv::null_logger>(),
         seeded.storage,
         block_size,
+        binsrv::replication_mode_type::position,
         from_position ? the_binlog.str() : std::string{},
         seeded.offsets[start_index],
+        binsrv::gtids::gtid_set{},
         session_checksum};
 
     heartbeat_testing::replica_coordinates coordinates;
@@ -1166,8 +1194,10 @@ BOOST_AUTO_TEST_CASE(MagicOnlyBinlogIsPolledUntilItsEventsArrive) {
         std::make_shared<binsrv::null_logger>(),
         storage,
         block_size,
+        binsrv::replication_mode_type::position,
         the_binlog.str(),
         start_position,
+        binsrv::gtids::gtid_set{},
         /*session_source_binlog_checksum=*/true};
 
     for (std::size_t poll{0U}; poll != polls; ++poll) {
@@ -1268,8 +1298,10 @@ BOOST_AUTO_TEST_CASE(PurgedStorageServesTheSurvivingBinlogs) {
           std::make_shared<binsrv::null_logger>(),
           storage,
           block_size,
+          binsrv::replication_mode_type::position,
           names[purged_index].str(),
           events::magic_binlog_offset,
+          binsrv::gtids::gtid_set{},
           /*session_source_binlog_checksum=*/true};
       const auto outcome{stream_until_end(reader, 4U)};
       require(outcome.failed && outcome.events.empty(),
@@ -1284,8 +1316,10 @@ BOOST_AUTO_TEST_CASE(PurgedStorageServesTheSurvivingBinlogs) {
         std::make_shared<binsrv::null_logger>(),
         storage,
         block_size,
+        binsrv::replication_mode_type::position,
         std::string_view{},
         events::magic_binlog_offset,
+        binsrv::gtids::gtid_set{},
         /*session_source_binlog_checksum=*/true};
     std::size_t expected_count{0U};
     for (std::size_t index{purge_count}; index != std::size(names); ++index) {
@@ -1347,8 +1381,10 @@ BOOST_AUTO_TEST_CASE(MisalignedDumpPositionNeverStreamsGarbage) {
         std::make_shared<binsrv::null_logger>(),
         seeded.storage,
         block_size,
+        binsrv::replication_mode_type::position,
         the_binlog.str(),
         position,
+        binsrv::gtids::gtid_set{},
         /*session_source_binlog_checksum=*/true};
 
     const auto outcome{

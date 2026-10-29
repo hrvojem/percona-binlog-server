@@ -52,11 +52,13 @@
 
 #include "binsrv/main_config.hpp"
 #include "binsrv/null_logger.hpp"
+#include "binsrv/replication_mode_type.hpp"
 #include "binsrv/storage.hpp"
 
 #include "binsrv/events/common_header_view.hpp"
 #include "binsrv/events/composite_binlog_name.hpp"
 #include "binsrv/gtids/gtid.hpp"
+#include "binsrv/gtids/gtid_set.hpp"
 
 #include "operations/sender_context.hpp"
 #include "operations/sender_single_file_context.hpp"
@@ -230,8 +232,10 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *input,
         std::make_shared<binsrv::null_logger>(),
         storage,
         block_size,
+        binsrv::replication_mode_type::position,
         from_position ? first.str() : std::string{},
         position,
+        binsrv::gtids::gtid_set{},
         session_checksum};
     util::const_byte_span event{};
     for (std::size_t count{0U}; count < max_events; ++count) {

@@ -151,7 +151,16 @@ def builds(runs):
                  "release_gcc14": "release (RelWithDebInfo, NDEBUG), 500 "
                                   "cases, 600 s and 4 GB limits per case (a "
                                   "hang is a TIMEOUT failure); short "
-                                  "fetch_crash_test"}
+                                  "fetch_crash_test",
+                 "fuzz": "libFuzzer targets (fuzz/), Clang 20 with ASan and "
+                         "UBSan, 10 min each against a corpus kept between "
+                         "nights; one case per target run and per distinct "
+                         "finding",
+                 "mull": "mutation testing (extra/qa/mull), weekly: the "
+                         "mutation score, and one case per mutant no test "
+                         "kills that is not triaged",
+                 "fuzz_clang20": "the build of the libFuzzer targets",
+                 "mull_clang20": "the build of the mutation-testing tree"}
     for run in runs:
         for result in run["results"]:
             label = result.get("config", "")
@@ -163,12 +172,14 @@ def builds(runs):
             elif label.startswith("qa-"):
                 described[label] = (
                     f"black-box QA harnesses (extra/qa), MySQL {label[3:]}: "
-                    f"every night pull_replica_test, query_race_test and "
-                    f"fetch_crash_test (file and S3 storage); one heavier "
-                    f"harness by weekday (s3_fault_sweep, disk_fault_sweep, "
+                    f"every night pull_replica_test, query_race_test, "
+                    f"pull_heartbeat_test and fetch_crash_test (file and "
+                    f"S3 storage); heavier harnesses by weekday "
+                    f"(s3_fault_sweep, disk_fault_sweep, "
                     f"network_fault_test, listener_fuzz_test, "
-                    f"source_change_test), so their cases appear about "
-                    f"once a week")
+                    f"source_change_test, large_binlog_test on file and S3 "
+                    f"storage, pull_load_test), so their cases appear "
+                    f"about once a week")
     return described
 
 

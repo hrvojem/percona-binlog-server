@@ -310,7 +310,7 @@ known ones of ticket 42); `copies`, `replica`, `still_serving` (exact data at
 the end). The first 15-minute run (2026-10-29, debug build) was flat (about
 23 MB, 16 descriptors, 2 threads) and exact, but the log grew 67 MB per hour:
 at info level `pull` logs every event it streams, per client (89% of the
-lines; ticket 45), and a client that dies during a dump is logged as an
+lines; ticket 45, PBS-118), and a client that dies during a dump is logged as an
 error (EPIPE, part of ticket 42).
 
 `repro_broken_checkpointing.py` is a self-contained reproducer kept from an
@@ -496,7 +496,7 @@ server rather than starting one.
   `pull_heartbeat_test quiet_after_rotation` (ticket 40, PBS-113),
   `large_binlog_test position/transaction_over_4gib` (ticket 41, PBS-114),
   `pull_load_test position/shutdown` (ticket 43, PBS-116),
-  `pull_soak_test position/log` (ticket 45: info-level log volume) and
+  `pull_soak_test position/log` (ticket 45, PBS-118: info-level log volume) and
   `fetch_crash_test gtid` (ticket 14, when the run generates a fetch /
   `FLUSH BINARY LOGS` / fetch sequence).
 - **`ci_property_tests.sh`** — what the CI job *GCC 14 Debug Property Tests*

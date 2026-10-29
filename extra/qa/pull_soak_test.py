@@ -43,7 +43,7 @@ descriptors and threads (/proc), its log size and the storage size. Cases
                     (PBS-115: a disconnect logged at error level, as EOF
                     when reading or as EPIPE, system:32, when a client
                     dies during a dump), which are counted; the most
-                    frequent message is reported (ticket 45: at info level
+                    frequent message is reported (ticket 45, PBS-118: at info level
                     every event streamed to every client is logged);
   copies            every long-lived client's copy of every closed binlog,
                     and every completed churn client's copies of the

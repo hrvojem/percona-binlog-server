@@ -157,21 +157,31 @@ enum class binlog_end : std::uint8_t { none, rotate, stop };
 
 struct binlog_spec {
   std::vector<transaction_spec> transactions;
-  // how the binlog ends; 'none' only for the last one
+  // how the binlog ends; 'none': no ROTATE / STOP (the last binlog of a
+  // running source, or one a crashed source left)
   binlog_end end;
 };
+
+// the server versions a stream comes from: 8.0 (no tagged GTIDs), exactly
+// 8.3.0 (the first with tagged GTIDs and the GTID_TAGGED_LOG post header
+// length, latest_known_protocol_server_version), 8.4 and 9.7
+const std::array<util::semantic_version, 4> stream_versions{
+    util::semantic_version{8U, 0U, 45U}, util::semantic_version{8U, 3U, 0U},
+    util::semantic_version{8U, 4U, 8U}, util::semantic_version{9U, 7U, 2U}};
 
 struct stream_spec {
   bool gtid_mode;
   bool with_checksum;
-  bool v84;
+  // into 'stream_versions'; tagged GTIDs from index 1 on
+  std::size_t version_index;
   std::vector<binlog_spec> binlogs;
 };
 
 std::ostream &operator<<(std::ostream &output, const stream_spec &spec) {
   output << (spec.gtid_mode ? "gtid" : "position") << " mode, "
          << (spec.with_checksum ? "with" : "without") << " checksums, "
-         << (spec.v84 ? "8.4" : "8.0") << ", binlogs:";
+         << stream_versions.at(spec.version_index).get_string()
+         << ", binlogs:";
   for (const auto &binlog : spec.binlogs) {
     output << " [";
     for (const auto &transaction : binlog.transactions) {
@@ -195,7 +205,9 @@ std::ostream &operator<<(std::ostream &output, const stream_spec &spec) {
     static constexpr std::size_t max_other_events{3U};
     stream_spec spec{.gtid_mode = tc.draw(gs::booleans()),
                      .with_checksum = tc.draw(gs::booleans()),
-                     .v84 = tc.draw(gs::booleans()),
+                     .version_index = tc.draw(gs::integers<std::size_t>(
+                         {.min_value = 0U,
+                          .max_value = std::size(stream_versions) - 1U})),
                      .binlogs = {}};
     // in position-based mode the server may have GTIDs on or off
     const bool anonymous{!spec.gtid_mode && tc.draw(gs::booleans())};
@@ -209,7 +221,8 @@ std::ostream &operator<<(std::ostream &output, const stream_spec &spec) {
       for (std::size_t index{0U}; index < number_of_transactions; ++index) {
         gtid_kind kind{gtid_kind::anonymous};
         if (!anonymous) {
-          kind = (spec.v84 && tc.draw(gs::booleans())) ? gtid_kind::tagged
+          kind = (spec.version_index != 0U && tc.draw(gs::booleans()))
+                     ? gtid_kind::tagged
                                                        : gtid_kind::untagged;
         }
         binlog_value.transactions.push_back(
@@ -226,11 +239,11 @@ std::ostream &operator<<(std::ostream &output, const stream_spec &spec) {
                       .max_value = max_other_event_content}),
                  {.min_size = 0U, .max_size = max_other_events}))});
       }
-      const bool last{binlog + 1U == number_of_binlogs};
-      binlog_value.end =
-          last ? tc.draw(gs::sampled_from(
-                     {binlog_end::none, binlog_end::rotate, binlog_end::stop}))
-               : tc.draw(gs::sampled_from({binlog_end::rotate, binlog_end::stop}));
+      // a binlog that is not the last may end without ROTATE / STOP too:
+      // a source that crashed leaves it so, and its binlog sender then moves
+      // to the next binlog with just the artificial ROTATE
+      binlog_value.end = tc.draw(gs::sampled_from(
+          {binlog_end::none, binlog_end::rotate, binlog_end::stop}));
       spec.binlogs.push_back(std::move(binlog_value));
     }
     return spec;
@@ -272,9 +285,8 @@ struct encoded_stream {
   std::vector<expected_transaction> transactions;
 };
 
-[[nodiscard]] util::semantic_version version_of(bool v84) {
-  return v84 ? util::semantic_version{8U, 4U, 8U}
-             : util::semantic_version{8U, 0U, 45U};
+[[nodiscard]] util::semantic_version version_of(std::size_t version_index) {
+  return stream_versions.at(version_index);
 }
 
 void write_crc(events::event_storage &buffer) {
@@ -418,7 +430,7 @@ expected_gtid(const transaction_spec &transaction) {
 [[nodiscard]] encoded_stream
 encode_stream(const stream_spec &spec,
               std::optional<std::size_t> resume_after = std::nullopt) {
-  const auto version{version_of(spec.v84)};
+  const auto version{version_of(spec.version_index)};
   encoded_stream result{.encoded_server_version = version.get_encoded(),
                         .with_checksum = spec.with_checksum,
                         .mode = spec.gtid_mode
@@ -1041,6 +1053,21 @@ BOOST_AUTO_TEST_CASE(ReaderContextResumesFromStoredPosition) {
     // PREVIOUS_GTIDS_LOG in GTID mode) is info-only: it is already stored
     const std::size_t info_only_events{spec.gtid_mode ? 3U : 2U};
     require_valid_stream_accepted(resumed, *context, info_only_events);
+  });
+}
+
+// the storage's current binlog may hold only the magic (fetch stopped right
+// after creating it): resuming there, at position 4, the source's stream
+// starts that binlog from the beginning, and its FORMAT_DESCRIPTION and
+// PREVIOUS_GTIDS_LOG are not yet stored, so they must not be reported as
+// info-only (only the artificial ROTATE is)
+BOOST_AUTO_TEST_CASE(ReaderContextResumesAtTheStartOfAStoredBinlog) {
+  run_property([](hegel::TestCase &tc) {
+    const auto spec{tc.draw("stream", stream_specs())};
+    const auto stream{encode_stream(spec)};
+    const events::composite_binlog_name first_binlog{binlog_base_name, 1U};
+    auto context{make_context(stream, first_binlog.str(), magic_offset)};
+    require_valid_stream_accepted(stream, *context, 0U);
   });
 }
 

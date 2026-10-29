@@ -1911,3 +1911,18 @@ BOOST_AUTO_TEST_CASE(S3StorageCredentialsAreDecoded) {
       },
       settings);
 }
+
+// the largest size and time that fit a 64-bit unsigned integer are accepted,
+// one more is out of range (gaps found by mutation testing, extra/qa/mull)
+BOOST_AUTO_TEST_CASE(SizeAndTimeUnitLargestValues) {
+  // (2^64 - 1) >> 10 and (2^64 - 1) / 60
+  BOOST_CHECK_EQUAL(binsrv::size_unit{"18014398509481983K"}.get_value(),
+                    18014398509481983ULL << 10U);
+  BOOST_CHECK_THROW(static_cast<void>(binsrv::size_unit{"18014398509481984K"}),
+                    std::out_of_range);
+  BOOST_CHECK_EQUAL(binsrv::time_unit{"307445734561825860m"}.get_value(),
+                    307445734561825860ULL * 60ULL);
+  BOOST_CHECK_THROW(
+      static_cast<void>(binsrv::time_unit{"307445734561825861m"}),
+      std::out_of_range);
+}

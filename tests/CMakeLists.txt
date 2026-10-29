@@ -28,6 +28,19 @@ set_target_properties(byte_span_encoding_test PROPERTIES
   CXX_EXTENSIONS NO
 )
 
+add_executable(util_test util_test.cpp)
+target_include_directories(util_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(util_test
+  PRIVATE
+    binlog_server_compiler_flags
+    binsrv::lib_util
+    Boost::unit_test_framework
+)
+set_target_properties(util_test PROPERTIES
+  CXX_STANDARD_REQUIRED YES
+  CXX_EXTENSIONS NO
+)
+
 add_executable(uuid_test uuid_test.cpp)
 target_include_directories(uuid_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(uuid_test
@@ -176,6 +189,7 @@ set_target_properties(heartbeat_query_pattern_test PROPERTIES
 
 set(test_run_options --no_color_output)
 add_test(NAME byte_span_encoding_test COMMAND byte_span_encoding_test ${test_run_options})
+add_test(NAME util_test COMMAND util_test ${test_run_options})
 add_test(NAME uuid_test COMMAND uuid_test ${test_run_options})
 add_test(NAME tag_test COMMAND tag_test ${test_run_options})
 add_test(NAME gtid_test COMMAND gtid_test ${test_run_options})

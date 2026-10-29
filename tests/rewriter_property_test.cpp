@@ -630,3 +630,40 @@ BOOST_AUTO_TEST_CASE(RewriterRenumbersTransactionsSafely) {
     }
   });
 }
+
+// fixed cases at the rewriter's limits (gaps found by mutation testing,
+// extra/qa/mull): a transaction that holds only its GTID_TAGGED_LOG event
+// (transaction_length equal to the event size) is rewritten, and a GTID
+// event whose last_committed equals its sequence_number is refused
+BOOST_AUTO_TEST_CASE(RewriterLimitsOfTransactionLengthAndLogicalClock) {
+  const auto context_ptr{make_context(true)};
+  const auto &context{*context_ptr};
+  for (const bool tagged : {false, true}) {
+    const source_transaction alone{.tagged = tagged,
+                                   .uuid_index = 0U,
+                                   .tag_index = 0U,
+                                   .gno = 1U,
+                                   .source_binlog = 0U,
+                                   .sequence_number = 1U,
+                                   .last_committed = 0U,
+                                   .other_event_sizes = {}};
+    const auto source{make_gtid_event(alone)};
+    const events::event_view source_v{context, util::const_byte_span{source}};
+    events::event_storage buffer;
+    BOOST_TEST_INFO("tagged " << tagged);
+    BOOST_CHECK_NO_THROW(static_cast<void>(
+        events::rewriter::rewrite(0U, source_v, buffer, magic_size)));
+
+    auto invalid{alone};
+    invalid.sequence_number = 2U;
+    invalid.last_committed = 2U;
+    const auto invalid_source{make_gtid_event(invalid)};
+    const events::event_view invalid_v{context,
+                                       util::const_byte_span{invalid_source}};
+    events::event_storage invalid_buffer;
+    BOOST_TEST_INFO("tagged " << tagged);
+    BOOST_CHECK_THROW(static_cast<void>(events::rewriter::rewrite(
+                          0U, invalid_v, invalid_buffer, magic_size)),
+                      std::logic_error);
+  }
+}

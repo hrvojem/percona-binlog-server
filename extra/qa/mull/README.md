@@ -128,3 +128,37 @@ listed so that the weekly run reports only new survivors:
 - **Storage reads (5):** `byte_range` text and `file_operations_helpers`
   boundaries, covered by `storage_property_test`, which is not in the run
   (minutes per run, and its S3 cases need the S3 server).
+
+### 2026-10-29, later: the open gaps closed
+
+The 35 open gaps were closed by tests or, where a closer look showed them
+harmless, moved to the harmless list: 16 run binaries (`util_test` new),
+418 mutants on covered lines, **392 killed (93.8%)**, the 26 survivors all
+harmless (equivalent or unreachable; none open). The tests that closed them:
+
+- `event_test`: the checksum algorithm and header flag names and
+  `flag_set` printing (through the library's printing functions: the
+  helpers are inline in headers, so a direct call would test the test's own
+  unmutated copy), the post header length tables (the code past 8.0's
+  table, the printed table), binlog sequence number 999,999 / 1,000,000, the
+  first invalid FDE checksum byte, encoding into exact-size buffers,
+  `common_header::create_with_offset` for artificial events, a ROTATE
+  shorter than its fixed parts, GTID_TAGGED_LOG bodies of every size around
+  the 128-byte boundary of their own size field, a repeated field id, and
+  `is_epoch()`;
+- `reader_context_property_test`: servers of exactly 8.3.0 (the post header
+  table switch) and 9.7.2 next to 8.0 and 8.4; binlogs that end without
+  ROTATE / STOP before the next one (the artificial ROTATE mid-stream); and
+  resuming at position 4 of a stored binlog that holds only the magic;
+- `rewriter_property_test`: a transaction of just its GTID_TAGGED_LOG event,
+  and `last_committed` equal to `sequence_number`;
+- `config_value_property_test`: the largest size and time that fit 64 bits;
+- `util_test` (new): `byte_range` at `UINT64_MAX` and its text, and
+  `read_file_content` at the end of a file and at its size limit.
+
+Moved to harmless: the rewriter's `event_size` update when it adds a
+checksum (rewrite mode refuses sources without checksums), an iteration
+bound of the tagged body's size calculation and the bit loop of `flag_set`
+printing (both equivalent). `sender_context_property_test`'s GTID-mode
+property is left out of the run: under Mull it took 47 minutes and it mostly
+exercises `indexed_event_block`, which is not mutated.

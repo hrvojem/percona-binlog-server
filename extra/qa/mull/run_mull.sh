@@ -25,6 +25,7 @@ TESTS=(
   "gtid_set_test"
   "gtid_set_property_test"
   "byte_span_encoding_test"
+  "util_test"
   "tag_test"
   "event_test"
   "heartbeat_log_v2_event_test"
@@ -34,8 +35,10 @@ TESTS=(
   "indexed_event_block_property_test"
   "search_helpers_property_test"
   "rewriter_property_test"
-  # about 50 s per run: the slowest binary of the set
-  "sender_context_property_test timeout=300000"
+  # about 50 s per run: the slowest binary of the set; its GTID-mode
+  # property is left out (it mostly exercises indexed_event_block, which is
+  # not mutated, and would make the run 20 minutes longer)
+  "sender_context_property_test timeout=300000 GtidModeStreamsExactlyTheMissingTransactions"
   # the S3 URI cases start the AWS SDK for each case (minutes per run)
   "config_value_property_test S3StorageUriMatchesModel S3StorageCredentialsAreDecoded"
 )

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""The MTR, QA-harness and fuzzing stages of the nightly run.
+"""The MTR, QA-harness, fuzzing and mutation-testing stages of the nightly
+run.
 
 run_nightly.sh calls this once per stage step; each call appends one JSON
 result line per test case to --results (the same fields the property-test
@@ -28,6 +29,13 @@ writes a log per failing case into --out.
        records '<mode>/s3'. A known-failure name may be a shell-style
        pattern ('position/PUT-*/reset_after/*'), and as for MTR a name
        without '/' also covers every '<name>/...' case.
+
+  mull runs extra/qa/mull/run_mull.sh (mutation testing of the Mull build's
+       test binaries) and records a passing case 'mull/run' of the build
+       'mull' with the score, plus one new case
+       'mull/<file>:<line>:<column>-<mutator>' per mutant that no test kills
+       and that is not in mull_known_survivors.txt. Listed survivors that no
+       longer survive are named in the reason of 'mull/run'.
 
 Statuses: passed, known (a listed failure), new (an unlisted failure),
 known-passed (a listed case that passed), skipped (MTR skipped the test), and
@@ -806,9 +814,53 @@ def run_fuzz(args) -> int:
     return 0
 
 
+def run_mull(args) -> int:
+    """Runs run_mull.sh over the Mull build and records 'mull/run' plus a new
+    case per unlisted surviving mutant."""
+    recorder = Recorder(args, "mull", "mull")
+    reports = Path(args.out) / "mull"
+    started = time.monotonic()
+    environment = dict(os.environ, MULL_KNOWN_SURVIVORS=str(args.known))
+    try:
+        run = subprocess.run(
+            [str(args.mull_script), str(args.runner), str(args.build),
+             str(reports), str(args.known_failures)],
+            capture_output=True, text=True, errors="replace",
+            timeout=args.timeout, env=environment)
+        output = run.stdout + run.stderr
+    except subprocess.TimeoutExpired as error:
+        output = (error.stdout or b"").decode(errors="replace") + \
+            f"\n(timed out after {args.timeout} s)"
+    seconds = time.monotonic() - started
+    (Path(args.out) / "mull.log").write_text(output)
+    summary_path = reports / "summary.json"
+    if not summary_path.exists():
+        recorder.record("", True, "", "run_mull.sh wrote no summary, see "
+                        "mull.log", seconds, status="no-test-cases")
+        return 0
+    summary = json.loads(summary_path.read_text())
+    for key in summary["surviving"]:
+        location, mutator = key.split(" ", 1)
+        recorder.record(
+            f"mull/{location}-{mutator}", True, "",
+            f"no test kills the mutant {mutator} at {location}", 0,
+            f"{key}\n\nNo test binary of the run fails with this mutant. "
+            f"Add a test that notices it, or, if it is equivalent or "
+            f"unreachable, list it in mull_known_survivors.txt.\n\n"
+            f"Per binary: {reports}/<binary>.txt\n\n{output}")
+    reason = (f"score {summary['score']}%: {summary['killed']} of "
+              f"{summary['covered']} covered mutants killed, "
+              f"{len(summary['known'])} known survivors")
+    if summary["stale"]:
+        reason += (f"; {len(summary['stale'])} listed survivors no longer "
+                   f"survive, remove them: " + ", ".join(summary["stale"]))
+    recorder.record("mull/run", False, "", reason[:600], seconds)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("stage", choices=["mtr", "qa", "fuzz"])
+    parser.add_argument("stage", choices=["mtr", "qa", "fuzz", "mull"])
     parser.add_argument("--dist", type=Path, help="the MySQL distribution")
     parser.add_argument("--series", help="8.0, 8.4, 9.7")
     parser.add_argument("--binsrv", type=Path)
@@ -863,7 +915,18 @@ def main():
                         help="the target's corpus, kept between runs")
     parser.add_argument("--seconds", type=int, default=900)
     parser.add_argument("--jobs", type=int, default=8)
+    # mull
+    parser.add_argument("--mull-script", type=Path,
+                        help="extra/qa/mull/run_mull.sh")
+    parser.add_argument("--runner", type=Path, help="mull-runner")
+    parser.add_argument("--build", type=Path, help="the Mull build directory")
+    parser.add_argument("--known-failures", type=Path,
+                        help="known_failures.txt (test cases left out)")
     args = parser.parse_args()
+    if args.stage == "mull":
+        if not (args.mull_script and args.runner and args.build):
+            parser.error("mull needs --mull-script, --runner and --build")
+        return run_mull(args)
     if args.stage == "fuzz":
         if not (args.target and args.binary and args.corpus):
             parser.error("fuzz needs --target, --binary and --corpus")

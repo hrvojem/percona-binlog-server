@@ -75,7 +75,7 @@ RELEASE_CASE_MEMORY_MB=${RELEASE_CASE_MEMORY_MB:-4096}
 # cases are memory-heavy, so they use a smaller pool.
 JOBS=${JOBS:-4}
 TSAN_JOBS=${TSAN_JOBS:-2}
-STAGES=" ${STAGES:-cpp mtr qa release fuzz} "
+STAGES=" ${STAGES:-cpp mtr qa release fuzz mull} "
 # MTR stage: <series>:<distribution under $WS/dist>; its own build thread
 # (ports) and var directories so it does not collide with manual MTR runs.
 # A worker of build thread N uses ports 10000+10*N.. (30 per worker) and the
@@ -93,6 +93,11 @@ MTR_PARALLEL=${MTR_PARALLEL:-4}
 FUZZ_TARGETS=${FUZZ_TARGETS:-"event_stream_fuzzer listener_packet_fuzzer stored_binlog_fuzzer decoders_fuzzer"}
 FUZZ_SECONDS=${FUZZ_SECONDS:-600}
 FUZZ_JOBS=${FUZZ_JOBS:-12}
+# mutation-testing stage (extra/qa/mull): weekly, on this day of the week
+# (1 = Monday, 'all' for every run), with Mull unpacked under $WS/mull
+MULL_DAY=${MULL_DAY:-7}
+MULL_RUNNER=${MULL_RUNNER:-$WS/mull/pkg/usr/bin/mull-runner-20}
+MULL_PLUGIN=${MULL_PLUGIN:-$WS/mull/pkg/usr/lib/mull-ir-frontend-20}
 # QA-harness stage: one MySQL version, the Python libraries, a port range
 QA_DIST=${QA_DIST:-8.4:mysql-8.4.8-$MYSQL_SUFFIX-minimal}
 QA_PORT=${QA_PORT:-24470}
@@ -675,6 +680,58 @@ if want fuzz; then
   fi
   log "fuzzing done in $(( ($(date +%s) - stage_started) / 60 )) min"
 fi
+# the mutation-testing stage: the Mull build (Clang with Mull's compiler
+# plugin and Clang coverage, against the GCC-built dependencies of
+# debug_gcc14 as for fuzzing), rebuilt from clean each time since the plugin
+# reads extra/qa/mull/mull.yml at compile time, then run_mull.sh over its
+# test binaries. Each mutant no test kills, unless listed in
+# mull_known_survivors.txt, is a new case of the build 'mull'
+if want mull; then
+  if [ "$MULL_DAY" != all ] && [ "$MULL_DAY" != "$(date -u +%u)" ]; then
+    log "mutation testing skipped: not day $MULL_DAY (MULL_DAY)"
+  elif [ ! -x "$MULL_RUNNER" ] || [ ! -f "$MULL_PLUGIN" ]; then
+    log "mutation testing skipped: no Mull at $MULL_RUNNER (see extra/qa/mull/README.md)"
+  else
+    mull_build=$WS/percona-binlog-server-build-mull_clang20
+    stage_started=$(date +%s)
+    export MULL_CONFIG=$SRC/extra/qa/mull/mull.yml
+    if [ ! -f "$mull_build/CMakeCache.txt" ]; then
+      log "configuring mull_clang20"
+      mull_flags="-fpass-plugin=$MULL_PLUGIN -g -grecord-command-line -fprofile-instr-generate -fcoverage-mapping -O0"
+      cmake -S "$SRC" -B "$mull_build" -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 \
+        -DWITH_STDLIB_LIBCXX=OFF -DCPP_STANDARD=23 -DBUILD_TESTING=ON \
+        -DWITH_PROPERTY_TESTS=ON -DS2N_USE_CRYPTO_SHARED_LIBS=ON \
+        "-DCMAKE_PREFIX_PATH=$WS/aws-sdk-cpp-install-debug_gcc14;$WS/boost-install-debug_gcc14" \
+        "-DCMAKE_C_FLAGS=$mull_flags" "-DCMAKE_CXX_FLAGS=$mull_flags" \
+        -DCMAKE_EXE_LINKER_FLAGS=-fprofile-instr-generate \
+        > "$out/configure-mull_clang20.log" 2>&1 ||
+        log "CONFIGURE FAILED: mull_clang20 (configure-mull_clang20.log)"
+    fi
+    log "building mull_clang20"
+    # shellcheck disable=SC2046 # one --target per word
+    if ! cmake --build "$mull_build" --clean-first --parallel 12 \
+        $(printf -- '--target %s ' $("$SRC/extra/qa/mull/run_mull.sh" --targets)) \
+        > "$out/build-mull_clang20.log" 2>&1; then
+      log "BUILD FAILED: mull_clang20"
+      results+=("BUILD FAILED  mull_clang20  (build-mull_clang20.log)")
+      record mull_clang20 "" build build-failed "" \
+        "see build-mull_clang20.log" 0 >> "$results_file"
+      broken=$((broken + 1))
+    else
+      log "mutation testing"
+      python3 "$NIGHTLY/nightly_stages.py" mull \
+        --mull-script "$SRC/extra/qa/mull/run_mull.sh" --runner "$MULL_RUNNER" \
+        --build "$mull_build" --known-failures "$NIGHTLY/known_failures.txt" \
+        --known "$SRC/extra/qa/mull/mull_known_survivors.txt" --timeout 7200 \
+        --results "$stage_results" --lines "$stage_lines" --out "$out" \
+        >> "$out/nightly.log" 2>&1
+      tally_stage $? mull mull
+    fi
+    unset MULL_CONFIG
+    log "mutation testing done in $(( ($(date +%s) - stage_started) / 60 )) min"
+  fi
+fi
 rm -f "$stage_results" "$stage_lines"
 
 duration=$(( ($(date +%s) - started) / 60 ))
@@ -688,6 +745,7 @@ duration=$(( ($(date +%s) - started) / 60 ))
   echo "Replay an MTR failure: cd $WS/dist/<distribution>/mysql-test && BINSRV=$debug_binsrv ./mtr --build-thread=$MTR_BUILD_THREAD binlog_streaming.<test> (log: mtr-<series>-<test>.log)"
   echo "Replay a QA failure: see the command at the top of qa-<series>-<case>.log"
   echo "Replay a fuzzing finding: $WS/percona-binlog-server-build-fuzz_clang20/fuzz/<target> <input> (inputs listed in fuzz-<target>-<finding>.log)"
+  echo "A surviving mutant: see mull/<binary>.txt in the run directory and extra/qa/mull/README.md"
 } >> "$summary"
 python3 -c 'import json,sys; print(json.dumps(dict(zip(["day","started","revision","qa_rotation","new","broken","known","known_passed","passed","skipped","minutes"], sys.argv[1:5]+[int(v) for v in sys.argv[5:]])), indent=1))' \
   "$day" "$started_utc" "$revision" "${rotation[*]:-}" "$new" "$broken" "$known_failed" \

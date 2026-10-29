@@ -1,4 +1,5 @@
-# Mutants that survive every test and were triaged as harmless:
+# Mutants that survive every test and were triaged: the harmless ones
+# (equivalent or unreachable) first, then the open test gaps.
 # <file relative to src/>:<line>:<column> <mutator>  # why
 # combine_mull_reports.py --known reports them separately. Line numbers move
 # with the code: re-triage after changes to these files.
@@ -26,3 +27,57 @@ binsrv/gtids/gtid_set.cpp:781:39 cxx_gt_to_ge
 # TSIDs
 binsrv/gtids/gtid_set.cpp:508:27 cxx_ge_to_gt
 binsrv/gtids/gtid_set.cpp:519:25 cxx_ge_to_gt
+binsrv/events/event_view.cpp:91:26 cxx_lt_to_le  # an FDE always has a post-header after the group
+binsrv/events/event_view.hpp:85:34 cxx_add_to_sub  # only used on events without a post-header
+binsrv/events/common_header_view.cpp:102:27 cxx_ge_to_gt  # the delimiter code has no name: rejected either way
+binsrv/events/composite_binlog_name.cpp:64:33 cxx_le_to_lt  # an empty base name is rejected later
+binsrv/events/gtid_tagged_log_body_impl.cpp:223:18 cxx_le_to_lt  # known_last_non_ignorable_field_id is 0
+binsrv/events/reader_context.cpp:600:3 cxx_pre_inc_to_pre_dec  # cycle_number_ is only compared with 0
+binsrv/events/rewriter.cpp:166:29 cxx_gt_to_ge  # equal: both branches give 0
+util/native_file_operations_helpers_posix.cpp:39:23 cxx_lt_to_le  # open() never returns 0 (stdin)
+
+# ---------------------------------------------------------------------------
+# Open test gaps (2026-10-29): mutants a test should kill. Listed so that the
+# weekly run reports only new survivors; remove a line when a test kills it
+# (the run reports it as stale).
+
+# text output no test compares: checksum algorithm and header flag names,
+# flag_set printing, the post-header length table
+binsrv/events/checksum_algorithm_type.hpp:57:14 cxx_eq_to_ne
+binsrv/events/common_header_flag_type.hpp:73:14 cxx_eq_to_ne
+util/flag_set.hpp:172:33 cxx_lt_to_ge
+util/flag_set.hpp:172:33 cxx_lt_to_le
+util/flag_set.hpp:172:60 cxx_pre_inc_to_pre_dec
+util/flag_set.hpp:173:23 cxx_ne_to_eq
+binsrv/events/protocol_traits.cpp:68:37 cxx_lt_to_ge
+binsrv/events/protocol_traits.cpp:68:37 cxx_lt_to_le
+binsrv/events/protocol_traits.cpp:68:50 cxx_pre_inc_to_pre_dec
+binsrv/events/protocol_traits.cpp:69:15 cxx_ne_to_eq
+# boundaries no test reaches
+binsrv/events/composite_binlog_name.cpp:55:24 cxx_ge_to_gt  # sequence number 1000000
+binsrv/events/format_description_body_impl.cpp:64:36 cxx_ge_to_gt  # checksum algorithm byte = first invalid value
+binsrv/events/gtid_tagged_log_body_impl.cpp:217:18 cxx_le_to_lt  # a repeated field id
+binsrv/events/gtid_tagged_log_body_impl.cpp:532:58 cxx_add_to_sub  # a length at a varint size boundary
+binsrv/events/protocol_traits.cpp:49:28 cxx_ge_to_gt  # the first event code past a version's table
+binsrv/events/reader_context.cpp:112:33 cxx_lt_to_le  # server version = latest_known_protocol_server_version
+binsrv/events/reader_context.cpp:472:33 cxx_lt_to_le  # the same
+binsrv/events/rewriter.cpp:152:29 cxx_ge_to_gt  # last_committed = sequence_number
+binsrv/events/rewriter.cpp:242:35 cxx_lt_to_le  # transaction length = event size
+binsrv/size_unit.cpp:78:19 cxx_gt_to_ge  # the largest representable size
+binsrv/time_unit.cpp:79:19 cxx_gt_to_ge  # the largest representable time
+util/byte_range.cpp:31:61 cxx_lt_to_le  # a range ending at UINT64_MAX
+binsrv/events/format_description_body_impl.cpp:88:30 cxx_lt_to_le  # encode_to into an exact-size buffer
+binsrv/events/rotate_post_header_impl.cpp:80:30 cxx_lt_to_le  # the same
+binsrv/events/event_view.cpp:111:59 cxx_add_to_sub  # an event shorter than header + post-header + footer
+# behaviour no test in the run checks
+binsrv/events/common_header.cpp:76:18 cxx_eq_to_ne  # next_event_position 0 of an artificial ROTATE built by common_header
+binsrv/events/reader_context.cpp:582:18 cxx_gt_to_ge  # resuming at position 4 of the same binlog
+binsrv/events/reader_context.cpp:760:12 cxx_eq_to_ne  # an artificial ROTATE in the middle of a stream
+binsrv/events/rewriter.cpp:190:29 cxx_ne_to_eq  # event_size after a rewrite that changes the size
+util/ctime_timestamp.hpp:38:19 cxx_eq_to_ne  # is_epoch()
+# storage reads: covered by storage_property_test, which is not in the run
+util/byte_range.cpp:51:38 cxx_add_to_sub
+util/byte_range.cpp:51:49 cxx_sub_to_add
+util/file_operations_helpers.cpp:60:26 cxx_gt_to_ge
+util/file_operations_helpers.cpp:73:29 cxx_sub_to_add
+util/file_operations_helpers.cpp:76:19 cxx_gt_to_ge

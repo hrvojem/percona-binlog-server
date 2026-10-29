@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <limits>
 #include <numeric>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -249,4 +250,47 @@ BOOST_DATA_TEST_CASE(PackedIntEncoding,
   BOOST_CHECK_EQUAL(actual_decoded_size, calculated_encoded_size);
 
   BOOST_CHECK_EQUAL(restored_value, value);
+
+  // a buffer of exactly the encoded size is enough, one byte less is not
+  // (and leaves the buffer untouched)
+  util::byte_span exact_portion{std::data(buffer), calculated_encoded_size};
+  BOOST_CHECK(
+      util::insert_packed_int_to_byte_span_checked(exact_portion, value));
+  BOOST_CHECK(exact_portion.empty());
+  util::byte_span short_portion{std::data(buffer),
+                                calculated_encoded_size - 1U};
+  BOOST_CHECK(
+      !util::insert_packed_int_to_byte_span_checked(short_portion, value));
+  BOOST_CHECK_EQUAL(std::size(short_portion), calculated_encoded_size - 1U);
+}
+
+// the checked byte span / byte array extractors take exactly as many bytes
+// as they need, and refuse a remainder one byte short without consuming it
+BOOST_AUTO_TEST_CASE(CheckedByteExtractionAtExactSize) {
+  static constexpr std::size_t size{5U};
+  const std::array<std::byte, size> source{std::byte{1}, std::byte{2},
+                                           std::byte{3}, std::byte{4},
+                                           std::byte{5}};
+
+  std::array<std::byte, size> span_storage{};
+  util::const_byte_span exact{source};
+  BOOST_CHECK(util::extract_byte_span_from_byte_span_checked(
+      exact, std::span<std::byte>{span_storage}));
+  BOOST_CHECK(exact.empty());
+  BOOST_CHECK(span_storage == source);
+  util::const_byte_span short_remainder{std::data(source), size - 1U};
+  BOOST_CHECK(!util::extract_byte_span_from_byte_span_checked(
+      short_remainder, std::span<std::byte>{span_storage}));
+  BOOST_CHECK_EQUAL(std::size(short_remainder), size - 1U);
+
+  std::array<std::byte, size> array_storage{};
+  exact = util::const_byte_span{source};
+  BOOST_CHECK(
+      util::extract_byte_array_from_byte_span_checked(exact, array_storage));
+  BOOST_CHECK(exact.empty());
+  BOOST_CHECK(array_storage == source);
+  short_remainder = util::const_byte_span{std::data(source), size - 1U};
+  BOOST_CHECK(!util::extract_byte_array_from_byte_span_checked(
+      short_remainder, array_storage));
+  BOOST_CHECK_EQUAL(std::size(short_remainder), size - 1U);
 }

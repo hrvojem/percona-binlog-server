@@ -1,7 +1,12 @@
-# Mull configuration of the mutation testing trial (see README.md): only the
-# GTID and util libraries are mutated. The compiler plugin and mull-runner
-# find it through MULL_CONFIG.
+# Mull configuration (see README.md): the code that is mutated. The compiler
+# plugin and mull-runner find it through MULL_CONFIG; changing the paths
+# needs a clean rebuild of the libraries concerned.
 includePaths:
   - ".*/src/binsrv/gtids/.*"
   - ".*/src/util/.*"
+  - ".*/src/binsrv/events/.*"
+  # the configuration and keyring validators, size and time units
+  - ".*/src/binsrv/[a-z_]*config\\.cpp"
+  - ".*/src/binsrv/(size|time)_unit\\.cpp"
+  - ".*/src/binsrv/(file_keyring|keyring_factory|keyring_record|keyring_record_collection)\\.cpp"
 quiet: true

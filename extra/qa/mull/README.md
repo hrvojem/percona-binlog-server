@@ -1,4 +1,4 @@
-# Mutation testing with Mull (trial)
+# Mutation testing with Mull
 
 [Mull](https://github.com/mull-project/mull) compiles every mutant of the
 code (`>` turned into `>=`, `+` into `-`, ...) into one instrumented test
@@ -7,8 +7,17 @@ binary, then runs the tests once per mutant. A mutant that no test notices
 property, a missing boundary case, or an equivalent mutant (a change with no
 observable effect).
 
-The trial mutates the GTID and util libraries (`mull.yml`) and runs the
-deterministic tests that exercise them.
+`mull.yml` names the code that is mutated: the GTID, util and event
+libraries (`reader_context` and the rewriter included), the configuration and
+keyring validators and the size / time units. `run_mull.sh` lists the test
+binaries that run against the mutants: the unit tests and the property tests
+of that code, `sender_context_property_test` included (about 50 s per run,
+the slowest), but not the storage, listener or replication-source tests
+(minutes per run, and the S3 cases need the S3 server).
+
+The nightly runs it weekly (stage `mull`, on Sundays by default,
+`MULL_DAY`): each mutant no test kills, unless it is listed in
+`mull_known_survivors.txt`, is a new failure of the build `mull`.
 
 ## Setup (test-infra)
 
@@ -36,40 +45,40 @@ cmake -S percona-binlog-server -B percona-binlog-server-build-mull_clang20 \
   "-DCMAKE_PREFIX_PATH=$HOME/ws/aws-sdk-cpp-install-debug_gcc14;$HOME/ws/boost-install-debug_gcc14" \
   "-DCMAKE_C_FLAGS=$F" "-DCMAKE_CXX_FLAGS=$F" \
   -DCMAKE_EXE_LINKER_FLAGS=-fprofile-instr-generate
-cmake --build percona-binlog-server-build-mull_clang20 -j12 --target \
-  gtid_test gtid_set_test gtid_set_property_test byte_span_encoding_test \
-  uuid_test tag_test
+cmake --build percona-binlog-server-build-mull_clang20 -j12 \
+  $(printf -- '--target %s ' $(percona-binlog-server/extra/qa/mull/run_mull.sh --targets))
 ```
+
+The nightly's `mull` stage configures this build itself the first time it
+runs; only the unpacked Mull is needed.
 
 ## Running
 
-`CI=1` makes Hegel derandomize its inputs and skip its failure database,
-so every mutant meets the same test cases. A test binary must pass without
-mutants, so the property tests run without their known failures
-(`known_failures.txt`):
-
 ```bash
 cd ~/ws/mull
-B=~/ws/percona-binlog-server-build-mull_clang20/tests
-export MULL_CONFIG=$HOME/ws/percona-binlog-server/extra/qa/mull/mull.yml CI=1
-known=$(awk '!/^#/ && NF {print $1}' ~/ws/nightly/known_failures.txt | sed 's/^[a-z_0-9]*://' | sort -u)
-for t in gtid_test gtid_set_test gtid_set_property_test byte_span_encoding_test uuid_test tag_test; do
-  args=()
-  if [[ $t == *_property_test ]]; then
-    args=("--run_test=$($B/$t --list_content 2>&1 | sed -n 's/^ *\([A-Za-z0-9_]*\)\*$/\1/p' | grep -vxF "$known" | paste -sd:)")
-  fi
-  pkg/usr/bin/mull-runner-20 --allow-surviving --workers 12 \
-    --reporters IDE --reporters SQLite --report-dir reports --report-name $t \
-    $B/$t "${args[@]}" > $t.out 2>&1
-done
-python3 ~/ws/percona-binlog-server/extra/qa/mull/combine_mull_reports.py \
-  --known ~/ws/percona-binlog-server/extra/qa/mull/mull_known_survivors.txt \
-  reports/*.sqlite
+MULL_CONFIG=~/ws/percona-binlog-server/extra/qa/mull/mull.yml \
+  ~/ws/percona-binlog-server/extra/qa/mull/run_mull.sh \
+  ~/ws/mull/pkg/usr/bin/mull-runner-20 \
+  ~/ws/percona-binlog-server-build-mull_clang20 ~/ws/mull/reports \
+  ~/ws/nightly/known_failures.txt
 ```
 
+`run_mull.sh --targets` prints the test binaries to build. After changing
+`includePaths` in `mull.yml`, rebuild them with `--clean-first`: the plugin
+reads the file at compile time.
+
+The script sets `CI=1`, which makes Hegel derandomize its inputs and skip its
+failure database, so every mutant meets the same test cases. A test binary
+must pass without mutants, so the test cases listed in `known_failures.txt`
+are left out (all of `indexed_event_block_property_test`'s, for now). A slow
+binary gets its own `timeout=<ms>` in the list: Mull's default timeout also
+applies to the unmutated warm-up run.
+
 mull-runner judges each test binary on its own; `combine_mull_reports.py`
-counts a mutant as surviving only if no test kills it, and sets aside the
-triaged harmless ones in `mull_known_survivors.txt`.
+counts a mutant as surviving only if no test kills it, sets aside the
+triaged ones in `mull_known_survivors.txt` and reports listed ones that no
+longer survive as stale. The per-binary reports are `<binary>.txt` (IDE
+format: file, line, column and the change) and `<binary>.sqlite`.
 
 ## First results (2026-10-28)
 

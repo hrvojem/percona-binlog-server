@@ -719,6 +719,46 @@ BOOST_AUTO_TEST_CASE(GtidSetWhitespaces) {
   BOOST_CHECK_EQUAL(gtids, restored_gtids);
 }
 
+// the hex digits of a UUID may be upper case: every letter, 'A' and 'F'
+// included, reads as its lower-case form
+BOOST_AUTO_TEST_CASE(GtidSetParsesUpperCaseHex) {
+  const auto upper{boost::lexical_cast<binsrv::gtids::gtid_set>(
+      "ABCDEF01-AAAA-BBBB-CCCC-DDDDEEEEFFFF:1-3")};
+  const auto lower{boost::lexical_cast<binsrv::gtids::gtid_set>(
+      "abcdef01-aaaa-bbbb-cccc-ddddeeeeffff:1-3")};
+  BOOST_CHECK_EQUAL(upper, lower);
+}
+
+// an interval of the binary encoding is [lower, upper): one with upper equal
+// to lower is empty and rejected, as one with upper below lower is
+BOOST_AUTO_TEST_CASE(GtidSetBinaryRejectsEmptyInterval) {
+  const binsrv::gtids::uuid first_uuid{first_uuid_sv};
+  binsrv::gtids::gtid_set gtids{};
+  // NOLINTBEGIN(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
+  gtids.add_interval(first_uuid, binsrv::gtids::tag{}, 5ULL, 6ULL);
+  // NOLINTEND(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
+  binsrv::gtids::gtid_set_storage buffer(gtids.calculate_encoded_size());
+  util::byte_span destination{buffer};
+  gtids.encode_to(destination);
+
+  // untagged encoding: the number of UUIDs, the UUID, the number of
+  // intervals, then each interval's lower and upper bound (8 bytes each,
+  // little endian): the last 8 bytes are the upper bound, 7 (the GNOs are
+  // 5 and 6)
+  static constexpr std::size_t bound_size{8U};
+  BOOST_REQUIRE(std::size(buffer) >= bound_size);
+  const auto upper_offset{std::size(buffer) - bound_size};
+  BOOST_REQUIRE(buffer[upper_offset] == std::byte{7});
+  const util::const_byte_span valid{buffer};
+  BOOST_CHECK_EQUAL(binsrv::gtids::gtid_set{valid}, gtids);
+
+  buffer[upper_offset] = std::byte{5};
+  const util::const_byte_span empty_interval{buffer};
+  BOOST_CHECK_THROW(
+      static_cast<void>(binsrv::gtids::gtid_set{empty_interval}),
+      std::invalid_argument);
+}
+
 BOOST_AUTO_TEST_CASE(GtidSetSimulateSearchByGTIDSet) {
   constexpr std::string_view first_random_uuid_sv{
       "ae6896b1-2e94-11f1-af82-76efd046f53d"};

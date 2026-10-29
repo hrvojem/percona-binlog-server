@@ -23,7 +23,8 @@ as killed when any run reports it failed, timed out, crashed or exited
 abnormally, and as surviving when at least one run executed it and none
 killed it. Mutants listed in --known (one '<file>:<line>:<column>
 <mutator>' per line, '#' comments allowed, the file relative to src/) are
-reported separately, as the triaged equivalent or unreachable ones.
+reported separately, as the triaged equivalent or unreachable ones, and
+listed ones that no longer survive are reported as stale.
 
 Prints a summary and the surviving mutants; with --json, writes them as
 JSON too. Example:
@@ -82,16 +83,22 @@ def main():
     known = read_known(args.known)
     new = [key for key in surviving if key not in known]
     triaged = [key for key in surviving if key in known]
+    # listed survivors that no test run reports as surviving any more (killed
+    # now, or the code moved): the list needs updating
+    stale = sorted(known.difference(surviving))
     score = 100.0 * len(killed) / max(len(statuses), 1)
     print(f"{len(args.reports)} reports, {len(statuses)} covered mutants, "
           f"{len(killed)} killed, {len(surviving)} surviving every test "
           f"(score {score:.1f}%), {len(triaged)} of them known")
     for key in new:
         print(f"  SURVIVED {key}")
+    for key in stale:
+        print(f"  STALE    {key} (listed, but no longer surviving)")
     if args.json:
         args.json.write_text(json.dumps({
             "covered": len(statuses), "killed": len(killed),
-            "score": round(score, 1), "surviving": new, "known": triaged},
+            "score": round(score, 1), "surviving": new, "known": triaged,
+            "stale": stale},
             indent=2))
     return 0
 

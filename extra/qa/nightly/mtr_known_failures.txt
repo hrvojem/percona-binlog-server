@@ -22,4 +22,4 @@
 # 'SSL required'; the replica never connects to pull's (TLS-less) listener,
 # and the SOURCE_POS_WAIT that follows hangs until the 30-minute test case
 # timeout. The other rs_* tests set SOURCE_SSL=0
-9.7 rs_heartbeat  ticket 44: the test does not set SOURCE_SSL=0, so the 9.7 replica refuses pull's listener ("SSL is required but the server doesn't support it")
+9.7 rs_heartbeat  ticket 44 (PBS-117): the test does not set SOURCE_SSL=0, so the 9.7 replica refuses pull's listener ("SSL is required but the server doesn't support it")

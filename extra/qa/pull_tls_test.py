@@ -87,6 +87,7 @@ WORKLOAD = [{"rows": [2000, 500], "ddl": False}]
 CLIENT_SECONDS = 60
 STARTUP_SECONDS = 15
 CATCH_UP_SECONDS = 120
+SOURCE_READ_TIMEOUT = 5
 
 
 def start_pull(binsrv, pull_port: int, ssl: "dict | None",
@@ -132,9 +133,15 @@ def wait_listening(port: int, process: subprocess.Popen) -> bool:
 
 
 def stop(process: subprocess.Popen) -> None:
+    """SIGTERM, which pull handles by shutting down cleanly (a coverage build
+    then writes its counters), and SIGKILL only if it does not exit."""
     if process.poll() is None:
-        process.kill()
-        process.wait()
+        process.terminate()
+        try:
+            process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
 
 
 def copy(args, port: int, first_binlog: str, directory: Path,
@@ -184,6 +191,9 @@ def run(args) -> list:
     harness.SERVER = source
     harness.BINSRV = binsrv = harness.BinlogServer(
         args.binsrv, work / "binsrv", args.port, False)
+    # pull exits on SIGTERM only once its read from the idle source times
+    # out (ticket 43, PBS-116): a short timeout keeps each stop short
+    binsrv.read_timeout = SOURCE_READ_TIMEOUT
     port = args.port + 2
     results = []
     source.start()

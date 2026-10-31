@@ -618,8 +618,9 @@ replay a failure, and a per-test rundown are documented in
 ## Coverage
 
 [`COVERAGE_GAPS.md`](COVERAGE_GAPS.md) records the last line and branch
-coverage measurement of `src/` (2026-10-28: 88.3% of lines over the unit,
-property, MTR 8.4 and QA layers), how it was taken, and a table of the code
+coverage measurement of `src/` (2026-10-30: 90.1% of lines and 80.3% of
+branches over the unit, property, MTR 8.4 and QA layers; 90.8% with every
+layer), how it was taken, and a table of the code
 no test reaches yet, each with the cheapest kind of test that would. It is
 measured with a gcov build in its own tree (`~/ws/build_coverage.sh`,
 `~/ws/run_coverage.sh`); see the document for the steps and for the pitfalls

@@ -172,7 +172,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *data,
         context.parse_client_full_auth_response(frame);
       }
       [[maybe_unused]] const bool authenticated{
-          context.check_client_full_authentication(key.private_key)};
+          context.check_client_full_authentication_rsa(key.private_key)};
     }
     [[maybe_unused]] const auto ok{context.generate_encoded_ok()};
 

@@ -346,7 +346,7 @@ if(WITH_PROPERTY_TESTS)
   add_executable(replication_source_property_test
     replication_source_property_test.cpp
     "${PROJECT_SOURCE_DIR}/src/minimysql/network_service.cpp"
-    "${PROJECT_SOURCE_DIR}/src/minimysql/network_io_operations.cpp"
+    "${PROJECT_SOURCE_DIR}/src/minimysql/session_frame_stream.cpp"
     "${PROJECT_SOURCE_DIR}/src/minimysql/connection_context.cpp"
     "${PROJECT_SOURCE_DIR}/src/minimysql/caching_sha2_password_authenticator.cpp"
     "${PROJECT_SOURCE_DIR}/src/minimysql/heartbeat_sender.cpp"

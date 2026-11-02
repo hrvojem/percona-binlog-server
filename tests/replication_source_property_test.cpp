@@ -142,8 +142,8 @@
 
 #include "minimysql/connection_context.hpp"
 #include "minimysql/connection_context_fwd.hpp"
-#include "minimysql/network_io_operations_fwd.hpp"
 #include "minimysql/network_service.hpp"
+#include "minimysql/session_frame_stream_fwd.hpp"
 
 #include "operations/event_generation_helpers.hpp"
 

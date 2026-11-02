@@ -328,12 +328,14 @@ replica with `SOURCE_SSL=1`; each must copy every closed binlog exactly, and
 under `require_secure_transport` a plain client must be refused with an
 error while `pull` keeps serving. Four more cases start `pull` with a
 missing certificate, a missing key, a key that is not the certificate's and
-a certificate that is not PEM: it must exit at once, naming the file. On
-2026-10-29 (PBS-31 part 1) the startup checks and plain clients pass, while
-every TLS client fails with `SSL connection error: wrong version number`:
-the listener advertises TLS but performs no handshake yet, and it does not
-enforce `require_secure_transport` (ticket 46, PBS-119). The nightly runs it every
-night.
+a certificate that is not PEM: it must exit at once, naming the file. Since
+PBS-31 parts 2 and 3 (upstream `6b0960f`) the listener performs the TLS
+handshake and every TLS client and the TLS replica pass (on PBS-31 part 1
+they failed with `wrong version number`, ticket 46, PBS-119). Still open: a
+plain client under `require_secure_transport` is refused, but `pull` closes
+the connection without an error packet, so the client sees only `Lost
+connection to MySQL server during query` instead of ER_SECURE_TRANSPORT_REQUIRED
+(3159) (ticket 48). The nightly runs it every night.
 
 `pull_soak_test.py` runs `pull` for a long time (`--duration`, 2 h by
 default) under churn: a steady workload with rotations and an occasional
@@ -540,7 +542,8 @@ server rather than starting one.
   `large_binlog_test position/transaction_over_4gib` (ticket 41, PBS-114),
   `pull_load_test position/shutdown` (ticket 43, PBS-116),
   `pull_soak_test position/log` (ticket 45, PBS-118: info-level log volume),
-  seven `pull_tls_test` cases (ticket 46, PBS-119: no TLS handshake yet),
+  `pull_tls_test position/plain_refused_when_required` (ticket 48: no error
+  packet for a plain client under `require_secure_transport`),
   `pull_gtid_test gtid/purged` and `gtid/ahead` (ticket 20, PBS-120: no ER 1236 for
   a replica lacking purged GTIDs or ahead of the source) and
   `fetch_crash_test gtid` (ticket 14, when the run generates a fetch /

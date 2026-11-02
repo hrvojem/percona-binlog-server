@@ -69,6 +69,7 @@ TARGETS = [("PUT", "binlog.0"), ("PUT", "binlog.index"), ("PUT", ".json"),
            ("GET", "binlog.0"), ("GET", "binlog.index"), ("GET", ".json"),
            ("GET", "list-type")]
 COUNTS = [1, 6]
+PULL_READ_TIMEOUT = 5
 WORKLOAD = [{"rows": [3000, 150_000], "ddl": False},
             {"rows": [500], "ddl": True}]
 RECOVERY_FIRST = [{"action": action, "method": "PUT", "match": "binlog.index",
@@ -119,6 +120,7 @@ def run_pull_read_case(args, faults) -> dict:
              "nth": 1, "count": 1000}
     result = {"case": "pull_read_shrunk_range", "fault": fault}
     pull = None
+    read_timeout = harness.BINSRV.read_timeout
     try:
         machine = harness.FetchCrashMachine()
         machine.start_from_scratch()
@@ -129,6 +131,10 @@ def run_pull_read_case(args, faults) -> dict:
         names = harness.SERVER.binlog_names()
         closed = names[:-1]
         pull_port = args.port + 2
+        # pull exits on SIGTERM only once its read from the idle source
+        # times out (ticket 43, PBS-116): a short timeout keeps the stop
+        # short, and a clean stop keeps a coverage build's counters
+        harness.BINSRV.read_timeout = PULL_READ_TIMEOUT
         pull = replication.start_pull(harness.BINSRV, pull_port)
 
         def copy(directory: Path) -> subprocess.CompletedProcess:
@@ -178,9 +184,14 @@ def run_pull_read_case(args, faults) -> dict:
         result["failure"] = harness.describe_failure(error)
     finally:
         faults.set_rules([])
+        harness.BINSRV.read_timeout = read_timeout
         if pull is not None and pull.poll() is None:
-            pull.kill()
-            pull.wait()
+            pull.terminate()
+            try:
+                pull.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                pull.kill()
+                pull.wait()
     return result
 
 

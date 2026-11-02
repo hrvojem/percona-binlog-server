@@ -39,6 +39,15 @@ and the exact bytes that triggered it are written to '<workdir>/crash.bin'.
 At the end a clean handshake plus COM_BINLOG_DUMP must still stream the
 stored binlogs, proving the listener still works.
 
+'pull' has an 'ssl' section (the MTR suite's test certificate), so the
+listener offers TLS (PBS-31), and some scenarios are hostile TLS clients: an
+SSL request followed by nothing, by garbage or by a truncated TLS record,
+the SSL flag in a full greeting, and, after a completed TLS handshake, a
+garbage greeting, wrong plain-text passwords, garbage commands and a second
+SSL request inside TLS. For those, crash.bin holds the plain bytes the
+client sent, outside and inside TLS. At the end a TLS client must still
+stream the binlogs too.
+
 Run against the AddressSanitizer build to catch memory errors. Example:
 
   PYTHONPATH=~/ws/qa/pylib python3 listener_fuzz_test.py \\
@@ -54,6 +63,7 @@ import os
 import random
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -72,6 +82,10 @@ PULL_PASSWORD = "fuzz_password"
 AUTH_RSA_PRIVATE_KEY = (Path(__file__).resolve().parents[2] / "mtr" /
                         "binlog_streaming" / "std_data" /
                         "caching_sha2_rsa_priv.pem")
+STD_DATA = (Path(__file__).resolve().parents[2] / "mtr" / "binlog_streaming" /
+            "std_data")
+SSL = {"cert": str(STD_DATA / "rs_cert.pem"),
+       "key": str(STD_DATA / "rs_priv.pem")}
 MYSQLBINLOG = Path("mysqlbinlog")  # set from --mysql-basedir in main()
 WORKLOAD = [{"rows": [2000, 40_000], "ddl": False},
             {"rows": [300], "ddl": True}]
@@ -79,6 +93,7 @@ WORKLOAD = [{"rows": [2000, 40_000], "ddl": False},
 # client capability flags (a subset of CLIENT_* from mysql_com.h)
 CLIENT_LONG_PASSWORD = 0x1
 CLIENT_PROTOCOL_41 = 0x200
+CLIENT_SSL = 0x800
 CLIENT_SECURE_CONNECTION = 0x8000
 CLIENT_PLUGIN_AUTH = 0x80000
 CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA = 0x200000
@@ -137,6 +152,19 @@ def greeting_payload(capabilities: int, username: bytes, auth_data: bytes,
     if capabilities & CLIENT_PLUGIN_AUTH:
         payload += plugin + b"\x00"
     return payload
+
+
+def ssl_request_payload(capabilities: int) -> bytes:
+    """An SSLRequest: the first 32 bytes of a HandshakeResponse41."""
+    return (struct.pack("<I", capabilities) + struct.pack("<I", 0x01000000) +
+            bytes([0xff]) + b"\x00" * 23)
+
+
+def tls_context() -> ssl.SSLContext:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
 
 
 class Listener:
@@ -230,6 +258,42 @@ class Listener:
                 self.send(frame(sequence + 1, encrypted))
         return False
 
+    def upgrade_to_tls(self, sequence: int = 1) -> bool:
+        """Sends an SSLRequest and performs the TLS handshake over the same
+        socket; True once TLS is up."""
+        self.send(frame(sequence, ssl_request_payload(
+            BASE_CAPABILITIES | CLIENT_SSL)))
+        try:
+            self.sock = tls_context().wrap_socket(self.sock)
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def tls_handshake(self, password: bytes = PULL_PASSWORD.encode() +
+                      b"\x00") -> bool:
+        """A login over TLS: SSLRequest, TLS, then the greeting; on "perform
+        full authentication" the password goes in plain (here: 'password',
+        by default the right one, NUL-terminated); True once the command
+        loop is reached."""
+        salt = self.server_salt()
+        if salt is None or not self.upgrade_to_tls():
+            return False
+        self.send(frame(2, greeting_payload(
+            BASE_CAPABILITIES | CLIENT_SSL, PULL_USER.encode(),
+            scramble(PULL_PASSWORD, salt), b"caching_sha2_password")))
+        for _ in range(4):
+            read = self.read_frame()
+            if read is None:
+                return False
+            sequence, body = read
+            if body[:1] == b"\x00":   # OK
+                return True
+            if body[:1] == b"\xff":   # ERR
+                return False
+            if body == b"\x01\x04":  # perform full authentication
+                self.send(frame(sequence + 1, password))
+        return False
+
     def close(self):
         try:
             self.sock.close()
@@ -267,7 +331,10 @@ def random_bytes(rng: random.Random, low: int, high: int) -> bytes:
 
 # each scenario returns a label; it talks to the listener through 'client'
 def scenario(rng: random.Random, client: Listener) -> str:
-    choice = rng.randrange(14)
+    choice = rng.randrange(22)
+
+    if choice >= 14:
+        return tls_scenario(choice, rng, client)
 
     if choice == 0:  # connect and close at once
         return "immediate close"
@@ -375,7 +442,91 @@ def scenario(rng: random.Random, client: Listener) -> str:
     return "binlog dump then close"
 
 
-def streams_binlogs(host: str, port: int) -> bool:
+def garbage_command(rng: random.Random, client: Listener):
+    """One of the command-loop scenarios 8-12, for a logged-in client."""
+    kind = rng.randrange(4)
+    if kind == 0:
+        body = bytes([rng.randint(0, 255)]) + random_bytes(rng, 0, 200)
+    elif kind == 1:
+        body = bytes([COM_BINLOG_DUMP]) + random_bytes(
+            rng, 0, rng.choice([0, 3, 6, 10, 200]))
+    elif kind == 2:
+        body = bytes([COM_BINLOG_DUMP_GTID]) + random_bytes(rng, 0, 300)
+    else:
+        body = bytes([COM_QUERY]) + random_bytes(rng, 0, 4000)
+    client.send(frame(0, body))
+    client.read_frame()
+
+
+def tls_scenario(choice: int, rng: random.Random, client: Listener) -> str:
+    """Hostile TLS clients (the listener has an 'ssl' section)."""
+    if choice == 14:  # SSLRequest, then close before any TLS byte
+        client.read_frame()
+        client.send(frame(1, ssl_request_payload(
+            BASE_CAPABILITIES | CLIENT_SSL)))
+        return "ssl request then close"
+
+    if choice == 15:  # SSLRequest, then garbage instead of a ClientHello
+        client.read_frame()
+        client.send(frame(1, ssl_request_payload(
+            BASE_CAPABILITIES | CLIENT_SSL)) + random_bytes(rng, 1, 600))
+        client.read_frame()
+        return "ssl request then garbage"
+
+    if choice == 16:  # SSLRequest, then a TLS record cut short or lying
+        client.read_frame()
+        length = rng.choice([0, 1, 200, 0x4000, 0xFFFF])
+        record = bytes([0x16, 0x03, rng.choice([0x01, 0x03])]) + \
+            struct.pack(">H", length) + bytes([0x01]) + \
+            random_bytes(rng, 0, 120)
+        client.send(frame(1, ssl_request_payload(
+            BASE_CAPABILITIES | CLIENT_SSL)) + record)
+        client.read_frame()
+        return "truncated tls record"
+
+    if choice == 17:  # the SSL flag in a full greeting, then plain frames
+        salt = client.server_salt()
+        client.send(frame(1, greeting_payload(
+            BASE_CAPABILITIES | CLIENT_SSL, PULL_USER.encode(),
+            scramble(PULL_PASSWORD, salt or b"\x00" * 20),
+            b"caching_sha2_password")))
+        client.send(frame(2, random_bytes(rng, 0, 100)))
+        client.read_frame()
+        return "ssl flag in full greeting"
+
+    # the rest complete the TLS handshake first
+    if choice == 18:  # garbage in place of the greeting, inside TLS
+        client.read_frame()
+        if not client.upgrade_to_tls(rng.choice([1, 1, 0, 5])):
+            return "tls handshake failed"
+        client.send(frame(2, random_bytes(rng, 0, 300)))
+        client.read_frame()
+        return "garbage greeting over tls"
+
+    if choice == 19:  # a wrong plain-text password: random, unterminated,
+        # empty or the right one without its NUL
+        password = rng.choice([random_bytes(rng, 0, 80),
+                               random_bytes(rng, 1, 40) + b"\x00", b"",
+                               PULL_PASSWORD.encode()])
+        client.tls_handshake(password)
+        return "wrong password over tls"
+
+    if not client.tls_handshake():
+        return "tls login did not complete"
+
+    if choice == 20:  # garbage commands in a TLS session
+        for _ in range(rng.randint(1, 3)):
+            garbage_command(rng, client)
+        return "garbage command over tls"
+
+    # choice == 21: a second SSLRequest inside the TLS session
+    client.send(frame(0, ssl_request_payload(
+        BASE_CAPABILITIES | CLIENT_SSL)))
+    client.read_frame()
+    return "ssl request inside tls"
+
+
+def streams_binlogs(host: str, port: int, tls: bool = False) -> bool:
     """A clean login plus a non-blocking dump of binlog.000001 with the real
     mysqlbinlog (full caching_sha2_password authentication with
     --get-server-public-key, @source_binlog_checksum declared); returns True
@@ -386,6 +537,7 @@ def streams_binlogs(host: str, port: int) -> bool:
              f"--host={host}", f"--port={port}", f"--user={PULL_USER}",
              f"--password={PULL_PASSWORD}",
              "--default-auth=caching_sha2_password", "--get-server-public-key",
+             "--ssl-mode=REQUIRED" if tls else "--ssl-mode=DISABLED",
              "binlog.000001"],
             capture_output=True, timeout=30, check=False)
     except subprocess.TimeoutExpired:
@@ -437,6 +589,7 @@ def main():
             "read_timeout": 3, "write_timeout": 3,
             "require_secure_transport": False,
             "auth_rsa_private_key": str(AUTH_RSA_PRIVATE_KEY),
+            "ssl": SSL,
             "authentication": {"user": PULL_USER, "password": PULL_PASSWORD,
                                "plugin": "caching_sha2_password"}}
         binsrv.config_path.write_text(json.dumps(config, indent=2))
@@ -492,6 +645,8 @@ def main():
         else:
             result["crashed"] = False
             result["still_serves"] = streams_binlogs("127.0.0.1", pull_port)
+            result["still_serves_tls"] = streams_binlogs("127.0.0.1",
+                                                         pull_port, True)
     finally:
         if pull is not None and pull.poll() is None:
             pull.send_signal(signal.SIGTERM)
@@ -503,7 +658,9 @@ def main():
 
     print(json.dumps(result), flush=True)
     (args.workdir / "result.json").write_text(json.dumps(result, indent=2))
-    ok = not result.get("crashed", True) and result.get("still_serves", False)
+    ok = not result.get("crashed", True) and \
+        result.get("still_serves", False) and \
+        result.get("still_serves_tls", False)
     return 0 if ok else 1
 
 

@@ -202,8 +202,15 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/network_fault_test.py \
 Throws malformed MySQL client traffic at the `pull` mode replication source
 listener (garbage greetings, lying length headers, the auth-method-switch path
 with junk, truncated `COM_BINLOG_DUMP`, random commands, bad sequence numbers)
-and checks that `pull` keeps running and still serves binlogs. The campaign is
-seeded and reproducible; run it against the ASan build.
+and checks that `pull` keeps running and still serves binlogs. `pull` has an
+`ssl` section (the MTR test certificate), so a third of the scenarios are
+hostile TLS clients (PBS-31): an SSL request followed by nothing, garbage or a
+truncated TLS record, the SSL flag in a full greeting, and, after a completed
+handshake, a garbage greeting, wrong plain-text passwords, garbage commands
+and a second SSL request inside TLS; at the end a TLS client must still get
+the binlogs too. The campaign is seeded and reproducible; run it against the
+ASan build. A first run on 2026-11-02 (debug build at upstream `6b0960f`,
+2000 connections per mode) found nothing.
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/listener_fuzz_test.py \
@@ -342,7 +349,9 @@ default) under churn: a steady workload with rotations and an occasional
 large transaction, three long-lived `mysqlbinlog --stop-never` clients, a
 replica stopped and started every 10 minutes, and a short client every 15 s
 (most copy from a random closed binlog to the end and exit, some are killed
-during the dump). Every minute it samples `pull`'s resident memory, open
+during the dump). `pull` has an `ssl` section, and TLS and plain connections
+are mixed: the second long-lived client, about half the short clients and
+the replica (`SOURCE_SSL=1`) use TLS. Every minute it samples `pull`'s resident memory, open
 file descriptors and threads (`/proc`), its log size and the storage size
 (`samples.json`). Cases: `alive`; `memory`, `file_descriptors`, `threads`
 (the last quarter of the run against the second, after a quarter of
@@ -352,7 +361,10 @@ the end). The first 15-minute run (2026-10-29, debug build) was flat (about
 23 MB, 16 descriptors, 2 threads) and exact, but the log grew 67 MB per hour:
 at info level `pull` logs every event it streams, per client (89% of the
 lines; ticket 45, PBS-118), and a client that dies during a dump is logged as an
-error (EPIPE, part of ticket 42).
+error (EPIPE, part of ticket 42). A 15-minute run with TLS clients
+(2026-11-02, upstream `6b0960f`: 36 of 65 connections over TLS) was flat and
+exact as well, and the TLS clients killed during a dump added no new error
+lines.
 
 `repro_broken_checkpointing.py` is a self-contained reproducer kept from an
 earlier finding (checkpoint settings having no effect); it drives an existing

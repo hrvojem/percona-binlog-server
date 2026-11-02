@@ -27,6 +27,11 @@ while 'pull' (info log level) serves:
     random closed binlog to the end of the data and exit, some are killed
     (SIGKILL) a few seconds into a --stop-never dump, as a client that dies.
 
+pull has an 'ssl' section (the MTR suite's test certificate, PBS-31), and
+TLS and plain connections are mixed: every second long-lived client, a
+TLS_SHARE of the churn clients (aborted ones included) and the replica
+(SOURCE_SSL=1) use TLS.
+
 Every SAMPLE_SECONDS it records pull's resident memory, open file
 descriptors and threads (/proc), its log size and the storage size. Cases
 (one JSON line each, the samples in --workdir/samples.json):
@@ -77,9 +82,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fetch_crash_test as harness  # noqa: E402
 import pull_replica_test as replication  # noqa: E402
 
-AUTH_RSA_PUBLIC_KEY = (Path(__file__).resolve().parents[2] / "mtr" /
-                       "binlog_streaming" / "std_data" /
-                       "caching_sha2_rsa_pub.pem")
+STD_DATA = (Path(__file__).resolve().parents[2] / "mtr" / "binlog_streaming" /
+            "std_data")
+AUTH_RSA_PUBLIC_KEY = STD_DATA / "caching_sha2_rsa_pub.pem"
+SSL = {"cert": str(STD_DATA / "rs_cert.pem"),
+       "key": str(STD_DATA / "rs_priv.pem")}
+TLS_SHARE = 0.5
 LONG_LIVED = 3
 TRANSACTION = [{"rows": [2000, 500], "ddl": False}]
 LARGE_TRANSACTION = [{"rows": [200_000], "ddl": False}]
@@ -113,6 +121,7 @@ def start_pull(binsrv, pull_port: int) -> subprocess.Popen:
         "read_timeout": 60, "write_timeout": 60,
         "require_secure_transport": False,
         "auth_rsa_private_key": str(replication.AUTH_RSA_PRIVATE_KEY),
+        "ssl": SSL,
         "authentication": {"user": replication.PULL_USER,
                            "password": replication.PULL_PASSWORD,
                            "plugin": "caching_sha2_password"}}
@@ -126,7 +135,8 @@ def start_pull(binsrv, pull_port: int) -> subprocess.Popen:
 
 
 def start_client(args, port: int, first_binlog: str, directory: Path,
-                 server_id: int, stop_never: bool) -> subprocess.Popen:
+                 server_id: int, stop_never: bool,
+                 tls: bool = False) -> subprocess.Popen:
     directory.mkdir(parents=True, exist_ok=True)
     return subprocess.Popen(
         [str(args.mysql_basedir / "bin" / "mysqlbinlog"), "--no-defaults",
@@ -134,7 +144,7 @@ def start_client(args, port: int, first_binlog: str, directory: Path,
          f"--user={replication.PULL_USER}",
          f"--password={replication.PULL_PASSWORD}",
          f"--server-public-key-path={AUTH_RSA_PUBLIC_KEY}",
-         "--ssl-mode=DISABLED", "--raw",
+         "--ssl-mode=REQUIRED" if tls else "--ssl-mode=DISABLED", "--raw",
          "--stop-never" if stop_never else "--to-last-log",
          f"--connection-server-id={server_id}",
          f"--result-file={directory}/", first_binlog],
@@ -208,11 +218,12 @@ def run(args) -> list:
         replication.replicate_from_pull(
             replica, pull_port, False,
             f"SOURCE_LOG_FILE='{first_binlog}', SOURCE_LOG_POS=4, "
-            "SOURCE_HEARTBEAT_PERIOD=1")
+            "SOURCE_HEARTBEAT_PERIOD=1", source_ssl=True)
         for index in range(LONG_LIVED):
             long_lived.append(start_client(
                 args, pull_port, first_binlog,
-                work / "copies" / f"long{index}", 1000 + index, True))
+                work / "copies" / f"long{index}", 1000 + index, True,
+                tls=index % 2 == 1))
 
         started = time.monotonic()
         next_sample = started
@@ -241,13 +252,14 @@ def run(args) -> list:
                 if closed:
                     start_name = rng.choice(closed)
                     aborted = rng.random() < ABORTED_SHARE
+                    tls = rng.random() < TLS_SHARE
                     directory = work / "copies" / f"churn{churn_index:05d}"
                     process = start_client(args, pull_port, start_name,
                                            directory, 2000 + churn_index,
-                                           aborted)
+                                           aborted, tls=tls)
                     churn.append({
                         "process": process, "directory": directory,
-                        "aborted": aborted,
+                        "aborted": aborted, "tls": tls,
                         "kill_at": now + rng.uniform(1.0, 5.0),
                         "closed": [name for name in closed
                                    if name >= start_name]})
@@ -359,6 +371,7 @@ def run(args) -> list:
         results["copies"].update(
             closed_binlogs=len(closed), completed_churn_clients=len(completed),
             aborted_churn_clients=len(churn) - len(completed),
+            tls_churn_clients=sum(1 for client in churn if client["tls"]),
             churn_clients_failed=failed_churn[:5],
             long_lived_exited=exited_long, wrong=wrong[:5],
             ok=not wrong and not failed_churn and not exited_long)

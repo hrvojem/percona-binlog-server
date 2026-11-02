@@ -90,11 +90,13 @@ def start_pull(binsrv, pull_port: int) -> subprocess.Popen:
 
 
 def replicate_from_pull(replica, pull_port: int, gtid_mode: bool,
-                        start: str, prepare: str = "") -> None:
+                        start: str, prepare: str = "",
+                        source_ssl: bool = False) -> None:
     """Points 'replica' at the listener of 'pull' and starts replication;
     'start' holds the starting-point options of CHANGE REPLICATION SOURCE TO
     (and any other options to add), 'prepare' any statements to run on the
-    reset replica first (such as giving it GTIDs)."""
+    reset replica first (such as giving it GTIDs), 'source_ssl' whether it
+    connects over TLS (pull needs an 'ssl' section then)."""
     # the source creates the 'qa' database before resetting its binary
     # logs (see fetch_crash_test.Server), so the schema is not in any
     # binlog: the replica starts from an empty 'qa' of its own
@@ -108,7 +110,8 @@ def replicate_from_pull(replica, pull_port: int, gtid_mode: bool,
     replica.sql(
         f"CHANGE REPLICATION SOURCE TO SOURCE_HOST='127.0.0.1', "
         f"SOURCE_PORT={pull_port}, SOURCE_USER='{PULL_USER}', "
-        f"SOURCE_PASSWORD='{PULL_PASSWORD}', GET_SOURCE_PUBLIC_KEY=1, SOURCE_SSL=0, "
+        f"SOURCE_PASSWORD='{PULL_PASSWORD}', GET_SOURCE_PUBLIC_KEY=1, "
+        f"SOURCE_SSL={1 if source_ssl else 0}, "
         f"SOURCE_CONNECT_RETRY=2, {start}; START REPLICA;")
 
 

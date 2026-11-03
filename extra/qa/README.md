@@ -305,6 +305,10 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_tls_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/pull-tls
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_gtid_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/pull-gtid
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_gtid_set_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/pull-gtid-set
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/telemetry_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/telemetry
 ```
 
 `pull_gtid_test.py` drives GTID auto-position replicas (PBS-29 part 2,
@@ -324,6 +328,43 @@ both of the others (ticket 20, PBS-120): the purged replica is silently streamed
 what is left (transactions 80-104 of 1-104, so its SQL thread fails on a
 missing table), the replica that is ahead waits for transactions that
 never come. The nightly runs it every night (`QA_PORT`+230, about 3 min).
+
+`pull_gtid_set_test.py` checks where `pull` starts an auto-positioned dump
+(PBS-29 part 3) for replicas with uneven GTID sets. The source writes six
+binlogs, each with ten transactions of its own UUID, three of a second UUID
+(`GTID_NEXT`) and, on 8.3 and later, two tagged GTIDs (`<uuid>:qa:N`); every
+transaction inserts a row with a known id. For each case a replica is given
+every GTID but some (`GTID_PURGED`) and connects; it must end with the
+source's GTID_EXECUTED, exactly the rows of the transactions it lacked and
+no thread error. Cases: `full`, `gap_spanning` (ten across a binlog
+boundary), `mid_binlog`, `two_gaps`, `single_first`, `single_last`,
+`other_uuid` (none of the second UUID), `tagged` and `nothing_missing`
+(transactions written after it connects must still arrive). On 2026-11-03
+all pass on 8.0, 8.4 and 9.7 (see below). The nightly runs it every night
+(`QA_PORT`+250, about 2 min).
+
+`telemetry_test.py` covers the telemetry reports of `pull` and the
+instance_id (PBS-41) beyond the MTR tests. `pull` cases (`pull` runs for 8 s
+with its own `telemetry` section and must keep serving a binlog to
+mysqlbinlog): `reports` (names, one tag, mode 0644, fields, growing uptime),
+`scrape_zero`, `scrape_negative` and `scrape_huge` (`200000d`, past the ~292
+years of int64 nanoseconds: no tight loop), `grace_huge` (no report),
+`path_is_file` and `path_unwritable` (no report, a logged failure),
+`cleanup_odd_names` (own old reports and stale foreign ones removed, files
+that only look like reports kept), `shared_directory` (two instances keep
+each other's recent reports), `settings_in_storage` (`local_settings_path`
+is the storage directory) and `damaged_id` (regenerated, as the README
+says; whether that is logged is reported). instance_id cases on `list`:
+`readonly_without_id` (fails, naming the instance id: the directory must be
+writable), `readonly_with_id`, `padded_id`, `uppercase_id`,
+`id_is_directory`, `leftover_tmp` and `no_instance_section` (a config of an
+earlier release is refused naming `instance`). On 2026-11-03 four fail:
+`scrape_zero`, `scrape_huge` and `grace_huge` (ticket 49: intervals are not
+validated; 0 writes 100-170 reports a second, more than ~292 years overflows
+the timer and expires at once) and `settings_in_storage` (ticket 50: the
+instance_id file makes a fresh storage directory "not empty but does not
+contain metadata"). A replaced damaged id is not logged. The nightly runs
+it every night (`QA_PORT`+270, about 3 min).
 
 `pull_tls_test.py` checks TLS on the listener (PBS-31). It starts `pull`
 with one `replication_source` configuration after another on the same
@@ -396,7 +437,10 @@ server rather than starting one.
      (TLS on the listener, 13 cases, port `QA_PORT`+190) and
      `pull_gtid_test.py` (GTID auto-position replicas, cases
      `gtid/catch_up`, `gtid/restart`, `gtid/purged` and `gtid/ahead`, port
-     `QA_PORT`+230), all with the debug build,
+     `QA_PORT`+230), `pull_gtid_set_test.py` (auto-positioning with
+     uneven replica GTID sets, 10 `gtid/...` cases, port `QA_PORT`+250) and
+     `telemetry_test.py` (telemetry and instance_id, 18 `position/...`
+     cases, port `QA_PORT`+270), all with the debug build,
      and a short
      `fetch_crash_test.py` run per mode (cases `gtid` and `position`,
      10 examples of 8 steps, `QA_EXAMPLES` / `QA_STEPS`) with the ASan build,
@@ -557,7 +601,11 @@ server rather than starting one.
   `pull_tls_test position/plain_refused_when_required` (ticket 48: no error
   packet for a plain client under `require_secure_transport`),
   `pull_gtid_test gtid/purged` and `gtid/ahead` (ticket 20, PBS-120: no ER 1236 for
-  a replica lacking purged GTIDs or ahead of the source) and
+  a replica lacking purged GTIDs or ahead of the source),
+  `telemetry_test position/scrape_zero`, `scrape_huge` and `grace_huge`
+  (ticket 49: telemetry intervals not validated),
+  `telemetry_test position/settings_in_storage` (ticket 50:
+  `local_settings_path` in the storage directory) and
   `fetch_crash_test gtid` (ticket 14, when the run generates a fetch /
   `FLUSH BINARY LOGS` / fetch sequence).
 - **`ci_property_tests.sh`** — what the CI job *GCC 14 Debug Property Tests*

@@ -14,7 +14,8 @@
 # debug build on MySQL 8.0, 8.4 and 9.7 (MTR_DISTS), and black-box QA
 # harnesses from extra/qa run against MySQL 8.4: every night
 # pull_replica_test.py, query_race_test.py, pull_heartbeat_test.py,
-# pull_tls_test.py, pull_gtid_test.py and a
+# pull_tls_test.py, pull_gtid_test.py, pull_gtid_set_test.py,
+# telemetry_test.py and a
 # short fetch_crash_test.py run per mode on file and on S3 storage; and one
 # of the heavier harnesses by day of the week (QA_ROTATION: the S3 and disk
 # fault sweeps, the network fault test, the listener fuzzer, the source
@@ -524,6 +525,12 @@ if want qa; then
     qa_run pull_gtid_test pull_gtid_test \
       --binsrv "$debug_binsrv" --workdir "$out/qa/gtid" \
       --port $((QA_PORT + 230)) --mode gtid --timeout 1200
+    qa_run pull_gtid_set_test pull_gtid_set_test \
+      --binsrv "$debug_binsrv" --workdir "$out/qa/gtid-set" \
+      --port $((QA_PORT + 250)) --mode gtid --timeout 1200
+    qa_run telemetry_test telemetry_test \
+      --binsrv "$debug_binsrv" --workdir "$out/qa/telemetry" \
+      --port $((QA_PORT + 270)) --timeout 900
   fi
   # the crash/resume test runs against the ASan build to catch memory errors
   if [ -n "${build_failed[asan_gcc14]:-}" ]; then

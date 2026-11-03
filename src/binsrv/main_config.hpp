@@ -18,11 +18,15 @@
 
 #include "binsrv/main_config_fwd.hpp" // IWYU pragma: export
 
+#include <string>
+
+#include "binsrv/instance_config.hpp"           // IWYU pragma: export
 #include "binsrv/keyring_config.hpp"            // IWYU pragma: export
 #include "binsrv/logger_config.hpp"             // IWYU pragma: export
 #include "binsrv/replication_config.hpp"        // IWYU pragma: export
 #include "binsrv/replication_source_config.hpp" // IWYU pragma: export
 #include "binsrv/storage_config.hpp"            // IWYU pragma: export
+#include "binsrv/telemetry_config.hpp"          // IWYU pragma: export
 
 #include "easymysql/connection_config.hpp" // IWYU pragma: export
 
@@ -34,12 +38,14 @@ class [[nodiscard]] main_config {
 private:
   using impl_type = util::nv_tuple<
       // clang-format off
+      util::nv<"instance"          , instance_config>,
       util::nv<"logger"            , logger_config>,
       util::nv<"connection"        , easymysql::connection_config>,
       util::nv<"replication"       , binsrv::replication_config>,
       util::nv<"replication_source", binsrv::replication_source_config>,
       util::nv<"keyring"           , optional_keyring_config>,
-      util::nv<"storage"           , storage_config>
+      util::nv<"storage"           , storage_config>,
+      util::nv<"telemetry"         , optional_telemetry_config>
       // clang-format on
       >;
 
@@ -48,8 +54,17 @@ public:
 
   [[nodiscard]] const auto &root() const noexcept { return impl_; }
 
+  // This instance's stable identifier (canonical UUID). It is established when
+  // the configuration is loaded: read from the instance_id file under
+  // instance.local_settings_path, or generated and persisted there on the
+  // first run.
+  [[nodiscard]] const std::string &instance_id() const noexcept {
+    return instance_id_;
+  }
+
 private:
   impl_type impl_;
+  std::string instance_id_;
 
   void validate() const;
 };

@@ -478,6 +478,9 @@ Please also notice that running the utility in the `purge_binlogs` mode on a cer
 The Percona Binary Log Server configuration file has the following format.
 ```json
 {
+  "instance": {
+    "local_settings_path": "/var/lib/pbs"
+  },
   "logger": {
     "level": "debug",
     "file": "binsrv.log"
@@ -547,9 +550,16 @@ The Percona Binary Log Server configuration file has the following format.
       "kek_id": "alpha",
       "cipher": "AES-256-CTR"
     }
+  },
+  "telemetry": {
+    "enabled": true
   }
 }
 ```
+
+#### \<instance\> section
+This mandatory section identifies the Percona Binary Log Server instance and points to its node-local state.
+- `<instance.local_settings_path>` - a path to a writable local directory (which must already exist and be a directory, or a symbolic link to one) where the utility keeps per-instance state. When several Binary Log Server instances run on the same host, give each one its own `local_settings_path` so that they do not share instance-local state. On the first run of any mode that reads the configuration file (`fetch`, `pull`, `list`, `search_by_timestamp`, `search_by_gtid_set`, `purge_binlogs`) the utility generates a stable instance identifier and stores it in an `instance_id` file inside this directory; subsequent runs reuse it (a missing or malformed `instance_id` file is regenerated).
 
 #### \<logger\> section
 - `<logger.level>` sets the minimum severity of the log messages that user want to appear in the log output, can be one of the `trace` / `debug` / `info` / `warning` / `error` / `fatal`  (explained below).
@@ -744,6 +754,12 @@ Keyring JSON file should represent a top-level JSON object with the following ke
 
 Make sure that the mode of the `cipher` is one of the `ECB`, `CBC`, `CTR`, or `GCM`. Also, make sure that the key size identified from the cipher name matches the actual `data_hex` length (for instance, for `AES-256-GCM`, the key length should be `256` bits, meaning `32` bytes, meaning `64` hexadecimal characters).
 As for the `algoritm` part of the cipher name, PBS has been tested with `AES`, `AREA`, and `CAMELLIA`. However, other algorithms be supported as well.
+
+#### \<telemetry\> optional section
+This optional section controls Percona telemetry reporting. When the section is omitted, telemetry is enabled. Telemetry is only produced in `pull` mode, which is the long-running one; the other modes never write telemetry. A write failure (for example, a missing or non-writable directory) is logged as a warning and never affects replication.
+- `<telemetry.enabled>` - whether telemetry is produced (default `true`). Set to `false` to disable it.
+
+Each report is a small JSON file containing the two mandatory fields `db_instance_id` (the stable instance identifier from `<instance.local_settings_path>`) and `pillar_version` (the PBS version), plus `uptime` (the number of whole seconds since PBS started).
 
 ### Resuming previous operation
 

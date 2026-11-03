@@ -167,6 +167,8 @@ set(util_source_files
   src/util/timestamp_types.hpp
   src/util/timestamp_helpers.hpp
   src/util/timestamp_helpers.cpp
+
+  src/util/uuid_helpers.hpp
 )
 add_library(lib_util STATIC ${util_source_files})
 target_link_libraries(lib_util
@@ -614,6 +616,13 @@ set(binsrv_source_files
   src/binsrv/filesystem_storage_backend.hpp
   src/binsrv/filesystem_storage_backend.cpp
 
+  src/binsrv/instance_config_fwd.hpp
+  src/binsrv/instance_config.hpp
+  src/binsrv/instance_config.cpp
+
+  src/binsrv/instance_id.hpp
+  src/binsrv/instance_id.cpp
+
   src/binsrv/log_severity_fwd.hpp
   src/binsrv/log_severity.hpp
 
@@ -695,6 +704,14 @@ set(binsrv_source_files
   src/binsrv/storage_config_fwd.hpp
   src/binsrv/storage_config.hpp
   src/binsrv/storage_config.cpp
+
+  src/binsrv/telemetry_config_fwd.hpp
+  src/binsrv/telemetry_config.hpp
+  src/binsrv/telemetry_config.cpp
+
+  src/binsrv/telemetry_fwd.hpp
+  src/binsrv/telemetry.hpp
+  src/binsrv/telemetry.cpp
 
   src/binsrv/storage_metadata_fwd.hpp
   src/binsrv/storage_metadata.hpp

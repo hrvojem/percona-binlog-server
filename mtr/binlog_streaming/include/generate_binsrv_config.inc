@@ -33,6 +33,12 @@
 #   --let $binsrv_source_secure_transport_required = TRUE | FALSE (optional, default: FALSE)
 #   --let $binsrv_source_ssl_cert = /path/to/source-cert.pem (optional)
 #   --let $binsrv_source_ssl_private_key = /path/to/source-key.pem (optional)
+#   --let $binsrv_local_settings_path = /existing/dir (optional, default: $MYSQL_TMP_DIR/binsrv_local_settings)
+#   --let $binsrv_telemetry_path = /existing/dir (optional; when unset telemetry is disabled, when set a telemetry section is emitted)
+#   --let $binsrv_telemetry_enabled = TRUE | FALSE (optional; when unset the 'enabled' field is omitted so the utility default applies)
+#   --let $binsrv_telemetry_grace_interval = 2 (optional, time unit string)
+#   --let $binsrv_telemetry_scrape_interval = 3600 (optional, time unit string)
+#   --let $binsrv_telemetry_history_keep_interval = 3600 (optional, time unit string)
 #   --source set_up_binsrv_environment.inc
 
 --echo
@@ -135,7 +141,20 @@ if ($binsrv_source_ssl_cert != "")
   }
 }
 
+# The 'instance' section is mandatory. Its 'local_settings_path' must point to
+# an existing directory. We use a dedicated per-worker directory that
+# set_up_binsrv_environment.inc creates and tear_down_binsrv_environment.inc
+# removes, so that the instance_id file the utility writes there does not stay
+# behind in $MYSQL_TMP_DIR and trip MTR's check for leftover files.
+if ($binsrv_local_settings_path == "")
+{
+  --let $binsrv_local_settings_path = $MYSQL_TMP_DIR/binsrv_local_settings
+}
+
 eval SET @binsrv_config_json = JSON_OBJECT(
+  'instance', JSON_OBJECT(
+    'local_settings_path', '$binsrv_local_settings_path'
+  ),
   'logger', JSON_OBJECT(
     'level', '$binsrv_log_level',
     'file', @log_path
@@ -249,6 +268,42 @@ if ($binsrv_source_ssl_enabled)
       'key', '$binsrv_source_ssl_private_key'
     )
   );
+}
+
+# The 'telemetry' section is optional and PBS enables telemetry by
+# default when it is absent. To keep unrelated tests from producing telemetry,
+# it is disabled here by default. Telemetry tests opt in by setting
+# $binsrv_telemetry_path; they leave $binsrv_telemetry_enabled unset to exercise
+# the "enabled by default" behavior, or set it (e.g. FALSE) to override. The
+# interval fields are time unit strings (a bare number is seconds); tests use
+# small values so that a report is written quickly instead of after the
+# production grace interval.
+if ($binsrv_telemetry_path == "")
+{
+  eval SET @binsrv_config_json = JSON_INSERT(
+    @binsrv_config_json, '$.telemetry', JSON_OBJECT('enabled', FALSE));
+}
+if ($binsrv_telemetry_path != "")
+{
+  eval SET @binsrv_config_json = JSON_INSERT(
+    @binsrv_config_json, '$.telemetry',
+    JSON_OBJECT('path', '$binsrv_telemetry_path'));
+  if ($binsrv_telemetry_enabled != "")
+  {
+    eval SET @binsrv_config_json = JSON_INSERT(@binsrv_config_json, '$.telemetry.enabled', $binsrv_telemetry_enabled);
+  }
+  if ($binsrv_telemetry_grace_interval != "")
+  {
+    eval SET @binsrv_config_json = JSON_INSERT(@binsrv_config_json, '$.telemetry.grace_interval', '$binsrv_telemetry_grace_interval');
+  }
+  if ($binsrv_telemetry_scrape_interval != "")
+  {
+    eval SET @binsrv_config_json = JSON_INSERT(@binsrv_config_json, '$.telemetry.scrape_interval', '$binsrv_telemetry_scrape_interval');
+  }
+  if ($binsrv_telemetry_history_keep_interval != "")
+  {
+    eval SET @binsrv_config_json = JSON_INSERT(@binsrv_config_json, '$.telemetry.history_keep_interval', '$binsrv_telemetry_history_keep_interval');
+  }
 }
 
 --let $binsrv_config_file_path = $MYSQL_TMP_DIR/binsrv_config.json

@@ -1,4 +1,7 @@
 {
+  "instance": {
+    "local_settings_path": "/var/lib/pbs"
+  },
   "logger": {
     "level": "debug",
     "file": "binsrv.log"
@@ -68,5 +71,8 @@
       "kek_id": "alpha",
       "cipher": "AES-256-CTR"
     }
+  },
+  "telemetry": {
+    "enabled": true
   }
 }

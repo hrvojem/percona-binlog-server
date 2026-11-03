@@ -161,9 +161,11 @@ private:
   std::filesystem::path path_;
 };
 
-// a minimal filesystem-backed, position-mode storage configuration
+// a minimal filesystem-backed storage configuration, in position mode
+// unless 'mode' says "gtid"
 [[nodiscard]] std::filesystem::path
-write_config(const std::filesystem::path &directory) {
+write_config(const std::filesystem::path &directory,
+             std::string_view mode = "position") {
   const auto storage_directory{directory / "storage"};
   std::filesystem::create_directories(storage_directory);
   const auto config_path{directory / "config.json"};
@@ -181,7 +183,7 @@ write_config(const std::filesystem::path &directory) {
   },
   "replication": {
     "server_id": 42, "idle_time": 10, "verify_checksum": true,
-    "mode": "position"
+    "mode": ")" << mode << R"("
   },
   "replication_source": {
     "port": 3307, "server_id": 142,
@@ -352,6 +354,8 @@ struct stream_outcome {
   std::vector<byte_vector> events;
   // get_event() threw (as opposed to reaching the end of the data)
   bool failed;
+  // what() of the exception it threw
+  std::string error{};
 };
 
 // reads a sender_context's stream up to the end of the stored data or the
@@ -368,8 +372,9 @@ struct stream_outcome {
           operations::event_fetching_result_type::success) {
         event = {};
       }
-    } catch (const std::exception &) {
+    } catch (const std::exception &exception) {
       result.failed = true;
+      result.error = exception.what();
       return result;
     }
     if (std::empty(event)) {
@@ -1603,9 +1608,11 @@ public:
                 binsrv::open_binlog_status::created,
             "a binlog was not created");
     std::uint64_t offset{events::magic_binlog_offset};
-    const auto store{[&](const byte_vector &bytes, bool at_boundary) {
-      storage_->write_event(util::const_byte_span{bytes}, at_boundary,
-                            binsrv::gtids::gtid{},
+    // the GTID goes with the events of its transaction, as the collector
+    // passes it (a GTID-mode storage records it at the boundary)
+    const auto store{[&](const byte_vector &bytes, bool at_boundary,
+                         const binsrv::gtids::gtid &gtid) {
+      storage_->write_event(util::const_byte_span{bytes}, at_boundary, gtid,
                             util::ctime_timestamp{std::time_t{1}}, 0ULL);
       offset += std::size(bytes);
     }};
@@ -1613,10 +1620,10 @@ public:
                               .format_description = make_fde(),
                               .previous_gtids_log = {},
                               .transactions = {}};
-    store(binlog.format_description, true);
+    store(binlog.format_description, true, binsrv::gtids::gtid{});
     binlog.previous_gtids_log =
         make_previous_gtids_log(offset, server_id, previous_);
-    store(binlog.previous_gtids_log, true);
+    store(binlog.previous_gtids_log, true, binsrv::gtids::gtid{});
     for (std::size_t index{0U}; index != std::size(specs); ++index) {
       const auto &spec{specs[index]};
       stored_transaction transaction{.gtid = {}, .events = {}};
@@ -1660,13 +1667,14 @@ public:
       }
       ++sequence_number_;
       if (!(damaged && damage == transaction_damage::missing_gtid_event)) {
-        store(gtid_event, false);
+        store(gtid_event, false, transaction.gtid);
         transaction.events.push_back(std::move(gtid_event));
       }
       for (std::size_t event{0U}; event != std::size(spec.other_event_sizes);
            ++event) {
         auto bytes{make_event(spec.other_event_sizes[event], event_id_++)};
-        store(bytes, event + 1U == std::size(spec.other_event_sizes));
+        store(bytes, event + 1U == std::size(spec.other_event_sizes),
+              transaction.gtid);
         transaction.events.push_back(std::move(bytes));
       }
       binlog.transactions.push_back(std::move(transaction));
@@ -1730,6 +1738,23 @@ store_gtid_binlogs(binsrv::storage &storage,
 // artificial ROTATE: the FORMAT_DESCRIPTION (see
 // gtid_mode_format_description()), the PREVIOUS_GTIDS_LOG, then every
 // transaction the replica lacks (anonymous ones always)
+// the binlog a GTID-mode dump starts from (auto-positioning, PBS-29 part 3,
+// as MySQL's find_first_log_not_in_gtid_set): the first one holding a GTID
+// the replica lacks (anonymous transactions do not count), else the last
+[[nodiscard]] std::size_t
+auto_position_index(const std::vector<stored_gtid_binlog> &binlogs,
+                    const binsrv::gtids::gtid_set &replica) {
+  for (std::size_t index{0U}; index != std::size(binlogs); ++index) {
+    for (const auto &transaction : binlogs[index].transactions) {
+      if (!transaction.gtid.is_empty() &&
+          !replica.contains(transaction.gtid)) {
+        return index;
+      }
+    }
+  }
+  return std::size(binlogs) - 1U;
+}
+
 [[nodiscard]] std::vector<std::vector<byte_vector>>
 expected_gtid_stream(const std::vector<stored_gtid_binlog> &binlogs,
                      const binsrv::gtids::gtid_set &replica) {
@@ -1819,13 +1844,14 @@ BOOST_AUTO_TEST_CASE(GtidModeStreamsExactlyTheMissingTransactions) {
     const bool session_checksum{tc.draw("checksum", gs::booleans())};
     const auto block_size{tc.draw("block", block_sizes())};
 
-    const auto storage{make_storage(write_config(directory.path()))};
+    const auto storage{make_storage(write_config(directory.path(), "gtid"))};
     const auto stored{store_gtid_binlogs(*storage, binlogs)};
     const auto replica{draw_replica_set(tc, stored)};
     const auto expected{expected_gtid_stream(stored, replica)};
+    const auto first{auto_position_index(stored, replica)};
     std::size_t expected_count{0U};
-    for (const auto &binlog : expected) {
-      expected_count += 1U + std::size(binlog);
+    for (std::size_t binlog{first}; binlog != std::size(expected); ++binlog) {
+      expected_count += 1U + std::size(expected[binlog]);
     }
 
     std::ostringstream label;
@@ -1841,13 +1867,13 @@ BOOST_AUTO_TEST_CASE(GtidModeStreamsExactlyTheMissingTransactions) {
     const auto outcome{stream_until_end(reader, expected_count + 1U)};
     require(!outcome.failed, label.str() + ": the GTID dump failed after " +
                                  std::to_string(std::size(outcome.events)) +
-                                 " event(s)");
+                                 " event(s): " + outcome.error);
     require(std::size(outcome.events) == expected_count,
             label.str() + ": " + std::to_string(std::size(outcome.events)) +
                 " event(s) streamed, expected " +
                 std::to_string(expected_count));
     std::size_t index{0U};
-    for (std::size_t binlog{0U}; binlog != std::size(expected); ++binlog) {
+    for (std::size_t binlog{first}; binlog != std::size(expected); ++binlog) {
       const auto &rotate{outcome.events[index]};
       require(is_artificial_rotate_to(rotate, stored[binlog].name,
                                       events::magic_binlog_offset),
@@ -1855,7 +1881,7 @@ BOOST_AUTO_TEST_CASE(GtidModeStreamsExactlyTheMissingTransactions) {
                   " is not the artificial ROTATE to " +
                   stored[binlog].name.str());
       require(rotate_has_checksum(rotate) ==
-                  (binlog == 0U ? session_checksum : true),
+                  (binlog == first ? session_checksum : true),
               label.str() + ": the artificial ROTATE to " +
                   stored[binlog].name.str() + " has the wrong checksum");
       ++index;
@@ -1907,10 +1933,11 @@ BOOST_AUTO_TEST_CASE(GtidModeRejectsDamagedTransactionsCleanly) {
 
     // the undamaged stream, from a storage of its own
     const temp_dir clean_directory;
-    const auto clean_storage{make_storage(write_config(clean_directory.path()))};
+    const auto clean_storage{
+        make_storage(write_config(clean_directory.path(), "gtid"))};
     const auto clean{store_gtid_binlogs(*clean_storage, {transactions})};
 
-    const auto storage{make_storage(write_config(directory.path()))};
+    const auto storage{make_storage(write_config(directory.path(), "gtid"))};
     const auto stored{
         store_gtid_binlogs(*storage, {transactions}, damage, damaged_index,
                            overrun)};
@@ -1988,7 +2015,7 @@ BOOST_AUTO_TEST_CASE(GtidModeSkipsATooLongTransactionWithoutTerminating) {
            .uuid_index = 1U,
            .tag_index = 0U,
            .other_event_sizes = {100U}}};
-      const auto storage{make_storage(write_config(directory.path()))};
+      const auto storage{make_storage(write_config(directory.path(), "gtid"))};
       const auto stored{store_gtid_binlogs(*storage, {transactions},
                                            transaction_damage::length_long,
                                            0U, overrun)};
@@ -2112,13 +2139,14 @@ BOOST_AUTO_TEST_CASE(GtidModeFollowsANewBinlog) {
     const bool session_checksum{tc.draw("checksum", gs::booleans())};
     const auto block_size{tc.draw("block", block_sizes())};
 
-    const auto storage{make_storage(write_config(directory.path()))};
+    const auto storage{make_storage(write_config(directory.path(), "gtid"))};
     gtid_binlog_writer writer{*storage};
     std::vector<stored_gtid_binlog> stored{writer.write(first)};
     // the replica's set is drawn over both binlogs' GTIDs, so write the
     // second binlog's specs into a scratch storage first to learn them
     const temp_dir scratch_directory;
-    const auto scratch{make_storage(write_config(scratch_directory.path()))};
+    const auto scratch{
+        make_storage(write_config(scratch_directory.path(), "gtid"))};
     const auto both{store_gtid_binlogs(*scratch, {first, second})};
     const auto replica{draw_replica_set(tc, both)};
 
@@ -2136,7 +2164,8 @@ BOOST_AUTO_TEST_CASE(GtidModeFollowsANewBinlog) {
     require(!before.failed && std::size(before.events) ==
                                   1U + std::size(expected_first.front()),
             "the dump did not stream the first binlog and wait (" +
-                std::to_string(std::size(before.events)) + " event(s))");
+                std::to_string(std::size(before.events)) + " event(s)" +
+                (before.failed ? ": " + before.error : std::string{}) + ")");
 
     stored.push_back(writer.write(second));
     const auto expected{expected_gtid_stream(stored, replica)};

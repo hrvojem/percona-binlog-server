@@ -1966,9 +1966,11 @@ BOOST_AUTO_TEST_CASE(ConfigDamagedFileFailsCleanly) {
     const auto spec{tc.draw("config", config_specs())};
     const scratch_directory scratch;
     const auto path{scratch.path() / "config.json"};
-    write_file(path, damage_text(tc, materialize(boost::json::serialize(
-                                                     spec.json),
-                                                 scratch.path())));
+    // damaged before materialize(): the scratch path is random, and the
+    // damage draws depend on the length of the text
+    write_file(path, materialize(damage_text(tc, boost::json::serialize(
+                                                     spec.json)),
+                                 scratch.path()));
     [[maybe_unused]] const auto error{
         load_cleanly([&] { const binsrv::main_config config{path.string()}; })};
   });

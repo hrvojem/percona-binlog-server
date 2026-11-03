@@ -87,6 +87,10 @@ def start_instances(binsrv, count: int) -> list:
         config["replication"]["server_id"] = (
             4242 if SHARED_SERVER_ID else 4242 + index)
         config["logger"]["file"] = str(binsrv.workdir / f"instance_{index}.log")
+        # each instance has its own local settings (instance_id, PBS-41)
+        local_settings = binsrv.workdir / f"local_settings_{index}"
+        local_settings.mkdir(parents=True, exist_ok=True)
+        config["instance"]["local_settings_path"] = str(local_settings)
         config_path = binsrv.workdir / f"config_{index}.json"
         config_path.write_text(json.dumps(config, indent=2))
         processes.append(subprocess.Popen(

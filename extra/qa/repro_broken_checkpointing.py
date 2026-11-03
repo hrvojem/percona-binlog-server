@@ -111,7 +111,10 @@ def write_config(args, workdir, storage_dir):
     if args.mode in ("interval", "both"):
         storage["checkpoint_interval"] = args.checkpoint_interval
 
+    local_settings = workdir / "local_settings"
+    local_settings.mkdir(parents=True, exist_ok=True)
     config = {
+        "instance": {"local_settings_path": str(local_settings)},
         "logger": {"level": "info", "file": str(workdir / "binsrv.log")},
         "connection": {
             "host": args.host, "port": args.port, "user": args.user,

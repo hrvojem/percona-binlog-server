@@ -330,6 +330,10 @@ class BinlogServer:
                         workdir / "storage")
         self.config_path = workdir / "binsrv.json"
         self.log_path = workdir / "binsrv.log"
+        # the instance's local settings (its instance_id, PBS-41) and the
+        # telemetry reports of pull, kept in the work directory
+        self.local_settings = workdir / "local_settings"
+        self.telemetry = workdir / "telemetry"
         self.checkpoint_size = None
         self.checkpoint_interval = None
         # connection settings (the network fault tests shorten them)
@@ -357,7 +361,10 @@ class BinlogServer:
             storage["checkpoint_size"] = self.checkpoint_size
         if self.checkpoint_interval is not None:
             storage["checkpoint_interval"] = self.checkpoint_interval
+        self.local_settings.mkdir(parents=True, exist_ok=True)
+        self.telemetry.mkdir(parents=True, exist_ok=True)
         config = {
+            "instance": {"local_settings_path": str(self.local_settings)},
             "logger": {"level": "info", "file": str(self.log_path)},
             "connection": {
                 "host": "127.0.0.1", "port": self.port,
@@ -378,6 +385,7 @@ class BinlogServer:
                     "user": "unused", "password": "unused",
                     "plugin": "caching_sha2_password"}},
             "storage": storage,
+            "telemetry": {"path": str(self.telemetry)},
         }
         self.config_path.write_text(json.dumps(config, indent=2))
 

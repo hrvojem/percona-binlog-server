@@ -103,12 +103,14 @@
 #include "binsrv/size_unit.hpp"
 #include "binsrv/storage_backend_type.hpp"
 #include "binsrv/storage_config.hpp"
+#include "binsrv/telemetry_config.hpp"
 #include "binsrv/time_unit.hpp"
 
 #include "binsrv/events/composite_binlog_name.hpp"
 
 #include "util/ctime_timestamp.hpp"
 #include "util/semantic_version.hpp"
+#include "util/uuid_helpers.hpp"
 
 namespace {
 
@@ -710,7 +712,10 @@ const std::vector<std::string> &config_defects() {
       "checkpoint_interval", "encryption_format",
       "encryption_cipher",   "missing_field",
       "auth_rsa_private_key_empty", "ssl_missing",
-      "ssl_cert_empty",    "ssl_key_empty"};
+      "ssl_cert_empty",    "ssl_key_empty",
+      "instance_path_empty", "instance_path_missing",
+      "instance_path_file", "instance_path_dangling",
+      "telemetry_interval"};
   return defects;
 }
 
@@ -762,6 +767,23 @@ config_specs(std::string forced_defect = {}) {
         static_cast<std::int64_t>(std::numeric_limits<std::uint16_t>::max())};
     static constexpr auto uint32_max{
         static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())};
+
+    // instance (PBS-41): local_settings_path is a placeholder that
+    // materialize() turns into a path in the scratch directory: a
+    // directory, a symlink to one, or (defects) nothing, a regular file or
+    // a dangling symlink
+    std::string local_settings{choose({"@dir@", "@link@"})};
+    if (is_defect("instance_path_empty")) {
+      local_settings.clear();
+    } else if (is_defect("instance_path_missing")) {
+      local_settings = "@missing@";
+    } else if (is_defect("instance_path_file")) {
+      local_settings = "@file@";
+    } else if (is_defect("instance_path_dangling")) {
+      local_settings = "@dangling@";
+    }
+    spec.json["instance"] =
+        boost::json::object{{"local_settings_path", local_settings}};
 
     // logger
     spec.json["logger"] = boost::json::object{
@@ -990,6 +1012,30 @@ config_specs(std::string forced_defect = {}) {
     }
     spec.json["storage"] = std::move(storage);
 
+    // telemetry (PBS-41): optional, and so is every field of it
+    if (is_defect("telemetry_interval") || tc.draw(gs::booleans())) {
+      boost::json::object telemetry;
+      if (tc.draw(gs::booleans())) {
+        telemetry["enabled"] = tc.draw(gs::booleans());
+      }
+      if (tc.draw(gs::booleans())) {
+        telemetry["path"] = tc.draw(text_of_size(0U, 16U));
+      }
+      const auto damaged{is_defect("telemetry_interval")
+                             ? tc.draw(gs::sampled_from<std::string>(
+                                   {"grace_interval", "scrape_interval",
+                                    "history_keep_interval"}))
+                             : std::string{}};
+      for (const auto *field :
+           {"grace_interval", "scrape_interval", "history_keep_interval"}) {
+        if (field == damaged || tc.draw(gs::booleans())) {
+          telemetry[field] =
+              unit_text("smhdSMHDw", field != damaged, time_symbols);
+        }
+      }
+      spec.json["telemetry"] = std::move(telemetry);
+    }
+
     if (is_defect("missing_field")) {
       const auto [section, field]{
           tc.draw(gs::sampled_from<std::pair<std::string, std::string>>(
@@ -1003,7 +1049,9 @@ config_specs(std::string forced_defect = {}) {
                {"replication_source", "require_secure_transport"},
                {"storage", "uri"},
                {"storage", ""},
-               {"logger", ""}}))};
+               {"logger", ""},
+               {"instance", "local_settings_path"},
+               {"instance", ""}}))};
       if (field.empty()) {
         spec.json.erase(section);
       } else {
@@ -1680,12 +1728,47 @@ BOOST_AUTO_TEST_CASE(KeyringDamagedFileFailsCleanly) {
 
 namespace {
 
+// the text of a configuration with the local_settings_path placeholders of
+// config_specs() replaced by paths in 'directory', which are created: a
+// directory, a symlink to one, a regular file, a dangling symlink; a missing
+// path is left absent
+[[nodiscard]] std::string materialize(std::string text,
+                                      const std::filesystem::path &directory) {
+  const auto replace{[&text](std::string_view placeholder,
+                             const std::filesystem::path &path) {
+    const auto position{text.find(placeholder)};
+    if (position != std::string::npos) {
+      text.replace(position, std::size(placeholder), path.generic_string());
+      return true;
+    }
+    return false;
+  }};
+  if (replace("@dir@", directory / "local_settings")) {
+    std::filesystem::create_directories(directory / "local_settings");
+  }
+  if (replace("@link@", directory / "local_settings_link")) {
+    std::filesystem::create_directories(directory / "linked_settings");
+    std::filesystem::create_directory_symlink(
+        directory / "linked_settings", directory / "local_settings_link");
+  }
+  if (replace("@file@", directory / "settings_file")) {
+    write_file(directory / "settings_file", "not a directory");
+  }
+  if (replace("@dangling@", directory / "dangling_link")) {
+    std::filesystem::create_directory_symlink(directory / "nowhere",
+                                              directory / "dangling_link");
+  }
+  replace("@missing@", directory / "missing_settings");
+  return text;
+}
+
 // loads 'spec' and checks the outcome against it: a rejection exactly for a
 // defect, and every value of an accepted file as written
 void check_config_file(const config_spec &spec) {
   const scratch_directory scratch;
   const auto path{scratch.path() / "config.json"};
-  const auto text{boost::json::serialize(spec.json)};
+  const auto text{
+      materialize(boost::json::serialize(spec.json), scratch.path())};
   write_file(path, text);
 
   std::optional<binsrv::main_config> config;
@@ -1781,6 +1864,66 @@ void check_config_file(const config_spec &spec) {
   }
   require(root.get<"keyring">().has_value() == json.contains("keyring"),
           "keyring section presence differs in '" + text + "'");
+
+  // the instance: an id in canonical UUID form, persisted in the
+  // local_settings_path directory, and the same when the file is loaded
+  // again (PBS-41)
+  const auto &instance_id{config->instance_id()};
+  require(util::is_canonical_uuid(instance_id),
+          "instance_id '" + instance_id + "' is not a canonical UUID");
+  const std::filesystem::path local_settings{
+      root.get<"instance">().get<"local_settings_path">()};
+  std::ifstream id_file{local_settings / "instance_id"};
+  std::string stored_id;
+  id_file >> stored_id;
+  require(stored_id == instance_id,
+          "the instance_id file holds '" + stored_id + "', not '" +
+              instance_id + "'");
+  const binsrv::main_config reloaded{path.string()};
+  require(reloaded.instance_id() == instance_id,
+          "a second load gives instance_id '" + reloaded.instance_id() +
+              "', not '" + instance_id + "'");
+
+  // telemetry: as written, the documented defaults where a field is left
+  // out (enabled, the report directory, 5 min / 1 day / 7 days)
+  const auto &telemetry{root.get<"telemetry">()};
+  require(telemetry.has_value() == json.contains("telemetry"),
+          "telemetry section presence differs in '" + text + "'");
+  if (telemetry.has_value()) {
+    const auto &written{json.at("telemetry").as_object()};
+    const auto *enabled{written.if_contains("enabled")};
+    require(telemetry->enabled() ==
+                (enabled == nullptr || enabled->as_bool()),
+            "telemetry.enabled differs in '" + text + "'");
+    const auto *report_path{written.if_contains("path")};
+    require(telemetry->path() ==
+                (report_path == nullptr
+                     ? std::string{"/usr/local/percona/telemetry/pbs"}
+                     : std::string{report_path->as_string()}),
+            "telemetry.path differs in '" + text + "'");
+    const auto same_interval{[&](const char *field, std::uint64_t actual,
+                                 std::uint64_t fallback) {
+      const auto *value{written.if_contains(field)};
+      const auto expected{
+          value == nullptr
+              ? std::optional<std::uint64_t>{fallback}
+              : model_unit(std::string{value->as_string()}, time_symbols)};
+      require(expected == actual, std::string{"telemetry."} + field +
+                                      " is " + std::to_string(actual) +
+                                      " s in '" + text + "'");
+    }};
+    same_interval("grace_interval",
+                  static_cast<std::uint64_t>(telemetry->grace_interval().count()),
+                  300U);
+    same_interval(
+        "scrape_interval",
+        static_cast<std::uint64_t>(telemetry->scrape_interval().count()),
+        86400U);
+    same_interval(
+        "history_keep_interval",
+        static_cast<std::uint64_t>(telemetry->history_keep_interval().count()),
+        604800U);
+  }
 }
 
 } // anonymous namespace
@@ -1823,7 +1966,9 @@ BOOST_AUTO_TEST_CASE(ConfigDamagedFileFailsCleanly) {
     const auto spec{tc.draw("config", config_specs())};
     const scratch_directory scratch;
     const auto path{scratch.path() / "config.json"};
-    write_file(path, damage_text(tc, boost::json::serialize(spec.json)));
+    write_file(path, damage_text(tc, materialize(boost::json::serialize(
+                                                     spec.json),
+                                                 scratch.path())));
     [[maybe_unused]] const auto error{
         load_cleanly([&] { const binsrv::main_config config{path.string()}; })};
   });

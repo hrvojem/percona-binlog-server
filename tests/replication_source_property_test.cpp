@@ -487,7 +487,12 @@ private:
   write_config(const source_settings &settings) const {
     const auto config_path{root_.path() / "config.json"};
     std::ofstream config{config_path};
+    // the instance's local settings (its instance_id, PBS-41)
+    const auto local_settings{root_.path() / "local_settings"};
+    std::filesystem::create_directories(local_settings);
     config << R"({
+  "instance": { "local_settings_path": ")"
+           << local_settings.generic_string() << R"(" },
   "logger": { "level": "error", "file": "" },
   "connection": {
     "host": "127.0.0.1", "port": 3306, "user": "root", "password": "",

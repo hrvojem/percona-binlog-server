@@ -660,16 +660,22 @@ what the nightly runs many cases of. Among them:
 (with a concurrent reader, also run under ThreadSanitizer),
 `indexed_event_block_property_test`, `cipher_context_property_test`,
 `minimysql_property_test` (the `pull` protocol codec), `rewriter_property_test`,
-`reader_context_property_test`, `config_value_property_test`,
+`reader_context_property_test`, `config_value_property_test` (including
+the `instance` section and its instance_id file and the optional
+`telemetry` section, PBS-41),
 `event_generation_property_test` (the artificial ROTATE / FORMAT_DESCRIPTION /
 PREVIOUS_GTIDS generators), `search_helpers_property_test`,
 `purge_selection_property_test`, `sender_context_property_test` (the
 `pull` COM_BINLOG_DUMP streamer: the stream preamble, reading each stored byte
-once, partial events at EOF, polling an empty storage, and the heartbeat an
-idle dump reports, ticket 40) and `replication_source_property_test` (the
+once, partial events at EOF, polling an empty storage, the heartbeat an
+idle dump reports, ticket 40, and in a GTID-mode storage the auto-positioned
+start at the first binlog holding a GTID the replica lacks, PBS-29 part 3) and `replication_source_property_test` (the
 real `pull` listener in-process with a test client: handshake statements,
 authentication, dump positions, heartbeat timing, and `COM_BINLOG_DUMP_GTID`,
-written ahead of PBS-29 part 2 and a known failure until then).
+written ahead of PBS-29 part 2; since part 2 it fails only on a replica that
+lacks purged GTIDs, ticket 20, PBS-120).
+Since PBS-41 every configuration these tests write has an
+`instance.local_settings_path` (a directory in the test's scratch tree).
 `storage_property_test`'s concurrent property runs a second reader that
 resumes from a position mid-run and checks every artificial event and
 heartbeat; the heartbeat checks are shared in `tests/heartbeat_test_helpers.hpp`.
@@ -688,4 +694,7 @@ no test reaches yet, each with the cheapest kind of test that would. It is
 measured with a gcov build in its own tree (`~/ws/build_coverage.sh`,
 `~/ws/run_coverage.sh`); see the document for the steps and for the pitfalls
 (one crashing property case hides the rest of its program; property layers
-vary between runs).
+vary between runs). The measurement predates the merge of PBS-41
+(telemetry and instance_id, upstream `2d7dc80`), so `binsrv/telemetry.cpp`,
+`binsrv/telemetry_config.cpp` and `binsrv/instance_id.cpp` are not in it yet;
+`telemetry_test.py` and the MTR telemetry tests are what reach them.

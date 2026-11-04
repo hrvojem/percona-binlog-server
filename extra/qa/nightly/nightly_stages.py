@@ -286,6 +286,9 @@ def harness_command(args, workdir: Path) -> list:
     if args.harness in ("pull_gtid_test", "pull_gtid_set_test",
                         "telemetry_test"):
         return script + common + mode
+    if args.harness == "upgrade_test":
+        return script + common + mode + ["--old-binsrv",
+                                          str(args.old_binsrv)]
     if args.harness == "fetch_crash_test":
         command = script + common + [
             "--mode", args.mode, "--examples", str(args.examples),
@@ -335,7 +338,7 @@ def harness_cases(args, returncode: int, output: str, lines: list,
     mode = args.mode or "position"
     if args.harness in ("pull_load_test", "pull_soak_test", "pull_tls_test",
                         "pull_gtid_test", "pull_gtid_set_test",
-                        "telemetry_test"):
+                        "telemetry_test", "upgrade_test"):
         cases = []
         for result, _ in objects:
             if "case" not in result:
@@ -875,6 +878,9 @@ def main():
     parser.add_argument("--dist", type=Path, help="the MySQL distribution")
     parser.add_argument("--series", help="8.0, 8.4, 9.7")
     parser.add_argument("--binsrv", type=Path)
+    parser.add_argument("--old-binsrv", type=Path,
+                        help="binlog_server of the previous release "
+                             "(upgrade_test)")
     parser.add_argument("--known", required=True,
                         help="the known-failures file of the stage")
     parser.add_argument("--results", required=True,

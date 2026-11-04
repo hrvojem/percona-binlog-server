@@ -15,7 +15,7 @@
 # harnesses from extra/qa run against MySQL 8.4: every night
 # pull_replica_test.py, query_race_test.py, pull_heartbeat_test.py,
 # pull_tls_test.py, pull_gtid_test.py, pull_gtid_set_test.py,
-# telemetry_test.py and a
+# telemetry_test.py, upgrade_test.py (from the release in OLD_BINSRV) and a
 # short fetch_crash_test.py run per mode on file and on S3 storage; and one
 # of the heavier harnesses by day of the week (QA_ROTATION: the S3 and disk
 # fault sweeps, the network fault test, the listener fuzzer, the source
@@ -106,6 +106,9 @@ QA_PORT=${QA_PORT:-24470}
 QA_RUNS=${QA_RUNS:-500}
 QA_EXAMPLES=${QA_EXAMPLES:-10}
 QA_STEPS=${QA_STEPS:-8}
+# the previous release's binlog_server, for upgrade_test (built once from
+# the pbs-0.4.1 tag with the release_gcc14 preset)
+OLD_BINSRV=${OLD_BINSRV:-$WS/pbs-0.4.1-build/binlog_server}
 # the S3 variant of fetch_crash_test, every night (the local S3 server)
 QA_S3_EXAMPLES=${QA_S3_EXAMPLES:-5}
 S3_BUCKET_DIR=${S3_BUCKET_DIR:-$WS/s3/data/pbs-mtr}
@@ -531,6 +534,18 @@ if want qa; then
     qa_run telemetry_test telemetry_test \
       --binsrv "$debug_binsrv" --workdir "$out/qa/telemetry" \
       --port $((QA_PORT + 270)) --timeout 900
+    # a storage of the previous release taken over by this build; the
+    # release is built once by hand (see extra/qa/README.md)
+    if [ -x "$OLD_BINSRV" ]; then
+      for mode in position gtid; do
+        qa_run upgrade_test "upgrade_test ($mode)" \
+          --binsrv "$debug_binsrv" --old-binsrv "$OLD_BINSRV" \
+          --workdir "$out/qa/upgrade-$mode" --mode "$mode" \
+          --port $((QA_PORT + 290)) --timeout 900
+      done
+    else
+      log "upgrade_test skipped: no release binary at $OLD_BINSRV"
+    fi
   fi
   # the crash/resume test runs against the ASan build to catch memory errors
   if [ -n "${build_failed[asan_gcc14]:-}" ]; then

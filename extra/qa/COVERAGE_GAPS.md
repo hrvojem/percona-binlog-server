@@ -1,48 +1,48 @@
 # Coverage gaps
 
-- **Date:** 2026-10-30 (previous measurement: 2026-10-29, commit `6800b5d`)
-- **Commit:** `bd8e2f6` (branch `pbt-init`). Since 2026-10-29 this adds the upstream merge of PBS-31 part 1 (`b49f8ce`: an optional `ssl` section and `require_secure_transport` for the listener), the coverage-gap tests of `e698aaf` (garbled encrypted passwords, a damaged PREVIOUS_GTIDS_LOG, the S3 range checks, the `fetch` TLS errors), the GTID-mode sender properties (`GtidModeStreamsExactlyTheMissingTransactions`, `GtidModeRejectsDamagedTransactionsCleanly`, `GtidModeFollowsANewBinlog`) and the harnesses `pull_tls_test.py` and `pull_gtid_test.py`. The measured tree is a clean worktree of that commit; md5 sums of `src/` before and after the run match.
-- **Not yet measured (2026-11-03):** the merge of upstream `2d7dc80` (PBS-41 telemetry and instance_id, PBS-29 part 3 GTID auto-positioning) came after this measurement. New code outside it: `binsrv/telemetry.cpp`, `binsrv/telemetry_config.cpp`, `binsrv/instance_id.cpp`, `util/uuid_helpers.hpp`, and the auto-positioning in `operations/sender_context.cpp`. Since then `telemetry_test.py` (telemetry intervals, unusable paths, cleanup, a shared directory, instance_id edge cases) and `pull_gtid_set_test.py` (auto-positioning with gapped, partial, multi-UUID and tagged replica GTID sets) have been added, both in the nightly. Every configuration of the coverage layers now needs an `instance` section. The next measurement should add a `telemetry` layer for those two harnesses.
-- **Host output (kept on the QA host only):** `test-infra:~/ws/coverage-20261030/` (the earlier data stays in `~/ws/coverage-20261029/` and `~/ws/coverage-20261028/`)
+- **Date:** 2026-11-03 (previous measurement: 2026-10-30, commit `bd8e2f6`)
+- **Commit:** `b24e653` (branch `pbt-init`). Since 2026-10-30 this adds the upstream merges of PBS-31 parts 2–3 (`6b0960f`: the listener performs the TLS handshake, ticket 46 fixed) and of PBS-41 and PBS-29 part 3 (`2d7dc80`: telemetry reports of `pull`, the mandatory `instance` section and its instance_id file, GTID auto-positioning), TLS clients in the listener fuzzer, and the harnesses `pull_gtid_set_test.py` and `telemetry_test.py`. The measured tree is a clean worktree of that commit; md5 sums of `src/` before and after the run match.
+- **Host output (kept on the QA host only):** `test-infra:~/ws/coverage-20261103/` (the earlier data stays in `~/ws/coverage-20261030/`, `~/ws/coverage-20261029/` and `~/ws/coverage-20261028/`)
   - `html/index.html`: line/branch HTML report for all layers (base + extra).
   - `combined.json`, `summary-combined.json`: the four base layers merged.
   - `combined-all.json`, `summary-all.json`: all layers merged.
   - `layers/*.json`: one tracefile per layer. `summary-<layer>.json`: one summary per layer.
   - `logs/`: test output. `logs/property-results.txt` has one PASS/FAIL line per property case.
-  - `all.sh` (the driver), `build.sh`, `run.sh`, `run_faults.sh`, `run_property_serial.sh`, `merge.sh`: the scripts that produced the data.
+  - `all.sh` (the driver), `build.sh`, `run.sh`, `run_faults.sh`, `run_property_serial.sh`, `merge.sh`: the scripts that produced the data; `rerun_mtr.sh` re-ran the MTR tests that lost a race (see the mtr-8.4 row), merged into `layers/mtr-8.4.json` (the parts are in `superseded/`).
   - `src-md5-before.txt`, `src-md5-after.txt`: md5 sums of `src/` before the build and after the last layer.
 
 ## How it was measured
 
 1. **Build.** `build.sh` is a copy of `~/ws/build_coverage.sh` with its own paths. It uses preset `debug_gcc14`, `-DWITH_PROPERTY_TESTS=ON`, `--coverage -fprofile-update=atomic -fprofile-abs-path` and linker `--coverage`, with `--parallel 4`.
-   - Source: a detached git worktree `~/ws/cov-src-20261030` at `bd8e2f6`. Build dir: `~/ws/percona-binlog-server-build-coverage-20261030` (kept).
+   - Source: a detached git worktree `~/ws/cov-src-20261103` at `b24e653`. Build dir: `~/ws/percona-binlog-server-build-coverage-20261103` (kept).
    - Nothing else built in this tree, so the MD5 merge problem of 2026-10-14 cannot happen.
 2. **Capture.** The `.gcda` counters were reset before each layer. Each layer was captured with gcovr 8.6 and gcov-14, using the flags of `~/ws/run_coverage.sh`: `--filter src/ --exclude-unreachable-branches --exclude-throw-branches`.
-3. **Isolation from other jobs on the host.** Every harness used its own port (25xxx, clear of the nightly's 24470 and up). MTR used `--build-thread=600` (S3 MTR: 610). The S3 layers used their own bucket `pbs-cov-20261030` on the shared versitygw, and their own fault proxy on port 25575. The serial property layer now runs with `LAYERS=property`: on 2026-10-29 its script, a copy of `run.sh`, also re-ran every other layer (same data, about an hour lost).
+3. **Isolation from other jobs on the host.** Every harness used its own port (25xxx, clear of the nightly's 24470 and up). MTR used `--build-thread=600` (S3 MTR: 610). The S3 layers used their own bucket `pbs-cov-20261103` on the shared versitygw, and their own fault proxy on port 25575. The serial property layer now runs with `LAYERS=property`: on 2026-10-29 its script, a copy of `run.sh`, also re-ran every other layer (same data, about an hour lost).
 4. **Base layers.** These four are comparable with earlier measurements:
 
 | Layer | What ran |
 |---|---|
-| unit | `ctest -E _property_test$` (13 Boost unit tests, new: `util_test`). All pass. |
-| property | All 14 Hegel property programs (125 cases, 116 before) at default Hegel settings, with `PBS_TEST_S3_*` set so the `...OnS3` variants ran. Each case ran in its own process, 4 at a time. 24 cases fail, all listed in `known_failures.txt`. |
-| mtr-8.4 | `binlog_streaming` suite (84 tests, 82 before; new: `fetch_ssl_errors`, `fetch_connection_error_reason`) on MySQL 8.4.8, filesystem storage. 13 tests fail, all listed in `mtr_known_failures.txt`. |
+| unit | `ctest -E _property_test$` (13 Boost unit tests). All pass. |
+| property | All 14 Hegel property programs (125 cases) at default Hegel settings, with `PBS_TEST_S3_*` set so the `...OnS3` variants ran. Each case ran in its own process, 4 at a time. 21 cases fail, all listed in `known_failures.txt`. |
+| mtr-8.4 | `binlog_streaming` suite (94 tests, 84 before; new: the PBS-41 telemetry tests and the PBS-31 TLS tests from upstream) on MySQL 8.4.8, filesystem storage. 14 tests fail: the 13 of `mtr_known_failures.txt` and `pull_source_purged_past_resume_point`, whose wait loop treated a log file `pull` had not created yet as an error (grep exit 2) on the slow coverage build. That loop and two like it were fixed (`57d6418`); the three tests were re-run on the coverage build (`rerun_mtr.sh`; the fixed test passes) and the re-run is merged into this layer. |
 | qa | `pull_replica_test.py` (position + gtid), `query_race_test.py --runs 200` (position + gtid) and `fetch_crash_test.py --examples 5 --steps 8` (gtid + position), all against 8.4.8. `pull_replica_test` passes in both modes now (GTID auto-position since PBS-29 part 2); the `query_race_test` failures are ticket 29. |
 
 5. **Extra layers.** These are not in the base totals. They are cheap and reach code that the base layers do not.
 
 | Layer | What ran |
 |---|---|
-| mtr-s3-8.4 | `binlog_streaming` on 8.4.8 with S3 storage (82 tests). 12 tests fail, all known. |
-| crash-s3 | `fetch_crash_test.py --storage s3` (gtid + position, 5 examples, 8 steps). Passes. |
-| listener-fuzz | `listener_fuzz_test.py --connections 2500 --seed 7` (position + gtid). Passes, with no crash. |
-| s3-faults | `s3_fault_sweep.py --mode position` (87 cases, new: `pull_read_shrunk_range`). 10 cases fail, all matching `qa_known_failures.txt` (ticket 18 `PUT-.json`/`PUT-binlog.0` x6; ticket 37 `PUT-binlog.index … then DELETE-.json`). |
+| mtr-s3-8.4 | `binlog_streaming` on 8.4.8 with S3 storage (92 tests). 12 tests fail, all known. |
+| crash-s3 | `fetch_crash_test.py --storage s3` (gtid + position, 5 examples, 8 steps). GTID mode hits ticket 14 (a resume after a rotation skips `binlog.000002`), known. |
+| listener-fuzz | `listener_fuzz_test.py --connections 2500 --seed 7` (position + gtid), now with TLS scenarios (about a third of the connections). Passes, with no crash; `pull` still serves plain and TLS clients afterwards. |
+| s3-faults | `s3_fault_sweep.py --mode position` (87 cases). It now stops `pull` with SIGTERM, so the `pull` cases keep their counters (41.2% of lines, 28.2% before). 10 cases fail, all matching `qa_known_failures.txt` (ticket 18 `PUT-.json`/`PUT-binlog.0` x6; ticket 37 `PUT-binlog.index … then DELETE-.json`). |
 | disk-faults | `disk_fault_sweep.py --mode position` with `libfsfault.so` (86 cases, 19 fail). The failures all match ticket 18 (`*/binlog-metadata/*`) and ticket 37 (`binlog-index … then unlink binlog-metadata`). |
-| pull-heartbeat | `pull_heartbeat_test.py` (new since 2026-10-28) with a real replica. Its known failure is `quiet_after_rotation` (ticket 40, PBS-113). |
-| property-serial | The property programs again, one case at a time (101 pass, 24 fail, all known). The two runs fail different random-input cases: `FilesystemStorageUriMatchesModel` (ticket 12) only in parallel, `GtidModeRejectsDamagedTransactionsCleanly` (ticket 39) only serially. |
-| pull-tls | `pull_tls_test.py` (new): the listener with and without an `ssl` section, TLS clients and a TLS replica. 7 of 13 cases fail, all known (ticket 46, PBS-119). |
-| pull-gtid | `pull_gtid_test.py` (new): GTID auto-position replicas through rotations, restarts, a purge and a replica ahead of the source. `purged` and `ahead` fail, both known (ticket 20, PBS-120). |
+| pull-heartbeat | `pull_heartbeat_test.py` with a real replica. Its known failure is `quiet_after_rotation` (ticket 40, PBS-113). |
+| property-serial | The property programs again, one case at a time (102 pass, 23 fail, all known). The two runs fail different random-input cases, as before. |
+| pull-tls | `pull_tls_test.py`: the listener with and without an `ssl` section, TLS clients and a TLS replica. Since PBS-31 parts 2–3 the handshake works; 12 of 13 cases pass, `plain_refused_when_required` fails (ticket 48, known). |
+| pull-gtid | `pull_gtid_test.py`: GTID auto-position replicas through rotations, restarts, a purge and a replica ahead of the source; `purged` and `ahead` fail, both known (ticket 20, PBS-120). Then `pull_gtid_set_test.py` (new): auto-positioning for replicas with gapped, partial, multi-UUID and tagged GTID sets; all 10 cases pass. |
+| telemetry | `telemetry_test.py` (new): telemetry intervals, unusable paths, cleanup, a shared directory and instance_id edge cases. 4 of 18 cases fail, all known (tickets 49 and 50). |
 
-**No unexpected failures** in any layer. Some known property failures did not fire at default settings, which is expected, because they depend on what Hegel generates. Examples are tickets 8 (split), 36, 37 (fs) and 39 (`ReplicationSourceSurvivesAnyDumpPosition`).
+**No unexpected failures** in any layer apart from the MTR wait-loop race in mtr-8.4 (a test bug, fixed and re-run). Some known property failures did not fire at default settings, which is expected, because they depend on what Hegel generates. Examples are tickets 8 (split), 36, 37 (fs) and 39 (`ReplicationSourceSurvivesAnyDumpPosition`).
 
 > **Note: one property run is not deterministic.** Hegel draws new inputs every run. A file reached by only a few cases can differ a lot between runs. For example, `config_value_property_test/ConfigFileMatchesModel` was run 6 more times on its own. `replication_source_config.cpp` came out at 66.7–81.5% lines, and `rewrite_config.cpp` at 50–100%. In the measured property layer, `rewrite_config.cpp` had 0% and the `replication_source_config` defect lines had none (see gap 10). Treat a ±1–2 line difference in a config validator as noise. A gap that a single run reliably misses needs explicit examples (`hegel` `@example`-style fixed cases) or more test cases.
 >
@@ -50,34 +50,35 @@
 
 ## Totals (all `src/` files, headers included)
 
-Base layers. "Δ" is the change in line % against 2026-10-29. There are 118 more instrumented lines (11764 → 11882), mostly the TLS listener of PBS-31 part 1 (`network_service.cpp` 245 → 266 lines, `replication_source_config.cpp`, the new `source_ssl_config.cpp`).
+Base layers. "Δ" is the change in line % against 2026-10-30. There are 472 more instrumented lines (11882 → 12354): the TLS session streams of PBS-31 parts 2–3 (`upgradable_stream.hpp`, `session_frame_stream.cpp`, `connection_context.cpp` +16), telemetry and the instance_id file of PBS-41 (`telemetry.cpp`, `telemetry_config.cpp`, `instance_id.cpp`, `instance_config.cpp`, `uuid_helpers.hpp`) and the auto-positioning of PBS-29 part 3 (`sender_context.cpp`, `storage_core.cpp` +14).
 
 | Layer | Lines | Line % | Δ | Branches | Branch % | Functions % |
 |---|---|---|---|---|---|---|
-| unit | 3134 / 11882 | 26.4 | +1.0 | 1263 / 6536 | 19.3 | 25.2 |
-| property | 8560 / 11882 | 72.0 | +1.4 | 4077 / 6536 | 62.4 | 71.9 |
-| mtr-8.4 | 8307 / 11882 | 69.9 | −0.3 | 3956 / 6536 | 60.5 | 71.0 |
-| qa | 5712 / 11882 | 48.1 | −0.4 | 2654 / 6536 | 40.6 | 50.3 |
-| **combined** | **10700 / 11882** | **90.1** | **+1.1** | **5248 / 6536** | **80.3** (+1.1) | **90.5** (+1.1) |
+| unit | 3134 / 12354 | 25.4 | −1.0 | 1263 / 6832 | 18.5 | 24.2 |
+| property | 8826 / 12354 | 71.4 | −0.6 | 4200 / 6832 | 61.5 | 71.6 |
+| mtr-8.4 | 8787 / 12354 | 71.1 | +1.2 | 4210 / 6832 | 61.6 | 72.4 |
+| qa | 5985 / 12354 | 48.4 | +0.3 | 2763 / 6832 | 40.4 | 50.9 |
+| **combined** | **11124 / 12354** | **90.0** | **−0.1** | **5485 / 6832** | **80.3** (+0.0) | **90.6** (+0.1) |
 
 Extra layers (each measured on its own), and everything merged:
 
 | Layer | Lines | Line % | Δ | Branches | Branch % | Functions % |
 |---|---|---|---|---|---|---|
-| mtr-s3-8.4 | 8523 / 11882 | 71.7 | −0.4 | 4074 / 6536 | 62.3 | 72.3 |
-| crash-s3 | 3767 / 11882 | 31.7 | +0.6 | 1771 / 6536 | 27.1 | 32.9 |
-| listener-fuzz | 4820 / 11882 | 40.6 | 0.0 | 2177 / 6536 | 33.3 | 41.8 |
-| s3-faults | 3348 / 11882 | 28.2 | 0.0 | 1536 / 6536 | 23.5 | 29.5 |
-| disk-faults | 3153 / 11882 | 26.5 | 0.0 | 1438 / 6536 | 22.0 | 28.2 |
-| pull-heartbeat | 4573 / 11882 | 38.5 | 0.0 | 1898 / 6536 | 29.0 | 42.0 |
-| property-serial | 8531 / 11882 | 71.8 | +0.9 | 4066 / 6536 | 62.2 | 71.6 |
-| pull-tls | 4394 / 11882 | 37.0 | new | 1943 / 6536 | 29.7 | 38.0 |
-| pull-gtid | 5619 / 11882 | 47.3 | new | 2523 / 6536 | 38.6 | 50.0 |
-| **all layers** | **10791 / 11882** | **90.8** | **+1.0** | **5321 / 6536** | **81.4** (+1.1) | **91.2** (+1.2) |
+| mtr-s3-8.4 | 9023 / 12354 | 73.0 | +1.3 | 4344 / 6832 | 63.6 | 73.8 |
+| crash-s3 | 3857 / 12354 | 31.2 | −0.5 | 1811 / 6832 | 26.5 | 32.1 |
+| listener-fuzz | 5179 / 12354 | 41.9 | +1.3 | 2333 / 6832 | 34.1 | 43.6 |
+| s3-faults | 5085 / 12354 | 41.2 | +13.0 | 2289 / 6832 | 33.5 | 42.4 |
+| disk-faults | 3291 / 12354 | 26.6 | +0.1 | 1506 / 6832 | 22.0 | 27.9 |
+| pull-heartbeat | 4807 / 12354 | 38.9 | +0.4 | 1977 / 6832 | 28.9 | 42.8 |
+| property-serial | 8732 / 12354 | 70.7 | −1.1 | 4155 / 6832 | 60.8 | 70.6 |
+| pull-tls | 4796 / 12354 | 38.8 | +1.8 | 2092 / 6832 | 30.6 | 40.4 |
+| pull-gtid | 6222 / 12354 | 50.4 | +3.1 | 2808 / 6832 | 41.1 | 52.7 |
+| telemetry | 4513 / 12354 | 36.5 | new | 1969 / 6832 | 28.8 | 39.4 |
+| **all layers** | **11243 / 12354** | **91.0** | **+0.2** | **5573 / 6832** | **81.6** (+0.2) | **91.5** (+0.3) |
 
-The small drops in mtr and qa are the larger denominator (the TLS code is reached only by pull-tls). The extra layers add 91 lines over the base. `pull-tls` is the only layer that reaches 15 of them, all in `network_service.cpp`: the certificate and key loading of `initialize_optional_ssl_context` (1173-1189) and the TLS context deleter (139-145). `pull-gtid` reaches no line that another layer misses; its value is the end-to-end checks (it found the ticket 20 gaps, PBS-120).
+The base layers stay level while the source grew by 4%: the new code is reached mostly by MTR (its telemetry tests run `pull`) and, for the TLS sessions, by the property tests that run the listener in-process. The property layer drops a little because the S3 property variants reached less of `s3_storage_backend.cpp` this time (78.8% in the base, 82.1% before; 85.0% with all layers): run-to-run noise of the S3 variants. The extra layers add 119 lines over the base; `telemetry` alone reaches the remaining instance_id and telemetry lines (unusable directories, odd cleanup names, damaged ids), `s3-faults` the S3 short-read check (313).
 
-**Not in this measurement:** MTR on 8.0 and 9.7, `network_fault_test.py`, `source_change_test.py`, `concurrent_storage_test.py`, `large_binlog_test.py`, `pull_load_test.py`, gtid-mode fault sweeps, the libFuzzer targets (a separate Clang build), Antithesis runs.
+**Not in this measurement:** MTR on 8.0 and 9.7, `network_fault_test.py`, `source_change_test.py`, `concurrent_storage_test.py`, `large_binlog_test.py`, `pull_load_test.py`, `pull_soak_test.py`, `upgrade_test.py`, gtid-mode fault sweeps, the libFuzzer targets (a separate Clang build), Antithesis runs.
 
 ## Top gaps
 
@@ -119,6 +120,8 @@ Coverage is the combined figure of the base layers, unless "extra" is named. Eve
 
 **2026-10-30:** the TLS listener of PBS-31 part 1. In the base layers `network_service.cpp` falls to 89.8% (95.1%), because none of them configures an `ssl` section; with pull-tls it is at 95.5% (254/266), and every TLS line of the listener is reached. The pull-tls layer was re-run on 2026-10-31 after a fix to the test: `pull_tls_test.py` used to stop `pull` with SIGKILL, which lost the counters of every run where `pull` started (the first capture had 1790 lines, 15.1%, only the startup failures). It now stops `pull` with SIGTERM (SIGKILL only after 60 s) and gives it a 5 s source `read_timeout`, because `pull` exits on SIGTERM only once its read from the idle source times out (ticket 43, PBS-116; 668 s per run with 60 s, 233 s now). No TLS handshake runs yet (ticket 46, PBS-119), so the session side of TLS has nothing to measure. Noise: `byte_span_extractors.hpp` 98.1 → 92.3 (the packed-integer markers at 161-178 were reached by random property inputs on 2026-10-29 and not this time); `empty_body.cpp` and `heartbeat_log_v2_body_impl.cpp` lost a line each the same way.
 
+**2026-11-03:** PBS-31 parts 2–3, PBS-41 and PBS-29 part 3. The TLS session side is measured for the first time: `upgradable_stream.hpp` 92.5% (open: the guards against upgrading twice, 110, and shutting down a plain stream as TLS, 130, plus 83), `session_frame_stream.cpp` 92.6% (open: the catch of a timer cancel that cannot fail, 81-82); `network_service.cpp` 95.5% with all layers. Telemetry: `telemetry.cpp` 90.4% with all layers; open are a failed rename of a finished report (195-198), a failed removal of an expired one (149-151), the catch for non-standard exceptions (217-219) and the cancelled-timer return (102), which cannot run because `pull` stops its `io_context` rather than cancelling the timer; the disk fault sweep's `fsfault` library on the telemetry directory would reach the first two. `instance_id.cpp` 97.2% (open: the empty catch at 62, a read failure other than a missing file). Auto-positioning: `sender_context.cpp` 95.4%; open are the empty-name raise (174) and a heartbeat before the first binlog (191-192), which a client cannot reach while a dump of an empty storage is refused (tickets 26 and 38). The S3 short-read check (313) is now counted: the sweep stops `pull` with SIGTERM.
+
 **Checked and adequately covered** (combined %, more than one layer reaches each):
 - **PBS-30 heartbeat sender:** `heartbeat_sender.cpp` 94.7%. `event_generation_helpers.cpp` 95.8% (150 and 192 are continuation lines).
 - **PBS-29 sender split:** `sender_context.cpp` 95.0%, `sender_single_file_context.cpp` 92.9%; `indexed_event_block.cpp` 92.1% (N10).
@@ -139,7 +142,7 @@ The last four columns are line % per layer.
 
 | File | Lines | L% | Branches | B% | unit | prop | mtr | qa |
 |---|---|---|---|---|---|---|---|---|
-| app.cpp | 7/14 | 50.0 | 5/29 | 17.2 | 0.0 | 0.0 | 50.0 | 50.0 |
+| app.cpp | 7/14 | 50.0 | 5/29 | 17.2 | 0.0 | 50.0 | 50.0 | 50.0 |
 | binsrv/authentication_config.cpp | 8/8 | 100.0 | 6/6 | 100.0 | 0.0 | 100.0 | 62.5 | 62.5 |
 | binsrv/basic_keyring.cpp | 7/8 | 87.5 | 0/0 | - | 0.0 | 87.5 | 87.5 | 0.0 |
 | binsrv/basic_logger.cpp | 21/22 | 95.5 | 13/13 | 100.0 | 0.0 | 95.5 | 95.5 | 95.5 |
@@ -149,22 +152,22 @@ The last four columns are line % per layer.
 | binsrv/encryption_config.cpp | 5/6 | 83.3 | 3/4 | 75.0 | 0.0 | 83.3 | 66.7 | 0.0 |
 | binsrv/events/common_header.cpp | 42/47 | 89.4 | 24/25 | 96.0 | 74.5 | 89.4 | 89.4 | 85.1 |
 | binsrv/events/common_header_view.cpp | 77/85 | 90.6 | 7/22 | 31.8 | 80.0 | 88.2 | 89.4 | 89.4 |
-| binsrv/events/composite_binlog_name.cpp | 30/33 | 90.9 | 20/24 | 83.3 | 81.8 | 87.9 | 81.8 | 78.8 |
+| binsrv/events/composite_binlog_name.cpp | 30/33 | 90.9 | 21/24 | 87.5 | 81.8 | 90.9 | 81.8 | 78.8 |
 | binsrv/events/empty_body.cpp | 5/6 | 83.3 | 1/2 | 50.0 | 0.0 | 83.3 | 83.3 | 0.0 |
 | binsrv/events/empty_post_header.cpp | 5/6 | 83.3 | 1/2 | 50.0 | 50.0 | 83.3 | 83.3 | 83.3 |
 | binsrv/events/event.cpp | 124/137 | 90.5 | 38/47 | 80.9 | 69.3 | 89.1 | 75.9 | 56.2 |
 | binsrv/events/event_view.cpp | 57/58 | 98.3 | 39/40 | 97.5 | 70.7 | 87.9 | 81.0 | 72.4 |
 | binsrv/events/footer.cpp | 4/12 | 33.3 | 2/6 | 33.3 | 16.7 | 33.3 | 33.3 | 33.3 |
 | binsrv/events/footer_view.cpp | 19/22 | 86.4 | 7/10 | 70.0 | 59.1 | 86.4 | 86.4 | 86.4 |
-| binsrv/events/format_description_body_impl.cpp | 25/26 | 96.2 | 8/10 | 80.0 | 88.5 | 88.5 | 88.5 | 61.5 |
+| binsrv/events/format_description_body_impl.cpp | 25/26 | 96.2 | 8/10 | 80.0 | 88.5 | 92.3 | 88.5 | 61.5 |
 | binsrv/events/format_description_post_header_impl.cpp | 72/82 | 87.8 | 20/25 | 80.0 | 70.7 | 87.8 | 86.6 | 69.5 |
 | binsrv/events/gtid_log_body.cpp | 100/110 | 90.9 | 66/76 | 86.8 | 61.8 | 90.9 | 29.1 | 29.1 |
 | binsrv/events/gtid_log_post_header.cpp | 45/48 | 93.8 | 20/23 | 87.0 | 54.2 | 93.8 | 81.2 | 62.5 |
-| binsrv/events/gtid_tagged_log_body_impl.cpp | 268/293 | 91.5 | 125/152 | 82.2 | 75.1 | 90.4 | 37.5 | 0.0 |
-| binsrv/events/heartbeat_log_v2_body_impl.cpp | 61/67 | 91.0 | 20/22 | 90.9 | 77.6 | 91.0 | 43.3 | 0.0 |
+| binsrv/events/gtid_tagged_log_body_impl.cpp | 270/293 | 92.2 | 127/152 | 83.6 | 75.1 | 91.1 | 37.5 | 0.0 |
+| binsrv/events/heartbeat_log_v2_body_impl.cpp | 59/67 | 88.1 | 18/22 | 81.8 | 77.6 | 88.1 | 43.3 | 0.0 |
 | binsrv/events/previous_gtids_log_body_impl.cpp | 25/26 | 96.2 | 9/10 | 90.0 | 73.1 | 96.2 | 96.2 | 53.8 |
-| binsrv/events/protocol_traits.cpp | 31/41 | 75.6 | 26/39 | 66.7 | 75.6 | 73.2 | 73.2 | 73.2 |
-| binsrv/events/reader_context.cpp | 239/255 | 93.7 | 175/196 | 89.3 | 40.0 | 93.7 | 84.3 | 78.4 |
+| binsrv/events/protocol_traits.cpp | 31/41 | 75.6 | 27/39 | 69.2 | 75.6 | 75.6 | 73.2 | 73.2 |
+| binsrv/events/reader_context.cpp | 240/255 | 94.1 | 176/196 | 89.8 | 40.0 | 94.1 | 84.3 | 78.4 |
 | binsrv/events/rewriter.cpp | 128/132 | 97.0 | 59/74 | 79.7 | 33.3 | 97.0 | 44.7 | 0.0 |
 | binsrv/events/rotate_body_impl.cpp | 20/21 | 95.2 | 5/6 | 83.3 | 76.2 | 95.2 | 95.2 | 95.2 |
 | binsrv/events/rotate_post_header_impl.cpp | 13/14 | 92.9 | 3/4 | 75.0 | 78.6 | 85.7 | 85.7 | 85.7 |
@@ -173,77 +176,81 @@ The last four columns are line % per layer.
 | binsrv/exception_handling_helpers.cpp | 24/27 | 88.9 | 15/20 | 75.0 | 0.0 | 0.0 | 88.9 | 0.0 |
 | binsrv/file_keyring.cpp | 30/33 | 90.9 | 30/42 | 71.4 | 0.0 | 90.9 | 72.7 | 0.0 |
 | binsrv/file_logger.cpp | 8/10 | 80.0 | 3/7 | 42.9 | 0.0 | 0.0 | 80.0 | 80.0 |
-| binsrv/filesystem_storage_backend.cpp | 98/115 | 85.2 | 79/110 | 71.8 | 0.0 | 85.2 | 80.0 | 67.8 |
+| binsrv/filesystem_storage_backend.cpp | 98/115 | 85.2 | 79/110 | 71.8 | 0.0 | 84.3 | 80.0 | 67.8 |
 | binsrv/gtids/gtid.cpp | 18/19 | 94.7 | 20/20 | 100.0 | 84.2 | 78.9 | 89.5 | 73.7 |
-| binsrv/gtids/gtid_set.cpp | 379/399 | 95.0 | 233/256 | 91.0 | 90.5 | 94.0 | 75.4 | 60.4 |
+| binsrv/gtids/gtid_set.cpp | 379/399 | 95.0 | 232/256 | 90.6 | 90.5 | 94.0 | 75.9 | 61.2 |
 | binsrv/gtids/tag.cpp | 30/34 | 88.2 | 17/19 | 89.5 | 88.2 | 76.5 | 47.1 | 14.7 |
 | binsrv/gtids/uuid.cpp | 24/25 | 96.0 | 5/7 | 71.4 | 96.0 | 84.0 | 56.0 | 56.0 |
-| binsrv/indexed_event_block.cpp | 117/127 | 92.1 | 78/90 | 86.7 | 0.0 | 90.6 | 72.4 | 69.3 |
+| binsrv/indexed_event_block.cpp | 117/127 | 92.1 | 78/90 | 86.7 | 0.0 | 90.6 | 74.0 | 69.3 |
+| binsrv/instance_config.cpp | 10/10 | 100.0 | 9/9 | 100.0 | 0.0 | 100.0 | 70.0 | 70.0 |
+| binsrv/instance_id.cpp | 33/36 | 91.7 | 28/33 | 84.8 | 0.0 | 88.9 | 91.7 | 88.9 |
 | binsrv/keyring_factory.cpp | 8/8 | 100.0 | 6/6 | 100.0 | 0.0 | 100.0 | 75.0 | 0.0 |
 | binsrv/keyring_record.cpp | 11/11 | 100.0 | 8/8 | 100.0 | 0.0 | 100.0 | 63.6 | 0.0 |
 | binsrv/keyring_record_collection.cpp | 41/42 | 97.6 | 28/28 | 100.0 | 0.0 | 97.6 | 88.1 | 0.0 |
 | binsrv/logger_factory.cpp | 5/5 | 100.0 | 4/4 | 100.0 | 0.0 | 0.0 | 100.0 | 100.0 |
-| binsrv/main_config.cpp | 14/14 | 100.0 | 8/8 | 100.0 | 0.0 | 100.0 | 92.9 | 92.9 |
+| binsrv/main_config.cpp | 17/17 | 100.0 | 10/10 | 100.0 | 0.0 | 100.0 | 94.1 | 94.1 |
 | binsrv/models/error_response.cpp | 8/8 | 100.0 | 3/3 | 100.0 | 0.0 | 0.0 | 100.0 | 100.0 |
 | binsrv/models/search_response.cpp | 12/20 | 60.0 | 2/3 | 66.7 | 0.0 | 0.0 | 60.0 | 60.0 |
 | binsrv/replication_config.cpp | 7/7 | 100.0 | 4/4 | 100.0 | 0.0 | 100.0 | 85.7 | 57.1 |
-| binsrv/replication_source_config.cpp | 33/33 | 100.0 | 38/38 | 100.0 | 0.0 | 100.0 | 66.7 | 66.7 |
+| binsrv/replication_source_config.cpp | 21/21 | 100.0 | 20/20 | 100.0 | 0.0 | 100.0 | 66.7 | 61.9 |
 | binsrv/rewrite_config.cpp | 6/6 | 100.0 | 5/5 | 100.0 | 0.0 | 100.0 | 50.0 | 0.0 |
 | binsrv/s3_error.cpp | 7/13 | 53.8 | 4/5 | 80.0 | 0.0 | 53.8 | 0.0 | 0.0 |
 | binsrv/s3_error_helpers_private.cpp | 20/20 | 100.0 | 14/15 | 93.3 | 0.0 | 100.0 | 0.0 | 0.0 |
-| binsrv/s3_storage_backend.cpp | 351/427 | 82.2 | 239/337 | 70.9 | 0.0 | 82.2 | 0.0 | 0.0 |
-| binsrv/size_unit.cpp | 36/39 | 92.3 | 22/26 | 84.6 | 0.0 | 92.3 | 69.2 | 66.7 |
-| binsrv/source_ssl_config.cpp | 6/6 | 100.0 | 4/4 | 100.0 | 0.0 | 100.0 | 0.0 | 0.0 |
-| binsrv/storage.cpp | 144/145 | 99.3 | 57/64 | 89.1 | 0.0 | 80.7 | 97.9 | 93.1 |
+| binsrv/s3_storage_backend.cpp | 337/427 | 78.9 | 235/337 | 69.7 | 0.0 | 78.9 | 0.0 | 0.0 |
+| binsrv/size_unit.cpp | 36/39 | 92.3 | 22/26 | 84.6 | 0.0 | 92.3 | 69.2 | 69.2 |
+| binsrv/source_ssl_config.cpp | 6/6 | 100.0 | 4/4 | 100.0 | 0.0 | 100.0 | 66.7 | 0.0 |
+| binsrv/storage.cpp | 146/147 | 99.3 | 57/64 | 89.1 | 0.0 | 81.0 | 98.0 | 93.2 |
 | binsrv/storage_backend_factory.cpp | 19/22 | 86.4 | 10/12 | 83.3 | 0.0 | 86.4 | 54.5 | 54.5 |
 | binsrv/storage_config.cpp | 11/11 | 100.0 | 7/7 | 100.0 | 0.0 | 100.0 | 90.9 | 81.8 |
-| binsrv/storage_core.cpp | 608/653 | 93.1 | 500/589 | 84.9 | 0.0 | 88.2 | 89.4 | 57.0 |
+| binsrv/storage_core.cpp | 619/667 | 92.8 | 511/603 | 84.7 | 0.0 | 88.3 | 89.2 | 57.0 |
 | binsrv/storage_metadata.cpp | 15/16 | 93.8 | 6/7 | 85.7 | 0.0 | 93.8 | 93.8 | 93.8 |
-| binsrv/time_unit.cpp | 37/40 | 92.5 | 22/26 | 84.6 | 0.0 | 92.5 | 67.5 | 0.0 |
-| easymysql/connection.cpp | 227/268 | 84.7 | 88/139 | 63.3 | 0.0 | 0.0 | 84.7 | 57.5 |
+| binsrv/telemetry.cpp | 88/104 | 84.6 | 84/119 | 70.6 | 0.0 | 0.0 | 84.6 | 22.1 |
+| binsrv/telemetry_config.cpp | 15/15 | 100.0 | 5/10 | 50.0 | 0.0 | 100.0 | 100.0 | 86.7 |
+| binsrv/time_unit.cpp | 37/40 | 92.5 | 22/26 | 84.6 | 0.0 | 92.5 | 70.0 | 0.0 |
+| easymysql/connection.cpp | 226/268 | 84.3 | 87/139 | 62.6 | 0.0 | 0.0 | 84.3 | 57.5 |
 | easymysql/connection_config.cpp | 22/27 | 81.5 | 26/36 | 72.2 | 0.0 | 33.3 | 77.8 | 77.8 |
 | easymysql/core_error.cpp | 9/13 | 69.2 | 4/5 | 80.0 | 0.0 | 0.0 | 69.2 | 0.0 |
 | easymysql/core_error_helpers_private.cpp | 12/12 | 100.0 | 6/7 | 85.7 | 0.0 | 0.0 | 100.0 | 0.0 |
 | easymysql/library.cpp | 8/12 | 66.7 | 1/2 | 50.0 | 0.0 | 0.0 | 66.7 | 66.7 |
 | minimysql/caching_sha2_password_authenticator.cpp | 26/28 | 92.9 | 19/22 | 86.4 | 0.0 | 92.9 | 89.3 | 42.9 |
-| minimysql/connection_context.cpp | 390/423 | 92.2 | 190/218 | 87.2 | 0.0 | 88.7 | 79.9 | 65.5 |
-| minimysql/heartbeat_sender.cpp | 18/19 | 94.7 | 7/8 | 87.5 | 0.0 | 94.7 | 94.7 | 84.2 |
-| minimysql/network_io_operations.cpp | 6/6 | 100.0 | 3/3 | 100.0 | 0.0 | 100.0 | 100.0 | 100.0 |
-| minimysql/network_service.cpp | 239/266 | 89.8 | 142/201 | 70.6 | 0.0 | 85.7 | 81.2 | 64.3 |
-| opensslpp/cipher_context.cpp | 209/247 | 84.6 | 106/150 | 70.7 | 82.2 | 71.3 | 70.4 | 0.0 |
+| minimysql/connection_context.cpp | 404/439 | 92.0 | 196/225 | 87.1 | 0.0 | 86.3 | 79.5 | 63.8 |
+| minimysql/heartbeat_sender.cpp | 17/18 | 94.4 | 6/7 | 85.7 | 0.0 | 94.4 | 94.4 | 83.3 |
+| minimysql/network_service.cpp | 250/264 | 94.7 | 146/199 | 73.4 | 0.0 | 81.8 | 86.0 | 63.3 |
+| minimysql/session_frame_stream.cpp | 25/27 | 92.6 | 9/9 | 100.0 | 0.0 | 85.2 | 92.6 | 77.8 |
+| opensslpp/cipher_context.cpp | 211/247 | 85.4 | 107/150 | 71.3 | 82.2 | 72.9 | 70.4 | 0.0 |
 | opensslpp/core_error.cpp | 23/23 | 100.0 | 22/26 | 84.6 | 100.0 | 95.7 | 0.0 | 0.0 |
 | opensslpp/crypto_rng.cpp | 7/9 | 77.8 | 4/6 | 66.7 | 77.8 | 66.7 | 66.7 | 66.7 |
 | opensslpp/digest_context.cpp | 46/57 | 80.7 | 22/36 | 61.1 | 80.7 | 78.9 | 78.9 | 0.0 |
 | opensslpp/evp_pkey.cpp | 187/216 | 86.6 | 109/152 | 71.7 | 86.6 | 76.9 | 53.7 | 53.7 |
-| operations/basic_operation.cpp | 6/9 | 66.7 | 2/7 | 28.6 | 0.0 | 0.0 | 66.7 | 66.7 |
-| operations/collector_context.cpp | 226/231 | 97.8 | 207/219 | 94.5 | 0.0 | 0.0 | 97.8 | 66.2 |
+| operations/basic_operation.cpp | 6/9 | 66.7 | 2/7 | 28.6 | 0.0 | 66.7 | 66.7 | 66.7 |
+| operations/collector_context.cpp | 222/231 | 96.1 | 205/219 | 93.6 | 0.0 | 0.0 | 96.1 | 66.2 |
 | operations/event_generation_helpers.cpp | 46/48 | 95.8 | 23/26 | 88.5 | 0.0 | 95.8 | 93.8 | 20.8 |
 | operations/fetch_operation.cpp | 39/40 | 97.5 | 22/22 | 100.0 | 0.0 | 0.0 | 97.5 | 80.0 |
 | operations/list_operation.cpp | 22/22 | 100.0 | 14/15 | 93.3 | 0.0 | 0.0 | 100.0 | 100.0 |
 | operations/logger_helpers.cpp | 306/312 | 98.1 | 205/233 | 88.0 | 0.0 | 0.0 | 98.1 | 54.5 |
 | operations/model_helpers.cpp | 12/12 | 100.0 | 10/20 | 50.0 | 0.0 | 0.0 | 100.0 | 91.7 |
-| operations/operation_factory.cpp | 14/18 | 77.8 | 6/9 | 66.7 | 0.0 | 0.0 | 77.8 | 61.1 |
-| operations/pull_operation.cpp | 52/53 | 98.1 | 34/35 | 97.1 | 0.0 | 0.0 | 98.1 | 84.9 |
+| operations/operation_factory.cpp | 15/18 | 83.3 | 6/9 | 66.7 | 0.0 | 50.0 | 77.8 | 61.1 |
+| operations/pull_operation.cpp | 53/54 | 98.1 | 35/36 | 97.2 | 0.0 | 0.0 | 98.1 | 85.2 |
 | operations/purge_binlogs_operation.cpp | 25/27 | 92.6 | 16/19 | 84.2 | 0.0 | 0.0 | 92.6 | 0.0 |
 | operations/search_by_gtid_set_operation.cpp | 25/25 | 100.0 | 16/17 | 94.1 | 0.0 | 0.0 | 100.0 | 0.0 |
 | operations/search_by_timestamp_operation.cpp | 27/27 | 100.0 | 18/19 | 94.7 | 0.0 | 0.0 | 100.0 | 0.0 |
 | operations/search_helpers.cpp | 33/33 | 100.0 | 31/31 | 100.0 | 0.0 | 100.0 | 97.0 | 0.0 |
-| operations/sender_context.cpp | 57/60 | 95.0 | 30/35 | 85.7 | 0.0 | 95.0 | 95.0 | 90.0 |
+| operations/sender_context.cpp | 62/65 | 95.4 | 36/42 | 85.7 | 0.0 | 95.4 | 95.4 | 87.7 |
 | operations/sender_single_file_context.cpp | 236/254 | 92.9 | 133/157 | 84.7 | 0.0 | 92.9 | 87.0 | 78.3 |
-| operations/version_operation.cpp | 0/6 | 0.0 | 0/3 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| operations/version_operation.cpp | 6/6 | 100.0 | 3/3 | 100.0 | 0.0 | 100.0 | 0.0 | 0.0 |
 | util/byte_range.cpp | 18/18 | 100.0 | 16/16 | 100.0 | 100.0 | 83.3 | 83.3 | 83.3 |
 | util/command_line_helpers.cpp | 22/26 | 84.6 | 14/18 | 77.8 | 0.0 | 0.0 | 84.6 | 84.6 |
 | util/crc_helpers.cpp | 4/4 | 100.0 | 0/0 | - | 100.0 | 100.0 | 100.0 | 100.0 |
 | util/ctime_timestamp.cpp | 26/30 | 86.7 | 11/16 | 68.8 | 6.7 | 86.7 | 86.7 | 56.7 |
 | util/ctime_timestamp_range.cpp | 23/25 | 92.0 | 16/20 | 80.0 | 0.0 | 92.0 | 84.0 | 84.0 |
-| util/file_operations_helpers.cpp | 39/54 | 72.2 | 40/66 | 60.6 | 50.0 | 59.3 | 63.0 | 59.3 |
+| util/file_operations_helpers.cpp | 41/54 | 75.9 | 44/66 | 66.7 | 50.0 | 59.3 | 66.7 | 59.3 |
 | util/hex_value.cpp | 47/52 | 90.4 | 19/22 | 86.4 | 0.0 | 90.4 | 71.2 | 0.0 |
 | util/native_file_operations_helpers_posix.cpp | 6/14 | 42.9 | 4/10 | 40.0 | 0.0 | 42.9 | 42.9 | 42.9 |
 | util/semantic_version.cpp | 27/28 | 96.4 | 26/27 | 96.3 | 78.6 | 96.4 | 78.6 | 78.6 |
 | util/timestamp_helpers.cpp | 10/10 | 100.0 | 4/4 | 100.0 | 60.0 | 100.0 | 40.0 | 40.0 |
 
-Notable moves against 2026-10-29 (combined base layers):
-- Up: `indexed_event_block.cpp` 74.0 → 92.1 (the GTID-mode sender properties, N10), `s3_storage_backend.cpp` 78.6 → 82.1, `file_operations_helpers.cpp` 63.0 → 72.2, `byte_range.cpp` 83.3 → 100, `connection_context.cpp` 91.5 → 92.9 (garbled passwords, N8), `reader_context.cpp` 92.5 → 93.7. New: `source_ssl_config.cpp` 100.
-- Down: `network_service.cpp` 95.1 → 89.8 (new TLS code reached only by the pull-tls extra layer; 95.5 with all layers). `byte_span_extractors.hpp`, `empty_body.cpp` and `heartbeat_log_v2_body_impl.cpp` are property-run noise.
+Notable moves against 2026-10-30 (combined base layers):
+- Up: `network_service.cpp` 89.8 → 94.7 (the TLS handshake now runs, reached by MTR and the property tests), `file_operations_helpers.cpp` 72.2 → 75.9, `version_operation.cpp` 0 → 100. New: `telemetry.cpp` 84.6 (90.4 with all layers), `telemetry_config.cpp` 100, `instance_id.cpp` 91.7 (97.2), `instance_config.cpp` 100, `uuid_helpers.hpp` 100, `session_frame_stream.cpp` 92.6, `upgradable_stream.hpp` 92.5; `sender_context.cpp` 95.0 → 95.4 with the auto-positioning.
+- Down: `s3_storage_backend.cpp` 82.1 → 78.8 (S3 property variants, noise; 85.0 with all layers), `collector_context.cpp` 97.8 → 96.1 (263-267, a failed switch to replication after a source restart, reached on 2026-10-30 by `rs_blocking_dump_empty_storage` and not this time: whether the reconnect fails at the connect or at the switch depends on timing), `heartbeat_log_v2_body_impl.cpp` 91.0 → 88.1 (property noise).
 
 Low-percentage but low-value: `footer.cpp`, `version_operation.cpp`, the `app.cpp` top-level catch, the `file_operations_helpers.cpp` / `native_file_operations_helpers_posix.cpp` I/O-error raises (disk-faults reaches some), and the `util/*.hpp` exception-location templates. The headers are in the totals but not in this table.

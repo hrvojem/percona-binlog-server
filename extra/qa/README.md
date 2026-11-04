@@ -309,6 +309,9 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_gtid_set_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/pull-gtid-set
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/telemetry_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/telemetry
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/upgrade_test.py \
+  --mysql-basedir <dist> --old-binsrv ~/ws/pbs-0.4.1-build/binlog_server \
+  --binsrv <binary> --workdir ~/ws/qa/upgrade --mode gtid
 ```
 
 `pull_gtid_test.py` drives GTID auto-position replicas (PBS-29 part 2,
@@ -365,6 +368,33 @@ the timer and expires at once) and `settings_in_storage` (ticket 50: the
 instance_id file makes a fresh storage directory "not empty but does not
 contain metadata"). A replaced damaged id is not logged. The nightly runs
 it every night (`QA_PORT`+270, about 3 min).
+
+`upgrade_test.py` checks that the current build takes over a storage
+written by the previous release (`--old-binsrv`, `pbs-0.4.1`, built once on
+the host: `git worktree add ~/ws/pbs-0.4.1-src pbs-0.4.1`, then `cmake -S
+~/ws/pbs-0.4.1-src -B ~/ws/pbs-0.4.1-build --preset release_gcc14` and
+`cmake --build ~/ws/pbs-0.4.1-build --target binlog_server`). The release
+gets the same settings without the sections it does not know (`instance`,
+`replication_source`, `telemetry`). Cases: `old_config` (the release's
+configuration given to the current build must fail naming what is missing;
+it also reports what the next missing section is), `plain_takeover` (the
+release fetches five binlogs; the current build must answer `list`,
+`search_by_timestamp` and, in GTID mode, `search_by_gtid_set` exactly as
+the release does, resume the fetch to a byte-identical copy and serve all of
+it to a MySQL replica through `pull`; whether the release can still list
+the storage afterwards is reported), `encrypted_takeover` (the same with
+KEK `alpha` and AES-256-CTR, checked through the replica; the release
+rejects the repository's `keyring_data.json` for its AES-256-GCM record
+`beta`, so the harness writes a keyring with `alpha` only) and
+`killed_takeover` (the release is killed with SIGKILL after 1.5 MB of a
+fetch with `checkpoint_size` 64K; the current build must recover the
+storage and complete the copy). On 2026-11-04 every case passes in both
+modes against `pbs-0.4.1`, and the release still lists a storage the
+current build wrote. `old_config` shows the upgrade is two failed starts
+long: `unable to extract "instance"`, then, with `instance` added, `unable
+to extract "replication_source"`, a section only `pull` uses (ticket 51).
+The nightly runs it for both modes every night (`QA_PORT`+290, about 5 min
+each).
 
 `pull_tls_test.py` checks TLS on the listener (PBS-31). It starts `pull`
 with one `replication_source` configuration after another on the same
@@ -440,7 +470,10 @@ server rather than starting one.
      `QA_PORT`+230), `pull_gtid_set_test.py` (auto-positioning with
      uneven replica GTID sets, 10 `gtid/...` cases, port `QA_PORT`+250) and
      `telemetry_test.py` (telemetry and instance_id, 18 `position/...`
-     cases, port `QA_PORT`+270), all with the debug build,
+     cases, port `QA_PORT`+270) and `upgrade_test.py` per mode (a storage
+     of the release in `OLD_BINSRV` taken over, 4 cases each, port
+     `QA_PORT`+290; skipped when that binary is missing), all with the
+     debug build,
      and a short
      `fetch_crash_test.py` run per mode (cases `gtid` and `position`,
      10 examples of 8 steps, `QA_EXAMPLES` / `QA_STEPS`) with the ASan build,
@@ -687,14 +720,12 @@ replay a failure, and a per-test rundown are documented in
 ## Coverage
 
 [`COVERAGE_GAPS.md`](COVERAGE_GAPS.md) records the last line and branch
-coverage measurement of `src/` (2026-10-30: 90.1% of lines and 80.3% of
-branches over the unit, property, MTR 8.4 and QA layers; 90.8% with every
+coverage measurement of `src/` (2026-11-03: 90.0% of lines and 80.3% of
+branches over the unit, property, MTR 8.4 and QA layers; 91.0% with every
 layer), how it was taken, and a table of the code
 no test reaches yet, each with the cheapest kind of test that would. It is
 measured with a gcov build in its own tree (`~/ws/build_coverage.sh`,
 `~/ws/run_coverage.sh`); see the document for the steps and for the pitfalls
 (one crashing property case hides the rest of its program; property layers
-vary between runs). The measurement predates the merge of PBS-41
-(telemetry and instance_id, upstream `2d7dc80`), so `binsrv/telemetry.cpp`,
-`binsrv/telemetry_config.cpp` and `binsrv/instance_id.cpp` are not in it yet;
-`telemetry_test.py` and the MTR telemetry tests are what reach them.
+vary between runs). It includes PBS-41 (telemetry and instance_id) and PBS-29
+part 3 (upstream `2d7dc80`), with a `telemetry` layer for `telemetry_test.py`.

@@ -16,7 +16,7 @@
 # pull_replica_test.py, query_race_test.py, pull_heartbeat_test.py,
 # pull_tls_test.py, pull_gtid_test.py, pull_gtid_set_test.py,
 # telemetry_test.py, upgrade_test.py (from the release in OLD_BINSRV),
-# pull_variety_test.py and a
+# pull_variety_test.py, pull_replica_fault_test.py and a
 # short fetch_crash_test.py run per mode on file and on S3 storage; and one
 # of the heavier harnesses by day of the week (QA_ROTATION: the S3 and disk
 # fault sweeps, the network fault test, the listener fuzzer, the source
@@ -558,6 +558,21 @@ if want qa; then
       qa_run pull_variety_test "pull_variety_test ($mode)" \
         --binsrv "$debug_binsrv" --workdir "$out/qa/variety-$mode" \
         --mode "$mode" --port $((QA_PORT + 310)) --timeout 1500
+    done
+    # the same served from an encrypted storage on S3
+    qa_run pull_variety_test "pull_variety_test (gtid, encrypted, S3)" \
+      --binsrv "$debug_binsrv" --workdir "$out/qa/variety-gtid-es3" \
+      --mode gtid --encrypted --storage s3 \
+      --s3-bucket-dir "$S3_BUCKET_DIR" \
+      --port $((QA_PORT + 310)) --timeout 1500
+    # network faults between pull and a MySQL replica (Toxiproxy outlives
+    # the nightly: it must not hold the run lock)
+    [ -x "$WS/qa/start_toxiproxy.sh" ] &&
+      "$WS/qa/start_toxiproxy.sh" 9>&- >> "$out/nightly.log" 2>&1
+    for mode in gtid position; do
+      qa_run pull_replica_fault_test "pull_replica_fault_test ($mode)" \
+        --binsrv "$debug_binsrv" --workdir "$out/qa/replica-fault-$mode" \
+        --mode "$mode" --port $((QA_PORT + 330)) --timeout 1500
     done
   fi
   # the crash/resume test runs against the ASan build to catch memory errors

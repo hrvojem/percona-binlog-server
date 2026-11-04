@@ -283,9 +283,19 @@ def harness_command(args, workdir: Path) -> list:
     if args.harness in ("pull_replica_test", "pull_heartbeat_test",
                         "pull_tls_test"):
         return script + common
-    if args.harness in ("pull_gtid_test", "pull_gtid_set_test",
-                        "pull_variety_test"):
+    if args.harness in ("pull_gtid_test", "pull_gtid_set_test"):
         return script + common + mode
+    if args.harness == "pull_replica_fault_test":
+        return script + common + mode + ["--toxiproxy-api",
+                                         args.toxiproxy_api]
+    if args.harness == "pull_variety_test":
+        command = script + common + mode
+        if args.encrypted:
+            command.append("--encrypted")
+        if args.storage == "s3":
+            command += ["--storage", "s3", "--s3-endpoint", args.s3_endpoint,
+                        "--s3-bucket-dir", str(args.s3_bucket_dir)]
+        return command
     if args.harness == "telemetry_test":
         command = script + common + mode
         if args.fsfault_lib:
@@ -348,7 +358,7 @@ def harness_cases(args, returncode: int, output: str, lines: list,
     if args.harness in ("pull_load_test", "pull_soak_test", "pull_tls_test",
                         "pull_gtid_test", "pull_gtid_set_test",
                         "telemetry_test", "upgrade_test",
-                        "pull_variety_test"):
+                        "pull_variety_test", "pull_replica_fault_test"):
         cases = []
         for result, _ in objects:
             if "case" not in result:
@@ -358,8 +368,17 @@ def harness_cases(args, returncode: int, output: str, lines: list,
                 details = {key: value for key, value in result.items()
                            if key not in ("case", "ok")}
                 reason = json.dumps(details)
-            cases.append((f"{mode}/{result['case']}", not result.get("ok"),
-                          reason[:240], None, None, None))
+            # pull_variety_test on another storage:
+            # '<mode>/<case>/encrypted', '.../s3', '.../encrypted-s3'
+            variant = "-".join(
+                name for name, used in (
+                    ("encrypted", getattr(args, "encrypted", False)),
+                    ("s3", args.storage == "s3"))
+                if used and args.harness == "pull_variety_test")
+            suffix = f"/{variant}" if variant else ""
+            cases.append((f"{mode}/{result['case']}{suffix}",
+                          not result.get("ok"), reason[:240], None, None,
+                          None))
         return cases
     if args.harness == "large_binlog_test":
         cases = []
@@ -610,8 +629,8 @@ def precondition_failure(args) -> str:
     if uses_s3 and not (args.s3_bucket_dir and
                         Path(args.s3_bucket_dir).is_dir()):
         return f"the bucket directory {args.s3_bucket_dir} does not exist"
-    if args.harness == "network_fault_test" and \
-            not reachable(f"{args.toxiproxy_api}/version"):
+    if args.harness in ("network_fault_test", "pull_replica_fault_test") \
+            and not reachable(f"{args.toxiproxy_api}/version"):
         return f"Toxiproxy is not reachable at {args.toxiproxy_api}"
     if args.harness == "disk_fault_sweep" and not (
             args.fsfault_lib and Path(args.fsfault_lib).is_file()):
@@ -888,6 +907,8 @@ def main():
     parser.add_argument("--dist", type=Path, help="the MySQL distribution")
     parser.add_argument("--series", help="8.0, 8.4, 9.7")
     parser.add_argument("--binsrv", type=Path)
+    parser.add_argument("--encrypted", action="store_true",
+                        help="an encrypted storage (pull_variety_test)")
     parser.add_argument("--old-binsrv", type=Path,
                         help="binlog_server of the previous release "
                              "(upgrade_test)")

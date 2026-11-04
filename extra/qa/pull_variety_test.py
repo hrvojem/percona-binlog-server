@@ -47,6 +47,11 @@ and a MySQL replica applies it from 'pull'. Kinds:
   tagged       (GTID mode, 8.3+) tagged GTIDs ('AUTOMATIC:<tag>');
   empty        (GTID mode) empty transactions given GTIDs of another UUID.
 
+The storage is a file storage by default; --encrypted encrypts it (KEK
+'alpha' of the repository's sample keyring, AES-256-CTR) and --storage s3 puts it
+on an S3-compatible server (--s3-bucket-dir), so the replicas are served
+through those read paths.
+
 Two phases: 'live' (the replica is connected while the workload runs) and
 'replay' (a reset replica replicates everything again from the storage).
 After each the replica's databases, tables (SHOW CREATE TABLE, row count
@@ -66,7 +71,9 @@ Uses the helpers of fetch_crash_test.py and pull_replica_test.py. Example:
 
 import argparse
 import json
+import os
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -84,6 +91,12 @@ TAG = "qa"
 # skipped; any other error fails it
 UNSUPPORTED = re.compile(r"ERROR (1193|1235|1064) ")
 PREFIX = "qv_"
+# the 'alpha' record of the repository's sample keyring: its record 'beta'
+# holds 31 bytes for AES-256-GCM, so every build rejects the whole file
+# (ticket 52)
+KEYRING_SOURCE = Path(__file__).resolve().parents[2] / "keyring_data.json"
+KEYRING: Path = None  # written into the work directory by main()
+ENCRYPTION = {"format": "generic", "kek_id": "alpha", "cipher": "AES-256-CTR"}
 
 
 def types() -> list:
@@ -526,8 +539,26 @@ def run(args) -> list:
     replica = harness.MySQLServer(args.mysql_basedir, work / "replica",
                                   args.port + 10, gtid_mode, server_id=10)
     harness.SERVER = source
+    s3 = None
+    if args.storage == "s3":
+        s3 = harness.S3Storage(args.s3_endpoint, args.s3_bucket,
+                               args.s3_bucket_dir, args.s3_access_key,
+                               args.s3_secret_key,
+                               f"variety-{args.mode}-{os.getpid()}")
     binsrv = harness.BinlogServer(args.binsrv, work / "binsrv", args.port,
-                                  gtid_mode)
+                                  gtid_mode, s3)
+    if args.encrypted:
+        # every configuration written (also start_pull's) is encrypted
+        write_config = binsrv.write_config
+
+        def write_encrypted_config():
+            write_config()
+            config = json.loads(binsrv.config_path.read_text())
+            config["keyring"] = {"uri": f"file://{KEYRING}"}
+            config["storage"]["encryption"] = dict(ENCRYPTION)
+            binsrv.config_path.write_text(json.dumps(config, indent=2))
+
+        binsrv.write_config = write_encrypted_config
     binsrv.reset()
     binsrv.checkpoint_size = "1"
     pull_port = args.port + 2
@@ -607,6 +638,10 @@ def run(args) -> list:
             pull.wait(timeout=120)
         source.stop()
         replica.stop()
+    if s3 is not None and all(result.get("ok") for result in results):
+        # the objects live in a shared bucket; a failed run keeps them
+
+        shutil.rmtree(binsrv.storage, ignore_errors=True)
     return results
 
 
@@ -618,12 +653,30 @@ def main():
     parser.add_argument("--port", type=int, default=24010)
     parser.add_argument("--mode", choices=["position", "gtid"],
                         default="gtid")
+    parser.add_argument("--encrypted", action="store_true",
+                        help="encrypt the storage")
+    parser.add_argument("--storage", choices=["file", "s3"], default="file")
+    parser.add_argument("--s3-endpoint", default="127.0.0.1:9000")
+    parser.add_argument("--s3-bucket", default="pbs-mtr")
+    parser.add_argument("--s3-bucket-dir", type=Path,
+                        help="the directory holding the bucket's objects")
+    parser.add_argument("--s3-access-key", default="pbsaccesskey")
+    parser.add_argument("--s3-secret-key", default="pbs/secret+key=1")
     parser.add_argument("--kinds", default="",
                         help="comma-separated kinds (default: all)")
     args = parser.parse_args()
     args.mysql_basedir = args.mysql_basedir.expanduser()
     args.binsrv = args.binsrv.expanduser()
     args.workdir = args.workdir.expanduser().resolve()
+    global KEYRING
+    KEYRING = args.workdir / "keyring.json"
+    keyring = json.loads(KEYRING_SOURCE.read_text())
+    keyring["keys"] = [key for key in keyring["keys"] if key["id"] == "alpha"]
+    KEYRING.write_text(json.dumps(keyring, indent=2))
+    if args.storage == "s3":
+        if args.s3_bucket_dir is None:
+            parser.error("--storage s3 needs --s3-bucket-dir")
+        args.s3_bucket_dir = args.s3_bucket_dir.expanduser().resolve()
     args.workdir.mkdir(parents=True, exist_ok=True)
     results = run(args)
     (args.workdir / "results.json").write_text(json.dumps(results, indent=2))

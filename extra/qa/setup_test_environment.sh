@@ -181,8 +181,10 @@ step_project() {
     case "$config" in
       tsan_gcc14)
         # the debug preset with ThreadSanitizer, for the concurrent storage
-        # property test
-        local tsan="-fsanitize=thread"
+        # property test; -Wno-tsan: GCC 14 warns that TSan does not model
+        # atomic_thread_fence, which Boost.Asio uses (telemetry.cpp, since
+        # PBS-41), and the preset's -Werror turns that into a build error
+        local tsan="-fsanitize=thread -Wno-tsan"
         configure+=(--preset debug_gcc14 -DHEGEL_SANITIZE=thread
                     "-DCMAKE_C_FLAGS=$tsan" "-DCMAKE_CXX_FLAGS=$tsan"
                     "-DCMAKE_EXE_LINKER_FLAGS=$tsan"

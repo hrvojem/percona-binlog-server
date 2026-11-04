@@ -64,7 +64,8 @@ INSERT INTO t1 VALUES(DEFAULT);
 --let $iteration = 0
 while($iteration < $max_number_of_attempts)
 {
-  --error 0, 1
+  # 2: the utility has not created its log file yet
+  --error 0, 1, 2
   --exec grep --silent $second_binlog $binsrv_log_path
   --let $grep_status = $__error
   if ($grep_status == 0)

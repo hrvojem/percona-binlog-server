@@ -458,7 +458,10 @@ BOOST_AUTO_TEST_CASE(MinimysqlParsesCommands) {
       require(context.get_client_mysql_command() ==
                   minimysql::client_command_type::binlog_dump,
               "binlog dump parsed as another command");
-      require(context.check_binlog_non_blocking_dump() == sent.non_blocking &&
+      // like MySQL, a dump from server_id 0 is non-blocking without the flag
+      // (PBS-55)
+      require(context.check_binlog_non_blocking_dump() ==
+                      (sent.non_blocking || sent.server_id == 0U) &&
                   context.get_binlog_server_id() == sent.server_id &&
                   context.get_binlog_filename() == sent.filename &&
                   context.get_binlog_position() == sent.position,

@@ -15,7 +15,8 @@
 # harnesses from extra/qa run against MySQL 8.4: every night
 # pull_replica_test.py, query_race_test.py, pull_heartbeat_test.py,
 # pull_tls_test.py, pull_gtid_test.py, pull_gtid_set_test.py,
-# telemetry_test.py, upgrade_test.py (from the release in OLD_BINSRV) and a
+# telemetry_test.py, upgrade_test.py (from the release in OLD_BINSRV),
+# pull_variety_test.py and a
 # short fetch_crash_test.py run per mode on file and on S3 storage; and one
 # of the heavier harnesses by day of the week (QA_ROTATION: the S3 and disk
 # fault sweeps, the network fault test, the listener fuzzer, the source
@@ -550,6 +551,14 @@ if want qa; then
     else
       log "upgrade_test skipped: no release binary at $OLD_BINSRV"
     fi
+    # a replica of pull must end with the source's data for every kind of
+    # workload (column types, row images, partial JSON, compression,
+    # statement format, DDL, XA, large events, savepoints, charsets)
+    for mode in gtid position; do
+      qa_run pull_variety_test "pull_variety_test ($mode)" \
+        --binsrv "$debug_binsrv" --workdir "$out/qa/variety-$mode" \
+        --mode "$mode" --port $((QA_PORT + 310)) --timeout 1500
+    done
   fi
   # the crash/resume test runs against the ASan build to catch memory errors
   if [ -n "${build_failed[asan_gcc14]:-}" ]; then

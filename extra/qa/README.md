@@ -114,6 +114,7 @@ JSON and exits non-zero on a failure.
 | `concurrent_storage_test.py` | runs several `fetch` instances against **one** storage at once (a cron `fetch` overrunning into the next run); checks the storage is not corrupted and heals. Two writers on one storage are an unsupported scenario (ticket 24, closed as not a bug in PBS-87), so its failures document misuse, not defects | ticket 24 |
 | `source_change_test.py` | changes the source under a running backup: `RESET BINARY LOGS`, a different server (failover), binlogs purged before fetch, a mid-stream restart | ticket 25 |
 | `event_variety_test.py` | drives less common event types — transaction compression, `binlog_row_image=MINIMAL`, partial JSON, XA, tagged GTIDs — through a full fetch and a kill/resume | — (no bug) |
+| `pull_variety_test.py` | a MySQL replica of `pull` must end with the source's data for a broad workload — every column type, row images, partial JSON, compression, statement format, DDL with routines and triggers, XA, an 8 MB row, savepoints, charsets, tagged GTIDs, empty transactions — live and replayed from the storage | — (no bug) |
 | `query_race_test.py` | runs `binlog_server list` `--runs` times (default 500) next to a `pull` writing a filesystem storage with `checkpoint_size` `"1K"` while the source gets small inserts and a `FLUSH BINARY LOGS` every 20 of them; reports the failed `list` runs and each distinct error message | ticket 29 |
 | `large_binlog_test.py` | binlogs and transactions past 4 GiB, where positions no longer fit the protocol's 32-bit fields. Case `binlog_over_4gib`: about 1 GB of 1 MiB transactions and one of about 3.5 GB leave a 4.5 GB binlog; `fetch` must store it byte for byte, a second `fetch` reopen the storage, `list` report its size, and `mysqlbinlog --raw` through `pull` copy it exactly (passes). Case `transaction_over_4gib`: one transaction of about 4.7 GB. Needs about 20 GB of disk; `--keep` keeps the data, `--cases` picks the cases. With `--storage s3 --s3-bucket-dir <dir>` the storage is in the S3 bucket, behind a counting `s3_fault_proxy.py` the harness starts (`--s3-proxy-port`), and a further check `s3_put_size` requires that no request uploads more than 5 GiB, the AWS limit for a single PUT, which local S3 servers do not enforce (only `binlog_over_4gib` by default; about 30 GB of disk). First run (2026-10-28, debug build): passes; the 4.5 GB binlog goes up as a multipart upload of 8 MiB parts (largest request 8 MiB), and `pull` streams it back from S3 byte for byte. Versity S3 Gateway 1.8.0 takes about a minute to join the parts, and the AWS SDK's CRT client repeats the CompleteMultipartUpload after about 5 s, which the gateway confirms at once, before the object exists; the harness therefore waits up to 5 min for the objects (`s3_object_late_seconds`, 54 s) before comparing. AWS S3 confirms a completion only once the object exists | ticket 41 (PBS-114) |
 
@@ -378,6 +379,27 @@ instance_id file makes a fresh storage directory "not empty but does not
 contain metadata"). A replaced damaged id is not logged. The nightly runs
 it every night (`QA_PORT`+270, about 3 min).
 
+`pull_variety_test.py` checks the data a MySQL replica of `pull` ends with.
+The source writes one database per kind: `types` (every column type at its
+limits, NULLs, 4-byte UTF-8, a 1 MB blob, JSON, GEOMETRY, generated
+columns), `row_images` (MINIMAL, NOBLOB and FULL, on a table with a primary
+key and one without any key), `partial_json`, `compression`, `statement`
+(STATEMENT and MIXED), `ddl` (ALTER, RENAME, TRUNCATE, CREATE ... SELECT, a
+view, a function, a procedure and a trigger), `xa` (committed, rolled back
+after PREPARE, ONE PHASE), `large` (20000 rows in one transaction, an 8 MB
+row), `savepoints` (with a MyISAM table), `charsets`, and in GTID mode
+`tagged` (8.3+) and `empty` (empty transactions of another UUID). Phase
+`live`: a replica of `pull` applies it as it is written; phase `replay`: a
+reset replica replicates everything again from the storage. After each the
+replica's tables (SHOW CREATE TABLE, row count, CHECKSUM TABLE), views,
+routines and triggers must equal the source's, with no replication error and,
+in GTID mode, the same GTID_EXECUTED. A kind the MySQL version does not
+support is reported as skipped; any other SQL error fails it. On 2026-11-04
+every kind passes in both modes on 8.4, and in GTID mode on 8.0 (`tagged`
+skipped) and 9.7; a row changed and a trigger dropped on the replica behind
+its back are both reported. The nightly runs it for both modes
+(`QA_PORT`+310, about 3.5 min each).
+
 `upgrade_test.py` checks that the current build takes over a storage
 written by the previous release (`--old-binsrv`, `pbs-0.4.1`, built once on
 the host: `git worktree add ~/ws/pbs-0.4.1-src pbs-0.4.1`, then `cmake -S
@@ -486,7 +508,10 @@ server rather than starting one.
      cases with the file system fault cases, port `QA_PORT`+270) and
      `upgrade_test.py` per mode (a storage of the release in `OLD_BINSRV`
      taken over: 5 position and 6 gtid cases, port `QA_PORT`+290; skipped
-     when that binary is missing), all with the debug build,
+     when that binary is missing) and `pull_variety_test.py` per mode (a
+     replica of `pull` gets the source's data for a broad workload, 14
+     `gtid/...` and 14 `position/...` cases, port `QA_PORT`+310), all with
+     the debug build,
      and a short
      `fetch_crash_test.py` run per mode (cases `gtid` and `position`,
      10 examples of 8 steps, `QA_EXAMPLES` / `QA_STEPS`) with the ASan build,

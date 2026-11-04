@@ -361,7 +361,16 @@ says; whether that is logged is reported). instance_id cases on `list`:
 `readonly_without_id` (fails, naming the instance id: the directory must be
 writable), `readonly_with_id`, `padded_id`, `uppercase_id`,
 `id_is_directory`, `leftover_tmp` and `no_instance_section` (a config of an
-earlier release is refused naming `instance`). On 2026-11-03 four fail:
+earlier release is refused naming `instance`). With `--fsfault-lib` (the
+disk fault sweep's LD_PRELOAD library) six more `pull` cases make calls
+inside the telemetry directory fail: every write (`fault_write_enospc`),
+open (`fault_open_erofs`), fsync (`fault_fsync_eio`), the rename of a
+finished report (`fault_rename`), the removal of expired reports
+(`fault_unlink`), and only the first two writes (`fault_transient`). In each
+`pull` keeps serving and logs every failure; a failed write or rename leaves
+its temporary file, which the history cleanup removes later; after the
+transient failure complete reports are written again. All six pass on
+2026-11-04. On 2026-11-03 four fail:
 `scrape_zero`, `scrape_huge` and `grace_huge` (ticket 49: intervals are not
 validated; 0 writes 100-170 reports a second, more than ~292 years overflows
 the timer and expires at once) and `settings_in_storage` (ticket 50: the
@@ -388,9 +397,13 @@ rejects the repository's `keyring_data.json` for its AES-256-GCM record
 `beta`, so the harness writes a keyring with `alpha` only) and
 `killed_takeover` (the release is killed with SIGKILL after 1.5 MB of a
 fetch with `checkpoint_size` 64K; the current build must recover the
-storage and complete the copy). On 2026-11-04 every case passes in both
-modes against `pbs-0.4.1`, and the release still lists a storage the
-current build wrote. `old_config` shows the upgrade is two failed starts
+storage and complete the copy), `s3_takeover` (with `--s3-bucket-dir`:
+`plain_takeover` on S3 storage of the local S3-compatible server; its
+objects are removed when it passes) and, in GTID mode, `rewrite_takeover`
+(`plain_takeover` with a `replication.rewrite` section, binlogs named
+`rewritten.NNNNNN` of 32K, checked through the replica). On 2026-11-04 every
+case passes in both modes against `pbs-0.4.1`, and the release still lists a
+storage the current build wrote. `old_config` shows the upgrade is two failed starts
 long: `unable to extract "instance"`, then, with `instance` added, `unable
 to extract "replication_source"`, a section only `pull` uses (ticket 51).
 The nightly runs it for both modes every night (`QA_PORT`+290, about 5 min
@@ -469,11 +482,11 @@ server rather than starting one.
      `gtid/catch_up`, `gtid/restart`, `gtid/purged` and `gtid/ahead`, port
      `QA_PORT`+230), `pull_gtid_set_test.py` (auto-positioning with
      uneven replica GTID sets, 10 `gtid/...` cases, port `QA_PORT`+250) and
-     `telemetry_test.py` (telemetry and instance_id, 18 `position/...`
-     cases, port `QA_PORT`+270) and `upgrade_test.py` per mode (a storage
-     of the release in `OLD_BINSRV` taken over, 4 cases each, port
-     `QA_PORT`+290; skipped when that binary is missing), all with the
-     debug build,
+     `telemetry_test.py` (telemetry and instance_id, 24 `position/...`
+     cases with the file system fault cases, port `QA_PORT`+270) and
+     `upgrade_test.py` per mode (a storage of the release in `OLD_BINSRV`
+     taken over: 5 position and 6 gtid cases, port `QA_PORT`+290; skipped
+     when that binary is missing), all with the debug build,
      and a short
      `fetch_crash_test.py` run per mode (cases `gtid` and `position`,
      10 examples of 8 steps, `QA_EXAMPLES` / `QA_STEPS`) with the ASan build,

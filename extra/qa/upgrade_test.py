@@ -33,6 +33,11 @@ JSON line each):
   encrypted_takeover
                    the same with an encrypted storage (keyring KEK 'alpha',
                    AES-256-CTR); the copy is checked through the replica;
+  s3_takeover      (with --s3-bucket-dir) plain_takeover on S3 storage of
+                   the local S3-compatible server;
+  rewrite_takeover (GTID mode) plain_takeover with a 'replication.rewrite'
+                   section (binlogs of their own names and 32K size); the
+                   copy is checked through the replica;
   killed_takeover  the release is killed with SIGKILL in the middle of a
                    fetch (checkpoint_size 64K, so it leaves a partly written
                    binlog); the current build must recover the storage and
@@ -52,6 +57,7 @@ Uses the helpers of fetch_crash_test.py and pull_replica_test.py. Example:
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -69,6 +75,8 @@ import pull_replica_test as replication  # noqa: E402
 KEYRING_SOURCE = Path(__file__).resolve().parents[2] / "keyring_data.json"
 KEYRING: Path = None  # written into the work directory by main()
 ENCRYPTION = {"format": "generic", "kek_id": "alpha", "cipher": "AES-256-CTR"}
+# rewrite mode (GTID mode only): binlogs of its own names and size
+REWRITE = {"base_file_name": "rewritten", "file_size": "32K"}
 CATCH_UP_SECONDS = 120
 # sections the release does not know (its configuration parser rejects
 # unknown sections)
@@ -78,28 +86,42 @@ NEW_SECTIONS = ("instance", "replication_source", "telemetry")
 class Takeover:
     """One storage, written by 'old' and then 'new' binlog_server."""
 
-    def __init__(self, args, name: str, encrypted: bool = False):
+    def __init__(self, args, name: str, encrypted: bool = False,
+                 s3: bool = False, rewrite: bool = False):
         self.args = args
         self.gtid_mode = args.mode == "gtid"
+        storage = None
+        if s3:
+            storage = harness.S3Storage(
+                args.s3_endpoint, args.s3_bucket, args.s3_bucket_dir,
+                args.s3_access_key, args.s3_secret_key,
+                f"upgrade-{args.mode}-{name}-{os.getpid()}")
         self.binsrv = harness.BinlogServer(
-            args.binsrv, args.workdir / name, args.port, self.gtid_mode)
+            args.binsrv, args.workdir / name, args.port, self.gtid_mode,
+            storage)
         self.binsrv.reset()
         self.encrypted = encrypted
+        # rewrite mode names the binlogs itself, so the copy is not
+        # byte-identical to the source's files
+        self.byte_identical = not encrypted and not rewrite
         self.old_config = self.binsrv.workdir / "old.json"
-        if encrypted:
+        if encrypted or rewrite:
             # every configuration written for this storage (also the one
-            # of start_pull) carries the keyring and the encryption
+            # of start_pull) carries these settings
             write_config = self.binsrv.write_config
 
-            def write_encrypted_config():
+            def write_extended_config():
                 write_config()
                 config = json.loads(self.binsrv.config_path.read_text())
-                config["keyring"] = {"uri": f"file://{KEYRING}"}
-                config["storage"]["encryption"] = dict(ENCRYPTION)
+                if encrypted:
+                    config["keyring"] = {"uri": f"file://{KEYRING}"}
+                    config["storage"]["encryption"] = dict(ENCRYPTION)
+                if rewrite:
+                    config["replication"]["rewrite"] = dict(REWRITE)
                 self.binsrv.config_path.write_text(
                     json.dumps(config, indent=2))
 
-            self.binsrv.write_config = write_encrypted_config
+            self.binsrv.write_config = write_extended_config
 
     def write_configs(self) -> None:
         self.binsrv.write_config()
@@ -257,9 +279,9 @@ def old_config_case(args, source) -> dict:
             "ok": code not in (0, None) and "instance" in message}
 
 
-def takeover_case(args, source, replica, name: str, encrypted: bool,
-                  first_row: int) -> dict:
-    takeover = Takeover(args, name, encrypted)
+def takeover_case(args, source, replica, name: str, first_row: int,
+                  **storage) -> dict:
+    takeover = Takeover(args, name, **storage)
     takeover.binsrv.checkpoint_size = "16K"
     result = {}
     workload(source, 120, first_row, 30, 800)
@@ -273,7 +295,8 @@ def takeover_case(args, source, replica, name: str, encrypted: bool,
     if error:
         return {**result, "error": error, "ok": False}
     result["binlogs"] = len(takeover.binsrv.indexed_binlogs())
-    copy_error = None if encrypted else complete_copy(source, takeover)
+    copy_error = (complete_copy(source, takeover)
+                  if takeover.byte_identical else None)
     result["copy_error"] = copy_error
     served = served_to_replica(source, replica, takeover, args.port + 2)
     result.update(served)
@@ -283,6 +306,9 @@ def takeover_case(args, source, replica, name: str, encrypted: bool,
         f"lists {len(query_result((code, stdout, stderr)) or [])} binlogs")
     result["ok"] = (not result["query_differences"] and copy_error is None
                     and served["replica_matches"] and served["pull_alive"])
+    if result["ok"] and takeover.binsrv.s3 is not None:
+        # the objects live in a shared bucket; a failed case keeps them
+        shutil.rmtree(takeover.binsrv.storage, ignore_errors=True)
     return result
 
 
@@ -334,9 +360,9 @@ def run(args) -> list:
                                   args.port + 10, gtid_mode, server_id=10)
     results = []
 
-    def report(name: str, function, *function_args) -> None:
+    def report(name: str, function, *function_args, **keywords) -> None:
         try:
-            result = function(*function_args)
+            result = function(*function_args, **keywords)
         except Exception as error:  # reported as the case's failure
             result = {"error": harness.describe_failure(error, 600),
                       "ok": False}
@@ -346,20 +372,30 @@ def run(args) -> list:
     source.start()
     replica.start()
     try:
-        cases = args.cases.split(",") if args.cases else [
-            "old_config", "plain_takeover", "encrypted_takeover",
-            "killed_takeover"]
+        cases = args.cases.split(",") if args.cases else (
+            ["old_config", "plain_takeover", "encrypted_takeover",
+             "killed_takeover"] +
+            (["s3_takeover"] if args.s3_bucket_dir else []) +
+            (["rewrite_takeover"] if gtid_mode else []))
+        if "rewrite_takeover" in cases and not gtid_mode:
+            raise SystemExit("rewrite_takeover needs --mode gtid (rewrite "
+                             "mode requires GTID replication)")
         for name in cases:
             # every case starts from fresh source binlogs
             source.reset()
             if name == "old_config":
                 report(name, old_config_case, args, source)
             elif name == "plain_takeover":
-                report(name, takeover_case, args, source, replica, name,
-                       False, 1)
+                report(name, takeover_case, args, source, replica, name, 1)
             elif name == "encrypted_takeover":
-                report(name, takeover_case, args, source, replica, name,
-                       True, 1)
+                report(name, takeover_case, args, source, replica, name, 1,
+                       encrypted=True)
+            elif name == "s3_takeover":
+                report(name, takeover_case, args, source, replica, name, 1,
+                       s3=True)
+            elif name == "rewrite_takeover":
+                report(name, takeover_case, args, source, replica, name, 1,
+                       rewrite=True)
             elif name == "killed_takeover":
                 report(name, killed_case, args, source, replica, 1)
             else:
@@ -380,12 +416,22 @@ def main():
     parser.add_argument("--port", type=int, default=23990)
     parser.add_argument("--mode", choices=["position", "gtid"],
                         default="position")
+    parser.add_argument("--s3-endpoint", default="127.0.0.1:9000",
+                        help="host:port of the S3-compatible server")
+    parser.add_argument("--s3-bucket", default="pbs-mtr")
+    parser.add_argument("--s3-bucket-dir", type=Path,
+                        help="the directory holding the bucket's objects; "
+                             "enables s3_takeover")
+    parser.add_argument("--s3-access-key", default="pbsaccesskey")
+    parser.add_argument("--s3-secret-key", default="pbs/secret+key=1")
     parser.add_argument("--cases", default="",
                         help="comma-separated case names (default: all)")
     args = parser.parse_args()
     args.mysql_basedir = args.mysql_basedir.expanduser()
     args.old_binsrv = args.old_binsrv.expanduser()
     args.binsrv = args.binsrv.expanduser()
+    if args.s3_bucket_dir is not None:
+        args.s3_bucket_dir = args.s3_bucket_dir.expanduser().resolve()
     # mysqld resolves a relative datadir against its basedir
     args.workdir = args.workdir.expanduser().resolve()
     args.workdir.mkdir(parents=True, exist_ok=True)

@@ -61,6 +61,23 @@ that 'pull' stayed up and still serves a binlog to mysqlbinlog):
                        canonical UUID on a 'fetch' (README); whether the
                        new identity is logged is reported, not checked.
 
+File system fault cases (with --fsfault-lib; pull with a report a second
+and history 1s while every matching call inside the telemetry directory
+fails, through the fsfault LD_PRELOAD library; pull must keep serving):
+
+  fault_write_enospc   writes fail with ENOSPC: no report, every failure
+                       logged, the history cleanup removes the temporary
+                       files left behind (at most 3 remain);
+  fault_open_erofs     opening a report fails with EROFS: the same;
+  fault_fsync_eio      fsync fails with EIO: the same;
+  fault_rename         renaming a finished report fails: no report, each
+                       one logged as not finalized, its temporary file left
+                       for the history cleanup;
+  fault_unlink         removing expired reports fails: each failure logged,
+                       new reports are still written;
+  fault_transient      the first two writes fail: both logged, later
+                       reports are written and complete.
+
 instance_id cases ('list' on an empty storage, no MySQL needed):
 
   readonly_without_id  local_settings_path is mode 0555 with no
@@ -168,7 +185,8 @@ class Pull:
     'port'."""
 
     def __init__(self, binsrv, port: int, telemetry: dict,
-                 local_settings: "Path | None" = None, server_id: int = 4242):
+                 local_settings: "Path | None" = None, server_id: int = 4242,
+                 extra_environment: "dict | None" = None):
         self.binsrv = binsrv
         self.port = port
         binsrv.read_timeout = SOURCE_READ_TIMEOUT
@@ -192,7 +210,7 @@ class Pull:
         self.process = subprocess.Popen(
             [str(binsrv.binary), "pull", str(binsrv.config_path)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=environment())
+            env=dict(environment(), **(extra_environment or {})))
         self.started = time.monotonic()
 
     def alive(self) -> bool:
@@ -232,15 +250,25 @@ class Cases:
         return self.next_port
 
     def run_pull(self, name: str, telemetry: dict, seconds=PULL_SECONDS,
-                 prepare=None) -> dict:
-        """Runs pull for 'seconds' and returns what it did."""
+                 prepare=None, fault_rule: "str | None" = None) -> dict:
+        """Runs pull for 'seconds' and returns what it did; 'fault_rule'
+        (fsfault) makes file system calls in the telemetry directory
+        fail."""
         binsrv = self.binsrv(name)
         telemetry = dict(telemetry)
         telemetry.setdefault("path", str(binsrv.telemetry))
         binsrv.telemetry.mkdir(parents=True, exist_ok=True)
         if prepare is not None:
             prepare(binsrv)
-        pull = Pull(binsrv, self.port(), telemetry)
+        fault_log = binsrv.workdir / "fsfault.log"
+        extra_environment = None
+        if fault_rule is not None:
+            extra_environment = {
+                "LD_PRELOAD": str(self.args.fsfault_lib),
+                "FSFAULT_ROOT": str(binsrv.telemetry),
+                "FSFAULT_RULES": fault_rule, "FSFAULT_LOG": str(fault_log)}
+        pull = Pull(binsrv, self.port(), telemetry,
+                    extra_environment=extra_environment)
         time.sleep(2)
         cpu_before = cpu_seconds(pull.process.pid) if pull.alive() else 0.0
         time.sleep(seconds - 2)
@@ -254,7 +282,13 @@ class Cases:
                 "cpu_share": None if cpu is None else
                 round(cpu / (seconds - 2), 3),
                 "written": log_count(binsrv, "telemetry: wrote report"),
-                "failed": log_count(binsrv, "telemetry: report write failed")}
+                "failed": log_count(binsrv, "telemetry: report write failed"),
+                "not_finalized": log_count(binsrv,
+                                           "telemetry: could not finalize"),
+                "not_removed": log_count(binsrv,
+                                         "telemetry: could not remove"),
+                "injected": (len(fault_log.read_text().splitlines())
+                             if fault_log.exists() else 0)}
 
     # 'pull' cases
 
@@ -575,11 +609,99 @@ class Cases:
         return {"exit_code": run["exit_code"], "output": run["output"],
                 "ok": run["exit_code"] != 0 and "instance" in run["output"]}
 
+    # file system fault cases (--fsfault-lib): the failures stay inside
+    # the telemetry directory and must never affect pull
+
+    def telemetry_fault(self, name: str, rule: str) -> dict:
+        """pull with a report a second and history 1s while every matching
+        call in the telemetry directory fails."""
+        run = self.run_pull(name, {"grace_interval": "0",
+                                   "scrape_interval": "1s",
+                                   "history_keep_interval": "1s"},
+                            fault_rule=rule)
+        directory = run["binsrv"].telemetry
+        tmp = sorted(path.name for path in directory.iterdir()
+                     if path.suffix == ".tmp")
+        return {"rule": rule, "injected": run["injected"],
+                "writes": run["written"], "failures_logged": run["failed"],
+                "not_finalized": run["not_finalized"],
+                "not_removed": run["not_removed"],
+                "reports": len(reports(directory)), "tmp_left": len(tmp),
+                "alive": run["alive"], "serves": run["serves"],
+                "exit_code": run["exit_code"], "run": run}
+
+    def fault_failed_writes(self, name: str, rule: str) -> dict:
+        result = self.telemetry_fault(name, rule)
+        result.pop("run")
+        # each failure is logged, nothing is finalized, and the history
+        # cleanup removes the temporary files left behind
+        result["ok"] = (result["serves"] and result["injected"] > 0 and
+                        result["writes"] == 0 and
+                        result["failures_logged"] > 0 and
+                        result["reports"] == 0 and result["tmp_left"] <= 3)
+        return result
+
+    def fault_write_enospc(self) -> dict:
+        return self.fault_failed_writes(
+            "fault_write_enospc", "op=write,count=1000000,errno=ENOSPC")
+
+    def fault_open_erofs(self) -> dict:
+        return self.fault_failed_writes(
+            "fault_open_erofs", "op=open,count=1000000,errno=EROFS")
+
+    def fault_fsync_eio(self) -> dict:
+        return self.fault_failed_writes(
+            "fault_fsync_eio", "op=fsync,count=1000000,errno=EIO")
+
+    def fault_rename(self) -> dict:
+        result = self.telemetry_fault("fault_rename",
+                                      "op=rename,count=1000000,errno=EIO")
+        result.pop("run")
+        # a report that cannot be renamed is reported as not finalized and
+        # its temporary file is left for the history cleanup
+        result["ok"] = (result["serves"] and result["injected"] > 0 and
+                        result["writes"] == 0 and
+                        result["not_finalized"] > 0 and
+                        result["reports"] == 0 and result["tmp_left"] <= 3)
+        return result
+
+    def fault_unlink(self) -> dict:
+        result = self.telemetry_fault("fault_unlink",
+                                      "op=unlink,count=1000000,errno=EIO")
+        result.pop("run")
+        # expired reports cannot be removed: each failure is logged, and
+        # new reports are still written
+        result["ok"] = (result["serves"] and result["injected"] > 0 and
+                        result["writes"] > 0 and result["not_removed"] > 0)
+        return result
+
+    def fault_transient(self) -> dict:
+        result = self.telemetry_fault(
+            "fault_transient", "op=write,nth=1,count=2,errno=EIO")
+        run = result.pop("run")
+        found = reports(run["binsrv"].telemetry)
+        latest_fields = None
+        if found:
+            try:
+                latest_fields = sorted(json.loads(found[-1][2].read_text()))
+            except ValueError as error:
+                latest_fields = f"not JSON: {error}"
+        result["latest_fields"] = latest_fields
+        # the two failed reports are logged, the later ones are written
+        result["ok"] = (result["serves"] and result["injected"] == 2 and
+                        result["failures_logged"] >= 1 and
+                        result["writes"] >= 2 and
+                        latest_fields == ["db_instance_id", "pillar_version",
+                                          "uptime"])
+        return result
+
 
 PULL_CASES = ["reports", "scrape_zero", "scrape_negative", "scrape_huge",
               "grace_huge", "path_is_file", "path_unwritable",
               "cleanup_odd_names", "shared_directory", "settings_in_storage",
               "damaged_id"]
+FAULT_CASES = ["fault_write_enospc", "fault_open_erofs", "fault_fsync_eio",
+               "fault_rename", "fault_unlink", "fault_transient"]
 ID_CASES = ["readonly_without_id", "readonly_with_id", "padded_id",
             "uppercase_id", "id_is_directory", "leftover_tmp",
             "no_instance_section"]
@@ -592,19 +714,29 @@ def main():
     parser.add_argument("--workdir", type=Path, required=True)
     parser.add_argument("--port", type=int, default=23960)
     parser.add_argument("--mode", choices=["position"], default="position")
+    parser.add_argument("--fsfault-lib", type=Path,
+                        help="the fsfault LD_PRELOAD library: enables the "
+                             "file system fault cases")
     parser.add_argument("--cases", nargs="*",
                         help="run only these cases (default: all)")
     args = parser.parse_args()
     args.mysql_basedir = args.mysql_basedir.expanduser()
     args.binsrv = args.binsrv.expanduser()
+    if args.fsfault_lib is not None:
+        args.fsfault_lib = args.fsfault_lib.expanduser().resolve()
     args.workdir.mkdir(parents=True, exist_ok=True)
     global MYSQLBINLOG
     MYSQLBINLOG = args.mysql_basedir / "bin" / "mysqlbinlog"
 
-    selected = args.cases or PULL_CASES + ID_CASES
+    selected = args.cases or (PULL_CASES + ID_CASES + (
+        FAULT_CASES if args.fsfault_lib is not None else []))
+    if any(name in FAULT_CASES for name in selected) and \
+            args.fsfault_lib is None:
+        parser.error("the fault cases need --fsfault-lib")
     cases = Cases(args)
     results = []
-    pull_cases = [name for name in selected if name in PULL_CASES]
+    pull_cases = [name for name in selected
+                  if name in PULL_CASES + FAULT_CASES]
     if pull_cases:
         cases.source.start()
     try:

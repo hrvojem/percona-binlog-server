@@ -531,9 +531,12 @@ if want qa; then
     qa_run pull_gtid_set_test pull_gtid_set_test \
       --binsrv "$debug_binsrv" --workdir "$out/qa/gtid-set" \
       --port $((QA_PORT + 250)) --mode gtid --timeout 1200
+    # with the fault cases: failed writes, renames and removals in the
+    # telemetry directory (fsfault, a debug build without ASan)
     qa_run telemetry_test telemetry_test \
       --binsrv "$debug_binsrv" --workdir "$out/qa/telemetry" \
-      --port $((QA_PORT + 270)) --timeout 900
+      --fsfault-lib "$WS/qa/fsfault/libfsfault.so" \
+      --port $((QA_PORT + 270)) --timeout 1200
     # a storage of the previous release taken over by this build; the
     # release is built once by hand (see extra/qa/README.md)
     if [ -x "$OLD_BINSRV" ]; then
@@ -541,6 +544,7 @@ if want qa; then
         qa_run upgrade_test "upgrade_test ($mode)" \
           --binsrv "$debug_binsrv" --old-binsrv "$OLD_BINSRV" \
           --workdir "$out/qa/upgrade-$mode" --mode "$mode" \
+          --s3-bucket-dir "$S3_BUCKET_DIR" \
           --port $((QA_PORT + 290)) --timeout 900
       done
     else

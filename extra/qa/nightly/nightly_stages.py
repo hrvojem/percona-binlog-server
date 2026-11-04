@@ -283,12 +283,20 @@ def harness_command(args, workdir: Path) -> list:
     if args.harness in ("pull_replica_test", "pull_heartbeat_test",
                         "pull_tls_test"):
         return script + common
-    if args.harness in ("pull_gtid_test", "pull_gtid_set_test",
-                        "telemetry_test"):
+    if args.harness in ("pull_gtid_test", "pull_gtid_set_test"):
         return script + common + mode
+    if args.harness == "telemetry_test":
+        command = script + common + mode
+        if args.fsfault_lib:
+            command += ["--fsfault-lib", str(args.fsfault_lib)]
+        return command
     if args.harness == "upgrade_test":
-        return script + common + mode + ["--old-binsrv",
-                                          str(args.old_binsrv)]
+        command = script + common + mode + ["--old-binsrv",
+                                            str(args.old_binsrv)]
+        if args.s3_bucket_dir:
+            command += ["--s3-endpoint", args.s3_endpoint,
+                        "--s3-bucket-dir", str(args.s3_bucket_dir)]
+        return command
     if args.harness == "fetch_crash_test":
         command = script + common + [
             "--mode", args.mode, "--examples", str(args.examples),

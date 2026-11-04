@@ -386,6 +386,8 @@ def main():
     args.mysql_basedir = args.mysql_basedir.expanduser()
     args.old_binsrv = args.old_binsrv.expanduser()
     args.binsrv = args.binsrv.expanduser()
+    # mysqld resolves a relative datadir against its basedir
+    args.workdir = args.workdir.expanduser().resolve()
     args.workdir.mkdir(parents=True, exist_ok=True)
     global KEYRING
     KEYRING = args.workdir / "keyring.json"

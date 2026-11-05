@@ -16,8 +16,8 @@
 # pull_replica_test.py, query_race_test.py, pull_heartbeat_test.py,
 # pull_tls_test.py, pull_gtid_test.py, pull_gtid_set_test.py,
 # telemetry_test.py, upgrade_test.py (from the release in OLD_BINSRV),
-# pull_variety_test.py, pull_replica_fault_test.py and a
-# short fetch_crash_test.py run per mode on file and on S3 storage; and one
+# pull_variety_test.py, pull_replica_fault_test.py, pull_restart_test.py and
+# a short fetch_crash_test.py run per mode on file and on S3 storage; and one
 # of the heavier harnesses by day of the week (QA_ROTATION: the S3 and disk
 # fault sweeps, the network fault test, the listener fuzzer, the source
 # change test, the over-4-GiB binlog test and the many-readers / shutdown
@@ -573,6 +573,12 @@ if want qa; then
       qa_run pull_replica_fault_test "pull_replica_fault_test ($mode)" \
         --binsrv "$debug_binsrv" --workdir "$out/qa/replica-fault-$mode" \
         --mode "$mode" --port $((QA_PORT + 330)) --timeout 1500
+    done
+    # a replica of pull across restarts (SIGTERM / SIGKILL) of pull
+    for mode in gtid position; do
+      qa_run pull_restart_test "pull_restart_test ($mode)" \
+        --binsrv "$debug_binsrv" --workdir "$out/qa/restart-$mode" \
+        --mode "$mode" --port $((QA_PORT + 350)) --timeout 1500
     done
   fi
   # the crash/resume test runs against the ASan build to catch memory errors

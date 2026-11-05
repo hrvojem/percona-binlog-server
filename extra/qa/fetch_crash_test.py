@@ -50,6 +50,14 @@ step runs 'fetch' while chosen file system calls in the storage directory
 fail (open for writing, write, fsync, rename or truncate, with ENOSPC or
 EIO), with the same checks.
 
+With '--tolerate-ticket-14' (GTID mode), the checks accept the two known
+effects of ticket 14 and nothing else: a closed binlog stored without the
+ROTATE event that ends it on the server, and server binlogs that hold no
+transactions missing from the storage and from 'binlog.index'. The test
+prints how many times it accepted them. Ticket 14 itself is tested by the
+MTR test binlog_streaming.gtid_resume_after_rotation; this option keeps the
+rest of the GTID-mode checks able to report a different bug.
+
 Requirements: Python 3.10+, Hypothesis (found through PYTHONPATH or
 installed), a MySQL 8.0 / 8.4 binary distribution and a 'binlog_server'
 binary. Example:
@@ -111,6 +119,11 @@ CHECKSUM_SIZE = 4
 
 class Failure(AssertionError):
     pass
+
+
+# --tolerate-ticket-14: how often each known effect was accepted
+TOLERATE_TICKET_14 = False
+TICKET_14_HITS = {"missing_rotate": 0, "skipped_binlog": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +287,45 @@ def transaction_boundaries(data: bytes) -> set:
         # the end of a complete transaction at the end of the file
         result.add(end)
     return result
+
+
+def without_closing_rotate(data: bytes) -> "bytes | None":
+    """The file without the ROTATE event that closes it, or None if its last
+    event is not a ROTATE."""
+    events = parse_events(data)
+    if not events:
+        return None
+    offset, type_code, size = events[-1]
+    if type_code != ROTATE_EVENT or offset + size != len(data):
+        return None
+    return data[:offset]
+
+
+def holds_transactions(data: bytes) -> bool:
+    return any(type_code in TRANSACTION_START_EVENTS
+               for _, type_code, _ in parse_events(data))
+
+
+def ticket_14_skippable(name: str) -> bool:
+    """With --tolerate-ticket-14: a server binlog without transactions,
+    which a GTID-mode resume never receives (ticket 14)."""
+    return TOLERATE_TICKET_14 and \
+        not holds_transactions(SERVER.binlog_as_sent(name))
+
+
+def expected_index(indexed: list, server_names: list) -> list:
+    """The server's binlogs that 'binlog.index' must list (as a prefix after
+    any step, in full after a complete fetch): all of them, or with
+    --tolerate-ticket-14, without the binlogs before the last indexed one
+    that hold no transactions and are not indexed."""
+    if not TOLERATE_TICKET_14 or not indexed or \
+            indexed[-1] not in server_names:
+        return server_names
+    last = server_names.index(indexed[-1])
+    skipped = [name for name in server_names[:last]
+               if name not in indexed and ticket_14_skippable(name)]
+    TICKET_14_HITS["skipped_binlog"] += len(skipped)
+    return [name for name in server_names if name not in skipped]
 
 
 # ---------------------------------------------------------------------------
@@ -661,7 +713,8 @@ class FetchCrashMachine(RuleBasedStateMachine):
             return
         indexed = BINSRV.indexed_binlogs()
         server_names = SERVER.binlog_names()
-        if indexed != server_names[:len(indexed)]:
+        expected = expected_index(indexed, server_names)
+        if indexed != expected[:len(indexed)]:
             raise Failure(f"binlog.index lists {indexed}, the server has "
                           f"{server_names}")
         for name in indexed:
@@ -693,10 +746,11 @@ class FetchCrashMachine(RuleBasedStateMachine):
     def check_complete_copy(self):
         server_names = SERVER.binlog_names()
         indexed = BINSRV.indexed_binlogs()
-        if indexed != server_names:
+        expected = expected_index(indexed, server_names)
+        if indexed != expected:
             raise Failure(f"after a complete fetch binlog.index lists "
                           f"{indexed}, the server has {server_names}")
-        for name in server_names:
+        for name in indexed:
             stored = (BINSRV.storage / name).read_bytes()
             source = SERVER.binlog_as_sent(name)
             # the storage writes the preamble (FORMAT_DESCRIPTION,
@@ -706,6 +760,11 @@ class FetchCrashMachine(RuleBasedStateMachine):
             if name == server_names[-1] and stored == BINLOG_MAGIC and \
                     not any(type_code in TRANSACTION_START_EVENTS for
                             _, type_code, _ in parse_events(source)):
+                continue
+            if stored != source and TOLERATE_TICKET_14 and \
+                    name != server_names[-1] and \
+                    stored == without_closing_rotate(source):
+                TICKET_14_HITS["missing_rotate"] += 1
                 continue
             if stored != source:
                 mismatch = next((i for i in range(min(len(stored),
@@ -724,7 +783,7 @@ class FetchCrashMachine(RuleBasedStateMachine):
 
 
 def main():
-    global SERVER, BINSRV, FAULTS, FAULT_LOG, FSFAULT_LIB
+    global SERVER, BINSRV, FAULTS, FAULT_LOG, FSFAULT_LIB, TOLERATE_TICKET_14
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--mysql-basedir", type=Path, required=True)
     parser.add_argument("--binsrv", type=Path, required=True)
@@ -748,9 +807,16 @@ def main():
     parser.add_argument("--fsfault-lib", type=Path,
                         help="the fsfault LD_PRELOAD library, enables the "
                              "disk fault step (file storage only)")
+    parser.add_argument("--tolerate-ticket-14", action="store_true",
+                        help="GTID mode: accept a closed binlog stored "
+                             "without its closing ROTATE and missing binlogs "
+                             "without transactions (ticket 14)")
     args = parser.parse_args()
 
     gtid_mode = args.mode == "gtid"
+    if args.tolerate_ticket_14 and not gtid_mode:
+        parser.error("--tolerate-ticket-14 needs --mode gtid")
+    TOLERATE_TICKET_14 = args.tolerate_ticket_14
     if args.fsfault_lib is not None:
         if args.storage != "file":
             parser.error("--fsfault-lib needs --storage file")
@@ -788,6 +854,11 @@ def main():
               f"{args.storage} storage")
         return 0
     finally:
+        if TOLERATE_TICKET_14:
+            print(f"ticket 14 accepted: {TICKET_14_HITS['missing_rotate']} "
+                  f"binlog(s) without their closing ROTATE, "
+                  f"{TICKET_14_HITS['skipped_binlog']} binlog(s) without "
+                  f"transactions skipped (counted per check)")
         SERVER.stop()
 
 

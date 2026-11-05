@@ -100,7 +100,11 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/fetch_crash_test.py \
 `--examples` is the number of Hypothesis examples, `--steps` the rule steps per
 example. With `--storage s3` plus the `--s3-*` options it runs the same state
 machine against S3 storage; with `--fsfault-lib` or `--s3-fault-control` it
-also exercises the disk- and S3-fault rules (see below). The other harnesses
+also exercises the disk- and S3-fault rules (see below). In GTID mode,
+`--tolerate-ticket-14` makes both invariants accept ticket 14's effects and
+nothing else: a closed binlog stored without the ROTATE event that ends it on
+the source, and binlogs without transactions missing before the last stored
+one. It prints how often it accepted them. The other harnesses
 reuse these pieces, so they share its config shape and its integrity checks.
 
 ## Correctness and crash tests
@@ -115,6 +119,7 @@ JSON and exits non-zero on a failure.
 | `source_change_test.py` | changes the source under a running backup: `RESET BINARY LOGS`, a different server (failover), binlogs purged before fetch, a mid-stream restart | ticket 25 |
 | `event_variety_test.py` | drives less common event types — transaction compression, `binlog_row_image=MINIMAL`, partial JSON, XA, tagged GTIDs — through a full fetch and a kill/resume | — (no bug) |
 | `pull_replica_fault_test.py` | network faults (Toxiproxy) between `pull` and a MySQL replica — resets, cuts at 1 KB / 100 KB / inside an 8 MB event / during the login, a stall past `replica_net_timeout`, refused connections, 1-byte pieces, latency, low bandwidth — while the source writes; the replica must reconnect and end with the source's data | — (no bug) |
+| `pull_restart_test.py` | a MySQL replica of `pull` (auto-positioning in GTID mode) across restarts of `pull` — SIGTERM or SIGKILL while idle, while the source writes, inside an 8 MB event, while the source rotates into binlogs without transactions, while a lagging replica catches up, and five quick kill/restart cycles; the replica must reconnect to the new `pull` and end with the source's data | — (no bug) |
 | `pull_variety_test.py` | a MySQL replica of `pull` must end with the source's data for a broad workload — every column type, row images, partial JSON, compression, statement format, DDL with routines and triggers, XA, an 8 MB row, savepoints, charsets, tagged GTIDs, empty transactions — live and replayed from the storage | — (no bug) |
 | `query_race_test.py` | runs `binlog_server list` `--runs` times (default 500) next to a `pull` writing a filesystem storage with `checkpoint_size` `"1K"` while the source gets small inserts and a `FLUSH BINARY LOGS` every 20 of them; reports the failed `list` runs and each distinct error message | ticket 29 |
 | `large_binlog_test.py` | binlogs and transactions past 4 GiB, where positions no longer fit the protocol's 32-bit fields. Case `binlog_over_4gib`: about 1 GB of 1 MiB transactions and one of about 3.5 GB leave a 4.5 GB binlog; `fetch` must store it byte for byte, a second `fetch` reopen the storage, `list` report its size, and `mysqlbinlog --raw` through `pull` copy it exactly (passes). Case `transaction_over_4gib`: one transaction of about 4.7 GB. Needs about 20 GB of disk; `--keep` keeps the data, `--cases` picks the cases. With `--storage s3 --s3-bucket-dir <dir>` the storage is in the S3 bucket, behind a counting `s3_fault_proxy.py` the harness starts (`--s3-proxy-port`), and a further check `s3_put_size` requires that no request uploads more than 5 GiB, the AWS limit for a single PUT, which local S3 servers do not enforce (only `binlog_over_4gib` by default; about 30 GB of disk). First run (2026-10-28, debug build): passes; the 4.5 GB binlog goes up as a multipart upload of 8 MiB parts (largest request 8 MiB), and `pull` streams it back from S3 byte for byte. Versity S3 Gateway 1.8.0 takes about a minute to join the parts, and the AWS SDK's CRT client repeats the CompleteMultipartUpload after about 5 s, which the gateway confirms at once, before the object exists; the harness therefore waits up to 5 min for the objects (`s3_object_late_seconds`, 54 s) before comparing. AWS S3 confirms a completion only once the object exists | ticket 41 (PBS-114) |
@@ -420,6 +425,23 @@ the case fails as one that tested nothing. On 2026-11-04 every fault passes
 in both modes on 8.4. The nightly runs it for both modes (`QA_PORT`+330,
 needs Toxiproxy).
 
+`pull_restart_test.py` connects a MySQL replica straight to `pull`
+(auto-positioning in GTID mode, binlog name and position in position mode)
+and, while the source keeps writing, stops and restarts `pull`:
+`term_idle` (SIGTERM while caught up, rows written while it is down),
+`kill_idle`, `kill_while_writing` (a stream of rows and rotations),
+`kill_mid_big_event` (as soon as part of an 8 MB row is stored; the case
+fails if the kill missed the event), `down_with_rotations` (three FLUSH
+BINARY LOGS, rows and two more, so the source has binlogs without
+transactions: the GTID-mode resume of `pull` loses those, ticket 14, which
+the replica must not notice), `kill_during_replica_catchup` (100 rows
+behind) and `flapping` (five SIGKILL / restart cycles a second apart). After
+each the replica must reconnect on its own (`SOURCE_CONNECT_RETRY`) and end
+with the source's data with no applier error, its error log must show the
+lost connection, and a SIGTERM must end `pull` with exit code 0. On
+2026-11-05 every case passes in both modes on 8.4. The nightly runs it for
+both modes (`QA_PORT`+350, about 4.5 min each).
+
 `upgrade_test.py` checks that the current build takes over a storage
 written by the previous release (`--old-binsrv`, `pbs-0.4.1`, built once on
 the host: `git worktree add ~/ws/pbs-0.4.1-src pbs-0.4.1`, then `cmake -S
@@ -534,9 +556,11 @@ server rather than starting one.
      when that binary is missing) and `pull_variety_test.py` per mode (a
      replica of `pull` gets the source's data for a broad workload, 14
      `gtid/...` and 14 `position/...` cases plus `gtid/.../encrypted-s3`,
-     port `QA_PORT`+310) and `pull_replica_fault_test.py` per mode
+     port `QA_PORT`+310), `pull_replica_fault_test.py` per mode
      (network faults between `pull` and a replica, 11 cases each, port
-     `QA_PORT`+330), all with the debug build,
+     `QA_PORT`+330) and `pull_restart_test.py` per mode (a replica across
+     restarts of `pull`, 7 cases each, port `QA_PORT`+350), all with the
+     debug build,
      and a short
      `fetch_crash_test.py` run per mode (cases `gtid` and `position`,
      10 examples of 8 steps, `QA_EXAMPLES` / `QA_STEPS`) with the ASan build,
@@ -701,9 +725,11 @@ server rather than starting one.
   `telemetry_test position/scrape_zero`, `scrape_huge` and `grace_huge`
   (ticket 49: telemetry intervals not validated),
   `telemetry_test position/settings_in_storage` (ticket 50:
-  `local_settings_path` in the storage directory) and
-  `fetch_crash_test gtid` (ticket 14, when the run generates a fetch /
-  `FLUSH BINARY LOGS` / fetch sequence).
+  `local_settings_path` in the storage directory). GTID-mode
+  `fetch_crash_test` runs pass `--tolerate-ticket-14`: they accept only
+  ticket 14's effects (a closed binlog stored without its closing ROTATE,
+  binlogs without transactions skipped), which `gtid_resume_after_rotation`
+  reports every night, so any other GTID-mode failure is new.
 - **`ci_property_tests.sh`** — what the CI job *GCC 14 Debug Property Tests*
   (`.github/workflows/cmake.yml`, configured with `-DWITH_PROPERTY_TESTS=ON`)
   runs: every property test through `ctest` at Hegel's default settings,

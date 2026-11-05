@@ -1859,7 +1859,8 @@ enum class checked_properties : std::uint8_t {
   purge_fault,
   recorded_data_kept,
   restart_fault,
-  query_keyring_error
+  query_keyring_error,
+  damaged_binlog_query
 };
 
 // the properties whose writer is hit by an injected fault at a chosen backend
@@ -2935,11 +2936,39 @@ public:
   void check_query_keyring_error(std::size_t variant) {
     tailing_reader_.reset();
     storage_.reset();
+    const auto [config, label] = write_wrong_keyring_config(
+        variant, root_.path() / "wrong-keyring", location_->config_members());
+    const auto queried{open_storage(
+        config, binsrv::storage_construction_mode_type::querying_only)};
+    require(!queried.records.has_value(),
+            "opening the encrypted storage for queries with " + label +
+                " succeeded with " +
+                std::to_string(std::size(*queried.records)) +
+                " binlog(s) instead of failing");
+    require(names_keyring_error(queried.error),
+            "opening the encrypted storage for queries with " + label +
+                " failed without naming the keyring, the KEK or the "
+                "encryption: " + queried.error);
+  }
+
+  [[nodiscard]] static bool names_keyring_error(const std::string &error) {
+    return error.find("keyring") != std::string::npos ||
+           error.find("KEK") != std::string::npos ||
+           error.find("encrypt") != std::string::npos;
+  }
+
+  // writes, in 'directory', a keyring without the storage's KEK and a
+  // configuration of the storage at 'members' that uses it as variant
+  // 'variant' of check_query_keyring_error() describes; returns the
+  // configuration and a description of it
+  [[nodiscard]] std::pair<std::filesystem::path, std::string>
+  write_wrong_keyring_config(std::size_t variant,
+                             const std::filesystem::path &directory,
+                             const location_members &members) const {
     require(settings_.encryption.has_value(),
             "the keyring property needs an encrypted storage");
     const auto &stored_kek{settings_.encryption->kek_id};
 
-    const auto directory{root_.path() / "wrong-keyring"};
     std::filesystem::create_directories(directory);
     std::string keys;
     for (const auto &line : split_lines(keyring_content)) {
@@ -2981,21 +3010,169 @@ public:
       label = "no keyring and no encryption section";
       break;
     }
-    const auto config{write_config(directory, location_->config_members(),
-                                   query_settings)};
+    return {write_config(directory, members, query_settings), label};
+  }
+
+  // damages the data or the metadata file of one binlog of a copy of the
+  // storage (no damage to binlog.index or metadata.json, so ticket 36 is not
+  // hit) and opens the copy for queries: with the storage's configuration
+  // this succeeds and returns every other binlog unchanged (the
+  // querying-only mode skips what it cannot read, README "Storage
+  // consistency checks"); with a keyring that cannot decrypt the storage
+  // ('keyring_variant', as in check_query_keyring_error()) it still fails
+  // with a keyring error, as long as an undamaged encrypted binlog is left
+  // (PBS-108 moved the keyring checks out of the skipping block)
+  void check_damaged_binlog_query(const damage &value,
+                                  std::optional<std::size_t> keyring_variant) {
+    const auto copy{location_->make_sibling("damaged")};
+    location_->copy_to(*copy);
+    const auto copy_config{
+        write_config(root_.path(), copy->config_members(), settings_)};
+    const auto reference_outcome{open_storage(
+        copy_config, binsrv::storage_construction_mode_type::querying_only)};
+    require(reference_outcome.records.has_value(),
+            "the undamaged storage cannot be opened for queries: " +
+                reference_outcome.error);
+    const auto &reference{*reference_outcome.records};
+    require(!reference.empty(), "the undamaged storage has no binlogs");
+
+    const auto damaged_binlog{
+        reference[value.target % std::size(reference)].name.str()};
+    const bool metadata{value.other_position % 2U == 1U};
+    const auto target_name{metadata ? damaged_binlog + ".json"
+                                    : damaged_binlog};
+    std::ostringstream description_stream;
+    description_stream << value << ':';
+    std::string description{description_stream.str()};
+    // in a quarter of the metadata cases of an encrypted storage the damage
+    // makes the binlog's encryption record name a KEK the keyring lacks,
+    // which random byte changes almost never do
+    const bool renames_kek{metadata && settings_.encryption.has_value() &&
+                           value.mask % 4U == 0U};
+    if (renames_kek) {
+      auto content{read_text(*copy, target_name)};
+      const auto quoted{'"' + settings_.encryption->kek_id + '"'};
+      const auto found{content.find(quoted)};
+      if (found == std::string::npos) {
+        return;
+      }
+      content.replace(found, std::size(quoted), "\"missing-kek\"");
+      write_text(*copy, target_name, content);
+      description += " renaming the KEK in '" + target_name +
+                     "' to 'missing-kek'";
+    }
+    switch (renames_kek ? damage_kind::add_unexpected_file : value.kind) {
+    case damage_kind::add_unexpected_file:
+      break;
+    case damage_kind::delete_file:
+      copy->remove(target_name);
+      description += " deleting '" + target_name + "'";
+      break;
+    case damage_kind::truncate_file: {
+      auto content{copy->read(target_name)};
+      if (content.empty()) {
+        return;
+      }
+      content.resize(value.position % std::size(content));
+      copy->write(target_name, content);
+      description += " truncating '" + target_name + "' to " +
+                     std::to_string(std::size(content)) + " bytes";
+      break;
+    }
+    case damage_kind::change_byte: {
+      auto content{read_text(*copy, target_name)};
+      if (content.empty()) {
+        return;
+      }
+      const auto position{value.position % std::size(content)};
+      content[position] = static_cast<char>(
+          static_cast<unsigned char>(content[position]) ^ value.mask);
+      write_text(*copy, target_name, content);
+      description += " changing byte " + std::to_string(position) + " of '" +
+                     target_name + "'";
+      break;
+    }
+    case damage_kind::append_garbage: {
+      auto content{read_text(*copy, target_name)};
+      content += value.text.empty() ? std::string{"garbage"} : value.text;
+      write_text(*copy, target_name, content);
+      description += " appending to '" + target_name + "'";
+      break;
+    }
+    default: {
+      if (!metadata) {
+        return;
+      }
+      auto content{read_text(*copy, target_name)};
+      const auto start{value.position % (std::size(content) + 1U)};
+      const auto length{std::min(value.other_position % 24U,
+                                 std::size(content) - start)};
+      content.replace(start, length, value.text);
+      write_text(*copy, target_name, content);
+      description += " replacing '" + target_name + "' bytes " +
+                     std::to_string(start) + ".." +
+                     std::to_string(start + length) + " with '" + value.text +
+                     "'";
+      break;
+    }
+    }
+
     const auto queried{open_storage(
-        config, binsrv::storage_construction_mode_type::querying_only)};
-    require(!queried.records.has_value(),
-            "opening the encrypted storage for queries with " + label +
-                " succeeded with " +
-                std::to_string(std::size(*queried.records)) +
-                " binlog(s) instead of failing");
-    require(queried.error.find("keyring") != std::string::npos ||
-                queried.error.find("KEK") != std::string::npos ||
-                queried.error.find("encrypt") != std::string::npos,
-            "opening the encrypted storage for queries with " + label +
-                " failed without naming the keyring, the KEK or the "
-                "encryption: " + queried.error);
+        copy_config, binsrv::storage_construction_mode_type::querying_only)};
+    if (renames_kek) {
+      // a KEK the keyring lacks is a configuration error (ticket 35, a KEK
+      // removed during a key rotation), not damage: PBS-108 reports it even
+      // though the other binlogs are readable
+      require(!queried.records.has_value() &&
+                  names_keyring_error(queried.error),
+              description + ": opening for queries " +
+                  (queried.records.has_value()
+                       ? "succeeded with " +
+                             std::to_string(std::size(*queried.records)) +
+                             " binlog(s)"
+                       : "failed with '" + queried.error + "'") +
+                  ", expected the missing KEK to be reported");
+      return;
+    }
+    require(queried.records.has_value(),
+            description + ": opening for queries failed: " + queried.error);
+    for (const auto &record : reference) {
+      if (record.name.str() == damaged_binlog) {
+        continue;
+      }
+      const auto found{std::ranges::find(*queried.records, record.name,
+                                         &binsrv::binlog_record::name)};
+      require(found != std::cend(*queried.records),
+              description + ": opening for queries left out '" +
+                  record.name.str() + "', whose files were not damaged");
+      require(same_records(*found, record),
+              description + ": opening for queries returned a changed "
+                            "record for '" + record.name.str() + "'");
+    }
+
+    if (!keyring_variant.has_value()) {
+      return;
+    }
+    const auto [wrong_config, label] = write_wrong_keyring_config(
+        *keyring_variant, root_.path() / "damaged-wrong-keyring",
+        copy->config_members());
+    const auto wrong{open_storage(
+        wrong_config, binsrv::storage_construction_mode_type::querying_only)};
+    // every binlog of an encrypted storage has an encryption record; with
+    // only the damaged binlog's record unreadable none may be left to check
+    const bool undamaged_left{std::size(reference) > 1U || !metadata};
+    if (!undamaged_left && wrong.records.has_value()) {
+      return;
+    }
+    require(!wrong.records.has_value(),
+            description + " and " + label + ": opening for queries "
+                                            "succeeded with " +
+                std::to_string(std::size(*wrong.records)) +
+                " binlog(s) instead of failing with a keyring error");
+    require(names_keyring_error(wrong.error),
+            description + " and " + label +
+                ": opening for queries failed without naming the keyring, "
+                "the KEK or the encryption: " + wrong.error);
   }
 
   // the restart after a fault keeps everything the storage had recorded
@@ -3248,6 +3425,7 @@ private:
 
     if (properties_ == checked_properties::model_agreement ||
         properties_ == checked_properties::damaged_files ||
+        properties_ == checked_properties::damaged_binlog_query ||
         properties_ == checked_properties::close_mid_transaction ||
         injects_faults(properties_) ||
         properties_ == checked_properties::purge_fault) {
@@ -3310,7 +3488,8 @@ void run_storage_property(hegel::TestCase &tc, checked_properties properties,
       "ops", gs::vectors(operations(
                  properties == checked_properties::close_mid_transaction)))};
   std::optional<damage> damage_value;
-  if (properties == checked_properties::damaged_files) {
+  if (properties == checked_properties::damaged_files ||
+      properties == checked_properties::damaged_binlog_query) {
     damage_value = tc.draw("damage", damages());
   }
   // the configuration of a query run: the same storage, encrypted in the
@@ -3395,6 +3574,13 @@ void run_storage_property(hegel::TestCase &tc, checked_properties properties,
     return;
   }
   std::optional<std::size_t> keyring_variant;
+  if (properties == checked_properties::damaged_binlog_query &&
+      settings.encryption.has_value() &&
+      tc.draw("wrong_keyring", gs::booleans())) {
+    keyring_variant = tc.draw(
+        "keyring_variant",
+        gs::integers<std::size_t>({.min_value = 0U, .max_value = 2U}));
+  }
   if (properties == checked_properties::query_keyring_error) {
     if (!settings.encryption.has_value()) {
       settings.encryption =
@@ -3423,6 +3609,10 @@ void run_storage_property(hegel::TestCase &tc, checked_properties properties,
     harness.start_resuming_reader();
   }
   harness.finish();
+  if (properties == checked_properties::damaged_binlog_query) {
+    harness.check_damaged_binlog_query(*damage_value, keyring_variant);
+    return;
+  }
   if (keyring_variant.has_value()) {
     harness.check_query_keyring_error(*keyring_variant);
   }
@@ -3746,6 +3936,18 @@ BOOST_AUTO_TEST_CASE(StorageOpeningOfDamagedFilesFailsCleanly) {
 BOOST_AUTO_TEST_CASE(StorageQueryingLeavesItUnchanged) {
   run_property([](hegel::TestCase &tc) {
     run_storage_property(tc, checked_properties::query_read_only);
+  });
+}
+
+// damage confined to the data or metadata file of one binlog: opening for
+// queries returns every other binlog unchanged, and with a keyring that
+// cannot decrypt an encrypted storage it still fails with a keyring error
+// (PBS-108), as it does when the damage makes a binlog's metadata name a KEK
+// the keyring lacks; unlike StorageOpeningOfDamagedFilesFailsCleanly it never damages
+// binlog.index, so ticket 36 does not hide its failures
+BOOST_AUTO_TEST_CASE(StorageQueryingSkipsOnlyTheDamagedBinlog) {
+  run_property([](hegel::TestCase &tc) {
+    run_storage_property(tc, checked_properties::damaged_binlog_query);
   });
 }
 

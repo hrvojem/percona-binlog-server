@@ -283,7 +283,8 @@ def harness_command(args, workdir: Path) -> list:
     if args.harness in ("pull_replica_test", "pull_heartbeat_test",
                         "pull_tls_test"):
         return script + common
-    if args.harness in ("pull_gtid_test", "pull_gtid_set_test"):
+    if args.harness in ("pull_gtid_test", "pull_gtid_set_test",
+                        "pull_restart_test"):
         return script + common + mode
     if args.harness == "pull_replica_fault_test":
         return script + common + mode + ["--toxiproxy-api",
@@ -312,6 +313,10 @@ def harness_command(args, workdir: Path) -> list:
         command = script + common + [
             "--mode", args.mode, "--examples", str(args.examples),
             "--steps", str(args.steps)]
+        # ticket 14 has its own MTR test (gtid_resume_after_rotation); the
+        # harness accepts only its effects, so other GTID bugs are new
+        if args.mode == "gtid":
+            command.append("--tolerate-ticket-14")
         if args.storage == "s3":
             command += ["--storage", "s3", "--s3-endpoint", args.s3_endpoint,
                         "--s3-bucket-dir", str(args.s3_bucket_dir)]
@@ -358,7 +363,8 @@ def harness_cases(args, returncode: int, output: str, lines: list,
     if args.harness in ("pull_load_test", "pull_soak_test", "pull_tls_test",
                         "pull_gtid_test", "pull_gtid_set_test",
                         "telemetry_test", "upgrade_test",
-                        "pull_variety_test", "pull_replica_fault_test"):
+                        "pull_variety_test", "pull_replica_fault_test",
+                        "pull_restart_test"):
         cases = []
         for result, _ in objects:
             if "case" not in result:

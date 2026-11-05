@@ -2171,6 +2171,122 @@ BOOST_AUTO_TEST_CASE(ReplicationSourceDumpGtidSendsTheMissingTransactions) {
   });
 }
 
+// a dump ends with EOF after the stored data exactly when it is non-blocking,
+// which, as in MySQL ('Binlog_sender::init()'), is when the client sets the
+// BINLOG_DUMP_NON_BLOCK flag or sends server_id 0 (PBS-55), for
+// COM_BINLOG_DUMP and COM_BINLOG_DUMP_GTID alike; any other dump streams the
+// stored events and stays open
+BOOST_AUTO_TEST_CASE(ReplicationSourceDumpFromServerIdZeroIsNonBlocking) {
+  hegel::Settings settings{};
+  static constexpr std::uint64_t test_cases{40U};
+  settings.test_cases = test_cases;
+  settings.suppress_health_check = {hegel::HealthCheck::TooSlow};
+  run_property(
+      [](hegel::TestCase &tc) {
+        auto source_values{tc.draw("settings", source_settings_generator())};
+        const bool by_gtid{tc.draw("by_gtid", gs::booleans())};
+        const bool flag{tc.draw("non_blocking_flag", gs::booleans())};
+        const auto server_id{tc.draw(
+            "server_id", gs::one_of({gs::just<std::uint32_t>(0U),
+                                     gs::integers<std::uint32_t>()}))};
+        const bool non_blocking{flag || server_id == 0U};
+        std::ostringstream label;
+        label << (by_gtid ? "COM_BINLOG_DUMP_GTID" : "COM_BINLOG_DUMP")
+              << " from server_id " << server_id
+              << (flag ? " with" : " without") << " the non-blocking flag";
+
+        // a GTID dump reads a GTID storage; the replica has nothing, so no
+        // purged GTID is missing
+        std::optional<gtid_layout> layout{};
+        if (by_gtid) {
+          source_values.gtid_mode = true;
+          layout = gtid_layout{.first_gno = 1U,
+                               .transactions_per_binlog = {2U, 1U}};
+        }
+        const replication_source source{source_values,
+                                        layout ? &*layout : nullptr};
+        mysql_client client{source.port()};
+        client.authenticate(replica_user, replica_password);
+        client.write_frame(encode_command(
+            {.kind = command_kind::query,
+             .statement = "SET @source_binlog_checksum = 'NONE', "
+                          "@master_binlog_checksum = 'NONE'"},
+            client.capabilities()));
+        require(client.read_reply().kind == reply_kind::ok,
+                "the checksum SET was not answered with OK");
+
+        if (by_gtid) {
+          using dump_gtid = cp::message::client::BinlogDumpGtid;
+          stdx::flags<dump_gtid::Flags> flags{};
+          if (flag) {
+            flags |= dump_gtid::Flags::non_blocking;
+          }
+          const binsrv::gtids::gtid_set replica{};
+          std::vector<std::byte> encoded(replica.calculate_encoded_size());
+          util::byte_span encoded_span{encoded};
+          replica.encode_to(encoded_span);
+          client.write_frame(encode_client_frame(
+              0U,
+              dump_gtid{flags, server_id, "",
+                        binsrv::events::magic_binlog_offset,
+                        std::string{reinterpret_cast<const char *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+                                        std::data(encoded)),
+                                    std::size(encoded)}},
+              client.capabilities()));
+        } else {
+          using dump = cp::message::client::BinlogDump;
+          stdx::flags<dump::Flags> flags{};
+          if (flag) {
+            flags |= dump::Flags::non_blocking;
+          }
+          client.write_frame(encode_client_frame(
+              0U, dump{flags, server_id, "", binsrv::events::magic_binlog_offset},
+              client.capabilities()));
+        }
+
+        // the events up to EOF, an error or a closed connection; a blocking
+        // dump gets 'window' to show that it does not end
+        static constexpr auto window{std::chrono::milliseconds{700}};
+        static constexpr auto reply_timeout{std::chrono::seconds{10}};
+        const auto deadline{std::chrono::steady_clock::now() +
+                            (non_blocking ? reply_timeout : window)};
+        std::size_t events{0U};
+        std::string ending{"still open"};
+        while (true) {
+          const auto remaining{
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  deadline - std::chrono::steady_clock::now())};
+          if (remaining.count() <= 0 || !client.wait_readable(remaining)) {
+            break;
+          }
+          const auto frame{client.read_frame()};
+          if (!frame.has_value()) {
+            ending = "the connection closed";
+            break;
+          }
+          const std::string_view payload{
+              std::string_view{*frame}.substr(frame_header_size)};
+          if (is_eof_packet(payload)) {
+            ending = "EOF";
+            break;
+          }
+          if (!payload.empty() &&
+              static_cast<std::uint8_t>(payload[0]) == 0xFFU) {
+            ending = "ERR " + std::to_string(read_fixed_int(payload, 1U, 2U));
+            break;
+          }
+          ++events;
+        }
+        require(events >= 1U, label.str() + ": no stored event was streamed (" +
+                                  ending + ")");
+        require(ending == (non_blocking ? "EOF" : "still open"),
+                label.str() + ": after " + std::to_string(events) +
+                    " event(s) " + ending + ", expected " +
+                    (non_blocking ? "EOF" : "the dump to stay open"));
+      },
+      settings);
+}
+
 namespace {
 
 // a logger that keeps every line the listener logs at info level or above

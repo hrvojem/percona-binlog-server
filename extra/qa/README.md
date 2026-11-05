@@ -178,8 +178,8 @@ fails cleanly and the storage stays openable. Six recovery cases follow: a
 failed `binlog.index` save during a rotation leaves the new binlog's files
 behind, the next `fetch` (whose start removes them) fails to delete one of
 them (`op=unlink`, which covers `unlink`, `unlinkat` and `remove`), and a
-third `fetch` without a failure must still recover (ticket 37: it does not
-when the metadata file was the one left). `s3_fault_sweep.py` ends with the
+third `fetch` without a failure must still recover (ticket 37: it did not
+when the metadata file was the one left, until PBS-110, upstream `e2fdd50`). `s3_fault_sweep.py` ends with the
 same two cases on S3 (failing `binlog.index` uploads, then a `DELETE` of the
 metadata object failing for the whole start: the S3 CRT client retries a
 `DELETE` about 10 times):
@@ -382,8 +382,17 @@ transient failure complete reports are written again. All six pass on
 validated; 0 writes 100-170 reports a second, more than ~292 years overflows
 the timer and expires at once) and `settings_in_storage` (ticket 50: the
 instance_id file makes a fresh storage directory "not empty but does not
-contain metadata"). A replaced damaged id is not logged. The nightly runs
-it every night (`QA_PORT`+270, about 3 min).
+contain metadata"). A replaced damaged id is not logged. Since PBS-122
+(upstream `2e9648c`, 2026-11-05) `pull` clamps the intervals (grace
+20 s..2 d, scrape 10 s..7 d, history 60 s..7 d) and logs the values it uses,
+so ticket 49 is fixed: the cases now run `pull` for 25 to 60 s around those
+minimums (reports at 20 s and then every 10 s), check the logged intervals
+of the out-of-range ones (`scrape_zero`: 20 s / 10 s, 3 reports in 45 s;
+`scrape_negative` and `scrape_huge`: 7 days, one report; `grace_huge`: 2
+days, none in 25 s), and the fault case `fault_unlink` plants an 8-day-old
+foreign report to be removed, as no own report expires within the 60 s
+history minimum. All pass but `settings_in_storage` (ticket 50). The nightly
+runs it every night (`QA_PORT`+270, about 12 min).
 
 `pull_variety_test.py` checks the data a MySQL replica of `pull` ends with.
 The source writes one database per kind: `types` (every column type at its
@@ -762,8 +771,6 @@ server rather than starting one.
   packet for a plain client under `require_secure_transport`),
   `pull_gtid_test gtid/purged` and `gtid/ahead` (ticket 20, PBS-120: no ER 1236 for
   a replica lacking purged GTIDs or ahead of the source),
-  `telemetry_test position/scrape_zero`, `scrape_huge` and `grace_huge`
-  (ticket 49: telemetry intervals not validated),
   `telemetry_test position/settings_in_storage` (ticket 50:
   `local_settings_path` in the storage directory). GTID-mode
   `fetch_crash_test` runs pass `--tolerate-ticket-14`: they accept only

@@ -559,7 +559,7 @@ if want qa; then
     qa_run telemetry_test telemetry_test \
       --binsrv "$debug_binsrv" --workdir "$out/qa/telemetry" \
       --fsfault-lib "$WS/qa/fsfault/libfsfault.so" \
-      --port $((QA_PORT + 270)) --timeout 1200
+      --port $((QA_PORT + 270)) --timeout 1800
     # a storage of the previous release taken over by this build; the
     # release is built once by hand (see extra/qa/README.md)
     if [ -x "$OLD_BINSRV" ]; then

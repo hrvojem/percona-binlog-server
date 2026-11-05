@@ -20,38 +20,43 @@ The MTR suite covers one report, a missing telemetry directory, cleanup of
 a stale and a recent foreign report, 'enabled: false' and a spoiled
 instance_id. This harness covers the rest, one JSON line per case.
 
-'pull' cases (a position-mode source, 'pull' run for PULL_SECONDS with its
+'pull' cases (a position-mode source, 'pull' run for a case's time with its
 own telemetry section, then stopped with SIGTERM; every case also checks
-that 'pull' stayed up and still serves a binlog to mysqlbinlog):
+that 'pull' stayed up and still serves a binlog to mysqlbinlog). Since
+PBS-122 'pull' clamps the intervals into ranges (grace 20s..2d, scrape
+10s..7d, history 60s..7d) and logs the values it uses, which the cases
+report as 'effective' and the clamping cases check; reports therefore come
+20 s after the start at the earliest and then every 10 s:
 
-  reports              grace 1s, scrape 2s: several reports, each named
+  reports              grace 20s, scrape 10s, 45 s: several reports, each named
                        '<unix_ts>-<tag>.json' with one tag, mode 0644, no
                        '.tmp' left, exactly the fields db_instance_id (the
                        instance_id file), pillar_version and a growing
                        uptime;
-  scrape_zero          scrape_interval 0: reports are not written in a
-                       tight loop (at most one per second, pull's CPU use
-                       stays low);
+  scrape_zero          grace and scrape_interval 0: clamped to 20 s and
+                       10 s (logged), so 2 to 4 reports in 45 s, not a
+                       tight loop (ticket 49, fixed by PBS-122);
   scrape_negative      a scrape_interval past INT64_MAX seconds
-                       ('106751991167301d', ~292 million years) becomes a
-                       negative interval after the cast to seconds: same
-                       checks as scrape_zero;
+                       ('106751991167301d', ~292 million years) is clamped
+                       to the 7-day maximum, not wrapped to a negative or
+                       zero interval: one report in 45 s;
   scrape_huge          scrape_interval HUGE_INTERVAL ('200000d', ~550
                        years, past the ~292 years of int64 nanoseconds):
-                       one report after the grace interval and no more (no
-                       overflow into the past);
-  grace_huge           grace_interval HUGE_INTERVAL: no report at all;
+                       clamped to 7 days, one report after the grace
+                       interval and no more (no overflow into the past);
+  grace_huge           grace_interval HUGE_INTERVAL: clamped to 2 days, no
+                       report in 25 s (a grace clamped to its minimum
+                       would give one);
   path_is_file         the telemetry path is a regular file: no report,
                        a warning, pull keeps serving;
   path_unwritable      the telemetry directory is mode 0555: the same;
-  cleanup_odd_names    history 1s, scrape 1s: our own old reports are
-                       removed (at most a few remain), a recent foreign
+  cleanup_odd_names    history and scrape at their minimums: a recent foreign
                        report is kept and an 8-day-old one removed, and
                        files that only look like reports (no delimiter,
                        a leading '-', a timestamp past int64, another
                        extension) are left alone;
   shared_directory     two 'pull' instances (own storages, local
-                       settings and server ids) with history 1s share one telemetry
+                       settings and server ids) with history 60s share one telemetry
                        directory: each keeps writing and neither removes
                        the other's recent reports;
   settings_in_storage  instance.local_settings_path is the storage
@@ -61,9 +66,10 @@ that 'pull' stayed up and still serves a binlog to mysqlbinlog):
                        canonical UUID on a 'fetch' (README); whether the
                        new identity is logged is reported, not checked.
 
-File system fault cases (with --fsfault-lib; pull with a report a second
-and history 1s while every matching call inside the telemetry directory
-fails, through the fsfault LD_PRELOAD library; pull must keep serving):
+File system fault cases (with --fsfault-lib; pull with reports from 20 s on,
+every 10 s, for FAULT_SECONDS while every matching call inside the telemetry
+directory fails, through the fsfault LD_PRELOAD library; pull must keep
+serving):
 
   fault_write_enospc   writes fail with ENOSPC: no report, every failure
                        logged, the history cleanup removes the temporary
@@ -73,8 +79,10 @@ fails, through the fsfault LD_PRELOAD library; pull must keep serving):
   fault_rename         renaming a finished report fails: no report, each
                        one logged as not finalized, its temporary file left
                        for the history cleanup;
-  fault_unlink         removing expired reports fails: each failure logged,
-                       new reports are still written;
+  fault_unlink         removing expired reports (an 8-day-old foreign
+                       report is planted, as the 60 s history minimum leaves
+                       no own report expired in the run) fails: each failure
+                       logged, new reports are still written;
   fault_transient      the first two writes fail: both logged, later
                        reports are written and complete.
 
@@ -122,6 +130,13 @@ import fetch_crash_test as harness  # noqa: E402
 import pull_replica_test as replication  # noqa: E402
 
 PULL_SECONDS = 8
+# PBS-122's minimums: the first report 20 s after the start, then every 10 s
+REPORT_SECONDS = 45
+SINGLE_REPORT_SECONDS = 35
+FAULT_SECONDS = 45
+EFFECTIVE = re.compile(r"telemetry: reporting to .* with grace_interval=(\d+)s, "
+                       r"scrape_interval=(\d+)s, history_keep_interval=(\d+)s")
+DAY = 86400
 # pull exits on SIGTERM only after the source read_timeout (PBS-116)
 SOURCE_READ_TIMEOUT = 5
 INT64_MAX = 2**63 - 1
@@ -172,6 +187,17 @@ def reports(directory: Path) -> list:
         if match:
             found.append((int(match.group(1)), match.group(2), path))
     return sorted(found)
+
+
+def effective(binsrv) -> "dict | None":
+    """The intervals 'pull' logged that it uses (after PBS-122's clamp)."""
+    if not binsrv.log_path.exists():
+        return None
+    match = EFFECTIVE.search(binsrv.log_path.read_text(errors="replace"))
+    if match is None:
+        return None
+    return dict(zip(("grace", "scrape", "history"),
+                    (int(value) for value in match.groups())))
 
 
 def log_count(binsrv, pattern: str) -> int:
@@ -281,6 +307,7 @@ class Cases:
                 "exit_code": exit_code,
                 "cpu_share": None if cpu is None else
                 round(cpu / (seconds - 2), 3),
+                "effective": effective(binsrv),
                 "written": log_count(binsrv, "telemetry: wrote report"),
                 "failed": log_count(binsrv, "telemetry: report write failed"),
                 "not_finalized": log_count(binsrv,
@@ -293,9 +320,10 @@ class Cases:
     # 'pull' cases
 
     def reports(self) -> dict:
-        run = self.run_pull("reports", {"grace_interval": "1s",
-                                        "scrape_interval": "2s",
-                                        "history_keep_interval": "1h"})
+        run = self.run_pull("reports", {"grace_interval": "20s",
+                                        "scrape_interval": "10s",
+                                        "history_keep_interval": "1h"},
+                            seconds=REPORT_SECONDS)
         binsrv = run["binsrv"]
         found = reports(binsrv.telemetry)
         instance_id = (binsrv.local_settings / "instance_id").read_text(
@@ -335,50 +363,60 @@ class Cases:
         if leftovers:
             wrong.append(f"left {leftovers}")
         return {"reports": len(found), "uptimes": uptimes, "wrong": wrong,
+                "effective": run["effective"],
                 "alive": run["alive"], "serves": run["serves"],
                 "ok": not wrong and run["serves"]}
 
-    def tight_loop(self, scrape_interval: str) -> dict:
-        run = self.run_pull(f"scrape_{scrape_interval}",
-                            {"grace_interval": "0",
-                             "scrape_interval": scrape_interval})
-        # reports overwrite each other within a second, so count the writes
-        # in the log; one per second (plus the first) is the most that a
-        # sane interval of at least 1s can give
-        limit = PULL_SECONDS + 2
-        return {"scrape_interval": scrape_interval,
-                "writes": run["written"], "write_limit": limit,
+    def clamped(self, name: str, telemetry: dict, seconds: int,
+                expected: dict, writes: range) -> dict:
+        """pull with intervals out of range: the logged intervals must be
+        'expected' and the reports written within 'writes'."""
+        run = self.run_pull(name, telemetry, seconds=seconds)
+        # reports may overwrite each other within a second, so count the
+        # writes in the log
+        return {**telemetry, "effective": run["effective"],
+                "expected": expected, "writes": run["written"],
+                "write_range": [writes.start, writes.stop - 1],
                 "cpu_share": run["cpu_share"],
                 "log_bytes": run["binsrv"].log_path.stat().st_size,
                 "alive": run["alive"], "serves": run["serves"],
-                "ok": run["serves"] and run["written"] <= limit}
+                "ok": run["serves"] and run["written"] in writes and
+                run["effective"] is not None and
+                all(run["effective"][key] == value
+                    for key, value in expected.items())}
 
     def scrape_zero(self) -> dict:
-        return self.tight_loop("0")
+        return self.clamped("scrape_zero",
+                            {"grace_interval": "0", "scrape_interval": "0"},
+                            REPORT_SECONDS, {"grace": 20, "scrape": 10},
+                            range(2, 5))
 
     def scrape_negative(self) -> dict:
         # 106751991167301 days are more than INT64_MAX seconds
-        assert 106751991167301 * 86400 > INT64_MAX
-        return self.tight_loop("106751991167301d")
+        assert 106751991167301 * DAY > INT64_MAX
+        return self.clamped("scrape_negative",
+                            {"grace_interval": "0",
+                             "scrape_interval": "106751991167301d"},
+                            REPORT_SECONDS, {"grace": 20, "scrape": 7 * DAY},
+                            range(1, 2))
 
     def scrape_huge(self) -> dict:
-        run = self.run_pull("scrape_huge", {"grace_interval": "1s",
-                                            "scrape_interval": HUGE_INTERVAL})
-        return {"scrape_interval": HUGE_INTERVAL, "writes": run["written"], "alive": run["alive"],
-                "serves": run["serves"],
-                "ok": run["serves"] and run["written"] == 1}
+        return self.clamped("scrape_huge",
+                            {"grace_interval": "20s",
+                             "scrape_interval": HUGE_INTERVAL},
+                            SINGLE_REPORT_SECONDS,
+                            {"grace": 20, "scrape": 7 * DAY}, range(1, 2))
 
     def grace_huge(self) -> dict:
-        run = self.run_pull("grace_huge", {"grace_interval": HUGE_INTERVAL})
-        return {"grace_interval": HUGE_INTERVAL, "writes": run["written"], "alive": run["alive"],
-                "serves": run["serves"],
-                "ok": run["serves"] and run["written"] == 0}
+        return self.clamped("grace_huge", {"grace_interval": HUGE_INTERVAL},
+                            25, {"grace": 2 * DAY}, range(0, 1))
 
     def unusable_path(self, name: str, prepare, path=None) -> dict:
-        telemetry = {"grace_interval": "0", "scrape_interval": "1s"}
+        telemetry = {"grace_interval": "20s", "scrape_interval": "10s"}
         if path is not None:
             telemetry["path"] = str(path)
-        run = self.run_pull(name, telemetry, prepare=prepare)
+        run = self.run_pull(name, telemetry, seconds=SINGLE_REPORT_SECONDS,
+                            prepare=prepare)
         return {"writes": run["written"], "failures_logged": run["failed"],
                 "alive": run["alive"], "serves": run["serves"],
                 "ok": run["serves"] and run["written"] == 0 and
@@ -421,9 +459,9 @@ class Cases:
                 (binsrv.telemetry / name).write_text("{}")
 
         run = self.run_pull("cleanup_odd_names",
-                            {"grace_interval": "0", "scrape_interval": "1s",
-                             "history_keep_interval": "1s"},
-                            prepare=prepare)
+                            {"grace_interval": "0", "scrape_interval": "0",
+                             "history_keep_interval": "0"},
+                            seconds=SINGLE_REPORT_SECONDS, prepare=prepare)
         directory = run["binsrv"].telemetry
         present = {path.name for path in directory.iterdir()}
         own = [entry for entry in reports(directory) if entry[1] != foreign]
@@ -436,9 +474,12 @@ class Cases:
         for key, name in odd.items():
             if name not in present:
                 wrong.append(f"{key} ({name}) removed")
-        # history 1s and a report a second: only the last few may remain
-        if len(own) > 3:
-            wrong.append(f"{len(own)} own reports kept")
+        # every report written in the run is younger than the 60 s history
+        if len(own) != run["written"]:
+            wrong.append(f"{len(own)} own reports kept of "
+                         f"{run['written']} written")
+        if not run["written"]:
+            wrong.append("no report written, so no cleanup ran")
         return {"own_reports": len(own), "writes": run["written"],
                 "wrong": wrong, "alive": run["alive"],
                 "serves": run["serves"], "ok": not wrong and run["serves"]}
@@ -448,11 +489,11 @@ class Cases:
         shutil.rmtree(shared, ignore_errors=True)
         shared.mkdir(parents=True)
         telemetry = {"path": str(shared), "grace_interval": "0",
-                     "scrape_interval": "1s", "history_keep_interval": "1s"}
+                     "scrape_interval": "0", "history_keep_interval": "0"}
         pulls = [Pull(self.binsrv(f"shared_{index}"), self.port(), telemetry,
                       server_id=4242 + index) for index in range(2)]
         seen = set()
-        deadline = time.monotonic() + PULL_SECONDS
+        deadline = time.monotonic() + SINGLE_REPORT_SECONDS
         while time.monotonic() < deadline:
             seen.update(tag for _, tag, _ in reports(shared))
             time.sleep(0.2)
@@ -467,7 +508,7 @@ class Cases:
         return {"tags_seen": len(seen), "tags_at_end": len(final),
                 "writes": writes, "alive": alive, "serves": serves,
                 "ok": all(serves) and len(seen) == 2 and len(final) == 2
-                and min(writes) >= PULL_SECONDS - 2}
+                and min(writes) >= 2}
 
     def settings_in_storage(self) -> dict:
         binsrv = self.binsrv("settings_in_storage")
@@ -612,12 +653,14 @@ class Cases:
     # file system fault cases (--fsfault-lib): the failures stay inside
     # the telemetry directory and must never affect pull
 
-    def telemetry_fault(self, name: str, rule: str) -> dict:
-        """pull with a report a second and history 1s while every matching
+    def telemetry_fault(self, name: str, rule: str, prepare=None,
+                        seconds: int = FAULT_SECONDS) -> dict:
+        """pull with reports from 20 s on, every 10 s, while every matching
         call in the telemetry directory fails."""
         run = self.run_pull(name, {"grace_interval": "0",
-                                   "scrape_interval": "1s",
-                                   "history_keep_interval": "1s"},
+                                   "scrape_interval": "0",
+                                   "history_keep_interval": "0"},
+                            seconds=seconds, prepare=prepare,
                             fault_rule=rule)
         directory = run["binsrv"].telemetry
         tmp = sorted(path.name for path in directory.iterdir()
@@ -666,8 +709,13 @@ class Cases:
         return result
 
     def fault_unlink(self) -> dict:
-        result = self.telemetry_fault("fault_unlink",
-                                      "op=unlink,count=1000000,errno=EIO")
+        # the 60 s history minimum leaves no own report expired during the
+        # run, so an 8-day-old foreign report is there to be removed
+        stale = (f"{int(time.time()) - 8 * DAY}-"
+                 "11111111-2222-3333-4444-555555555555.json")
+        result = self.telemetry_fault(
+            "fault_unlink", "op=unlink,count=1000000,errno=EIO",
+            prepare=lambda binsrv: (binsrv.telemetry / stale).write_text("{}"))
         result.pop("run")
         # expired reports cannot be removed: each failure is logged, and
         # new reports are still written
@@ -676,8 +724,10 @@ class Cases:
         return result
 
     def fault_transient(self) -> dict:
+        # reports at about 20, 30, 40 and 50 s: the first two fail
         result = self.telemetry_fault(
-            "fault_transient", "op=write,nth=1,count=2,errno=EIO")
+            "fault_transient", "op=write,nth=1,count=2,errno=EIO",
+            seconds=FAULT_SECONDS + 15)
         run = result.pop("run")
         found = reports(run["binsrv"].telemetry)
         latest_fields = None

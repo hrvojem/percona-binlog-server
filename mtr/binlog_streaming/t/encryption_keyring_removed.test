@@ -8,9 +8,9 @@
 # error, and no attempt may change the storage. 'list' (querying-only mode)
 # fails the same way (status "error" naming the missing KEK / keyring) and
 # does not change the storage either; in case 1 so do 'search_by_timestamp'
-# and 'search_by_gtid_set'. Since PBS-59 the querying-only mode skips such
-# binlogs instead: 'list' reports success with no binlogs, the searches
-# "Binlog storage is empty" (ticket 35).
+# and 'search_by_gtid_set'. From PBS-59 until PBS-108 the querying-only
+# mode skipped such binlogs instead: 'list' reported success with no
+# binlogs, the searches "Binlog storage is empty" (ticket 35).
 #
 --source ../include/have_binsrv.inc
 

@@ -42,6 +42,11 @@ JSON line each):
                    fetch (checkpoint_size 64K, so it leaves a partly written
                    binlog); the current build must recover the storage and
                    complete the copy;
+                   With --tolerate-ticket-14 (GTID mode, as the nightly
+                   runs it) the copy may lack a closing ROTATE where the
+                   kill came between a binlog's last transaction and its
+                   ROTATE (ticket 14: the GTID-mode resume starts in the
+                   next binlog); hit on 9.7 on 2026-11-05;
   downgrade        (reported, not checked) the release lists the storage
                    after the current build has written to it.
 
@@ -217,6 +222,8 @@ def fetch_to_the_end(takeover: Takeover, current: bool) -> "str | None":
 
 
 def complete_copy(source, takeover: Takeover) -> "str | None":
+    """The copy error of fetch_crash_test's check (with
+    --tolerate-ticket-14, ticket 14's effects are accepted there)."""
     harness.SERVER = source
     harness.BINSRV = takeover.binsrv
     try:
@@ -426,7 +433,15 @@ def main():
     parser.add_argument("--s3-secret-key", default="pbs/secret+key=1")
     parser.add_argument("--cases", default="",
                         help="comma-separated case names (default: all)")
+    parser.add_argument("--tolerate-ticket-14", action="store_true",
+                        help="GTID mode: accept a closed binlog stored "
+                             "without its closing ROTATE and missing binlogs "
+                             "without transactions (ticket 14), as "
+                             "fetch_crash_test does")
     args = parser.parse_args()
+    if args.tolerate_ticket_14 and args.mode != "gtid":
+        parser.error("--tolerate-ticket-14 needs --mode gtid")
+    harness.TOLERATE_TICKET_14 = args.tolerate_ticket_14
     args.mysql_basedir = args.mysql_basedir.expanduser()
     args.old_binsrv = args.old_binsrv.expanduser()
     args.binsrv = args.binsrv.expanduser()
@@ -441,6 +456,9 @@ def main():
     keyring["keys"] = [key for key in keyring["keys"] if key["id"] == "alpha"]
     KEYRING.write_text(json.dumps(keyring, indent=2))
     results = run(args)
+    if args.tolerate_ticket_14:
+        print(json.dumps({"ticket_14_accepted": harness.TICKET_14_HITS}),
+              flush=True)
     (args.workdir / "results.json").write_text(json.dumps(results, indent=2))
     return 0 if all(result.get("ok") for result in results) else 1
 

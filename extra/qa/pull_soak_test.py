@@ -53,6 +53,13 @@ descriptors and threads (/proc), its log size and the storage size. Cases
   copies            every long-lived client's copy of every closed binlog,
                     and every completed churn client's copies of the
                     binlogs closed before it started, equal the source's;
+  replica_lag       the rows the replica is behind the source (MAX(id) of
+                    qa.t on both, sampled once it has run REPLICA_SETTLE
+                    seconds since its last restart) stay within
+                    LAG_LIMIT_ROWS, and their most in the last quarter
+                    within twice that of the second quarter plus
+                    LAG_SLACK_ROWS (a replica of pull that falls further
+                    and further behind);
   replica           the replica ends with the source's data;
   still_serving     at the end a new client still gets every closed binlog.
 
@@ -104,6 +111,10 @@ MEMORY_SLACK_MB = 32
 FD_SLACK = 8
 THREAD_SLACK = 4
 LOG_MB_PER_HOUR = 50
+# the workload writes about 4 rows a second: 200 rows are some 50 s of it
+REPLICA_SETTLE = 30
+LAG_LIMIT_ROWS = 200
+LAG_SLACK_ROWS = 20
 # the known error lines of ticket 42 (PBS-115): EOF (asio.misc:2) when a
 # client disconnects, EPIPE (system:32) when it dies during a dump
 KNOWN_ERROR = re.compile(
@@ -188,6 +199,19 @@ def quarters(samples: list, key: str) -> tuple:
     return second, last
 
 
+def max_id(server) -> int:
+    value = server.sql("SELECT COALESCE(MAX(id), 0) FROM qa.t").strip()
+    return int(value or 0)
+
+
+def replica_lag(source, replica) -> "int | None":
+    """Rows of qa.t the replica lacks; None if it cannot be asked."""
+    try:
+        return max(0, max_id(source) - max_id(replica))
+    except RuntimeError:
+        return None
+
+
 def run(args) -> list:
     work = args.workdir
     rng = random.Random(args.seed)
@@ -200,7 +224,7 @@ def run(args) -> list:
         args.binsrv, work / "binsrv", args.port, False)
     pull_port = args.port + 2
     cases = ("alive", "memory", "file_descriptors", "threads", "log",
-             "copies", "replica", "still_serving")
+             "copies", "replica_lag", "replica", "still_serving")
     results = {case: {"case": case} for case in cases}
     pull = None
     long_lived = []
@@ -229,6 +253,7 @@ def run(args) -> list:
         next_sample = started
         next_churn = started + CHURN_SECONDS
         next_replica_restart = started + REPLICA_RESTART_SECONDS
+        replica_started = started
         transactions = 0
         churn_index = 0
         died_at = None
@@ -245,6 +270,8 @@ def run(args) -> list:
                                if binsrv.log_path.exists() else 0),
                     storage_bytes=directory_size(binsrv.storage),
                     binlogs=len(source.binlog_names()))
+                if now - replica_started >= REPLICA_SETTLE:
+                    sample["replica_lag_rows"] = replica_lag(source, replica)
                 samples.append(sample)
                 next_sample += SAMPLE_SECONDS
             if now >= next_churn:
@@ -273,6 +300,7 @@ def run(args) -> list:
             if now >= next_replica_restart:
                 replica.sql("STOP REPLICA")
                 replica.sql("START REPLICA")
+                replica_started = time.monotonic()
                 next_replica_restart += REPLICA_RESTART_SECONDS
             machine.run_workload(LARGE_TRANSACTION
                                  if transactions % LARGE_EVERY ==
@@ -314,6 +342,26 @@ def run(args) -> list:
                                 max(second)],
                 last_quarter=[min(last), statistics.median(last), max(last)],
                 ok=check(second, last))
+
+        lag_samples = [sample for sample in samples
+                       if "replica_lag_rows" in sample]
+        unanswered = sum(1 for sample in lag_samples
+                         if sample["replica_lag_rows"] is None)
+        answered = [sample for sample in lag_samples
+                    if sample["replica_lag_rows"] is not None]
+        second, last = quarters(answered, "replica_lag_rows")
+        if not second or not last:
+            results["replica_lag"].update(ok=False, reason="too few samples")
+        else:
+            worst = max(sample["replica_lag_rows"] for sample in answered)
+            results["replica_lag"].update(
+                samples=len(answered), unanswered=unanswered,
+                second_quarter=[min(second), statistics.median(second),
+                                max(second)],
+                last_quarter=[min(last), statistics.median(last), max(last)],
+                worst=worst,
+                ok=unanswered == 0 and worst <= LAG_LIMIT_ROWS and
+                max(last) <= 2 * max(second) + LAG_SLACK_ROWS)
 
         log_text = binsrv.log_path.read_text(errors="replace") \
             if binsrv.log_path.exists() else ""

@@ -405,7 +405,13 @@ every kind passes in both modes on 8.4, and in GTID mode on 8.0 (`tagged`
 skipped) and 9.7; a row changed and a trigger dropped on the replica behind
 its back are both reported. `--encrypted` (KEK `alpha`, AES-256-CTR) and
 `--storage s3` serve the replicas from an encrypted and an S3 storage; every
-combination passes in both modes on 8.4. The nightly runs it for both modes
+combination passes in both modes on 8.4. `--rewrite` (GTID mode) stores the
+binlogs in rewrite mode (`rewritten.NNNNNN`, 32 KB each) and the `replay`
+replica then starts by name and position (`rewritten.000001`, 4) instead of
+auto-positioning, so it follows the ROTATE events and positions rewrite mode
+generates; on 2026-11-05 it passes on 8.4 (41 rewritten binlogs, every kind
+identical, GTID_EXECUTED equal). The nightly runs it in GTID mode too (cases
+`gtid/<kind>/rewrite`). The nightly runs it for both modes
 and once more in GTID mode on an encrypted S3 storage (cases
 `gtid/<kind>/encrypted-s3`; `QA_PORT`+310, about 3.5 min each).
 
@@ -493,7 +499,19 @@ the connection without an error packet, so the client sees only `Lost
 connection to MySQL server during query` instead of ER_SECURE_TRANSPORT_REQUIRED
 (3159) (ticket 48). On 2026-11-04 the same holds with MySQL 9.7.2 (source,
 replica and clients): a 9.7 replica with `SOURCE_SSL=1` replicates over TLS,
-and only ticket 48's case fails. The nightly runs it every night (8.4).
+and only ticket 48's case fails. The limits (2026-11-05): clients limited
+to `--tls-version=TLSv1.2` and `TLSv1.3`, and `VERIFY_IDENTITY` to
+127.0.0.1 (a name of the certificate), copy exactly; TLS 1.0 and 1.1
+handshakes (`openssl s_client -starttls mysql`, which still offers them) and
+a TLS 1.2 handshake with only NULL, RC4, 3DES or export ciphers fail, while
+`pull` keeps serving; `VERIFY_IDENTITY` to the host's own address (not in the
+certificate) is refused by the client in time; with an expired certificate
+signed by the test CA, `pull` starts, `VERIFY_CA` clients are refused and
+`REQUIRED` ones copy exactly. All pass on 8.4. The listener sets no protocol
+or cipher limits of its own (a plain Boost.Asio `tls_server` context): TLS
+1.0 / 1.1 and weak ciphers are refused because of the host's OpenSSL 3.0
+defaults, which `old_tls_refused` and `weak_cipher_refused` would show
+changing. The nightly runs it every night (8.4).
 
 `pull_soak_test.py` runs `pull` for a long time (`--duration`, 2 h by
 default) under churn: a steady workload with rotations and an occasional
@@ -517,6 +535,13 @@ error (EPIPE, part of ticket 42). A 15-minute run with TLS clients
 exact as well, and the TLS clients killed during a dump added no new error
 lines.
 
+The `replica_lag` case (2026-11-05) samples how many rows of `qa.t` the
+replica is behind the source (`MAX(id)` on both) once it has run 30 s since
+its last restart: the worst must stay within 200 rows (some 50 s of the
+workload) and the worst of the last quarter within twice that of the second
+quarter plus 20, so a replica of `pull` that falls further and further behind
+fails even when it catches up at the end.
+
 `repro_broken_checkpointing.py` is a self-contained reproducer kept from an
 earlier finding (checkpoint settings having no effect); it drives an existing
 server rather than starting one.
@@ -530,10 +555,19 @@ server rather than starting one.
      `tsan_gcc14` trees in place, runs the unit tests, then runs **every
      Hegel property-test case separately** with many more cases than the
      default (the profiles in `hegel.toml`), and compares each failure
-     against `known_failures.txt`.
+     against `known_failures.txt`. Builds use 12 compile jobs
+     (`BUILD_JOBS`) and, when `ccache` is installed (test-infra since
+     2026-11-05, 4 GB cache), compile through it: the first build of a tree
+     sets `CMAKE_*_COMPILER_LAUNCHER`, and after that a rebuild after a
+     merge recompiles only what changed. Property cases run 8 at a time
+     (`JOBS`), ThreadSanitizer ones 4 (`TSAN_JOBS`); the S3 variants one at
+     a time.
   2. **MTR** (`mtr`): the whole `binlog_streaming` suite with the debug build
      on MySQL 8.0.45, 8.4.8 and 9.7.2 (`MTR_DISTS`), one version after the
-     other, each with `--parallel=4` (`MTR_PARALLEL`), `--build-thread=500`
+     other, each with `--parallel=4` (`MTR_PARALLEL`), a 10-minute limit per
+     test (`--testcase-timeout=10`; the slowest passing test takes about 5,
+     and a hung one, such as `rs_heartbeat` on 9.7 for ticket 44, cost 30
+     minutes with the default), `--build-thread=500`
      (`MTR_BUILD_THREAD`; the `rs_*` tests also use ports 1000 above the
      server's, so 500 keeps clear of the automatic build threads 300-399) and var directories `$WS/mtr-var-nightly-<series>`,
      so it does not collide with manual MTR runs. Every test (and
@@ -555,7 +589,8 @@ server rather than starting one.
      taken over: 5 position and 6 gtid cases, port `QA_PORT`+290; skipped
      when that binary is missing) and `pull_variety_test.py` per mode (a
      replica of `pull` gets the source's data for a broad workload, 14
-     `gtid/...` and 14 `position/...` cases plus `gtid/.../encrypted-s3`,
+     `gtid/...` and 14 `position/...` cases plus `gtid/.../encrypted-s3`
+     and `gtid/.../rewrite`,
      port `QA_PORT`+310), `pull_replica_fault_test.py` per mode
      (network faults between `pull` and a replica, 11 cases each, port
      `QA_PORT`+330) and `pull_restart_test.py` per mode (a replica across
@@ -572,14 +607,19 @@ server rather than starting one.
 
      | Day | Harness (mode) | Build |
      | --- | --- | --- |
-     | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts | ASan |
-     | Tue | `disk_fault_sweep.py` (position) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first) |
+     | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7 | ASan; debug |
+     | Tue | `disk_fault_sweep.py` (position); `pull_versions` on 8.0 | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first) |
      | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end) | ASan |
      | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid) | ASan |
      | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`) | ASan |
      | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position) | debug / ASan |
      | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default) | ASan / debug |
 
+     `pull_versions/<series>` runs the replica harnesses of the nightly 8.4
+     stage against another MySQL version of `MTR_DISTS`: `upgrade_test.py`,
+     `pull_variety_test.py` and `pull_restart_test.py` per mode and
+     `pull_replica_fault_test.py` in GTID mode, recorded as `qa-9.7` /
+     `qa-8.0` (ports `QA_PORT`+370 to +430, about 40 min).
      `QA_ROTATION_DAY` overrides the day (`1`-`7`, a comma list such as
      `2,4`, `all` or `none`), e.g. to try Tuesday's set now:
      `QA_ROTATION_DAY=2 STAGES=qa OUT_DIR=~/ws/qa/nightly-try ~/ws/nightly/run_nightly.sh`.

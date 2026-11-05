@@ -75,9 +75,14 @@ RELEASE_CASE_TIMEOUT=${RELEASE_CASE_TIMEOUT:-600}
 RELEASE_CASE_MEMORY_MB=${RELEASE_CASE_MEMORY_MB:-4096}
 # property test cases run several at a time; each one is a separate process
 # with its own Hegel database subtree, so they do not interfere. ThreadSanitizer
-# cases are memory-heavy, so they use a smaller pool.
-JOBS=${JOBS:-4}
-TSAN_JOBS=${TSAN_JOBS:-2}
+# cases are memory-heavy, so they use a smaller pool (16 cores, 15 GB on
+# test-infra).
+JOBS=${JOBS:-8}
+TSAN_JOBS=${TSAN_JOBS:-4}
+# compile jobs of every build; with ccache installed the build trees compile
+# through it (use_ccache), so a rebuild after a merge reuses every object
+# whose sources did not change
+BUILD_JOBS=${BUILD_JOBS:-12}
 STAGES=" ${STAGES:-cpp mtr qa release fuzz mull} "
 # MTR stage: <series>:<distribution under $WS/dist>; its own build thread
 # (ports) and var directories so it does not collide with manual MTR runs.
@@ -115,7 +120,7 @@ QA_S3_EXAMPLES=${QA_S3_EXAMPLES:-5}
 S3_BUCKET_DIR=${S3_BUCKET_DIR:-$WS/s3/data/pbs-mtr}
 # the rotation of the heavier QA harnesses: '<weekday>:<harness>/<mode>'
 # (weekday 1-7 is Monday-Sunday, date +%u); 4-15 min a night (README.md)
-QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 2:disk_fault_sweep/position 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 7:network_fault_test/gtid 7:pull_soak_test/position"}
+QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 7:network_fault_test/gtid 7:pull_soak_test/position"}
 QA_ROTATION_DAY=${QA_ROTATION_DAY:-$(date -u +%u)}
 # each fuzz connection takes about 1 s since the listener always does full
 # caching_sha2_password authentication (PBS-10), 3000 would take 50 min
@@ -147,6 +152,22 @@ record() {
   python3 -c 'import json,sys; print(json.dumps(dict(zip(["config","program","test_case","status","ticket","reason","seconds"], sys.argv[1:7]+[int(sys.argv[7])]))))' "$@"
 }
 log() { echo "[$(date -u "+%F %T")] $*" | tee -a "$out/nightly.log"; }
+
+# makes a build tree compile through ccache when it is installed; the
+# launcher is set once per tree, and the first build after that compiles
+# everything into the cache
+use_ccache() {
+  local build_dir=$1
+  command -v ccache > /dev/null || return 0
+  [ -f "$build_dir/CMakeCache.txt" ] || return 0
+  grep -q '^CMAKE_CXX_COMPILER_LAUNCHER:.*ccache' "$build_dir/CMakeCache.txt" &&
+    return 0
+  log "compiling $(basename "$build_dir") through ccache from now on"
+  cmake -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache "$build_dir" \
+    > "$out/ccache-$(basename "$build_dir").log" 2>&1 ||
+    log "could not set ccache for $build_dir (ccache-$(basename "$build_dir").log)"
+}
 
 # runs one property test case (meant to be backgrounded) and writes its
 # outcome to "$status_dir/<test case>" as tab-separated fields the main loop
@@ -329,8 +350,9 @@ for config in "${cpp_configs[@]}"; do
       ;;
   esac
 
+  use_ccache "$build_dir"
   log "building $config"
-  if ! cmake --build "$build_dir" --parallel 4 "${targets[@]}" \
+  if ! cmake --build "$build_dir" --parallel "$BUILD_JOBS" "${targets[@]}" \
       > "$out/build-$config.log" 2>&1; then
     log "BUILD FAILED: $config"
     results+=("BUILD FAILED  $config  (build-$config.log)")
@@ -565,6 +587,11 @@ if want qa; then
       --mode gtid --encrypted --storage s3 \
       --s3-bucket-dir "$S3_BUCKET_DIR" \
       --port $((QA_PORT + 310)) --timeout 1500
+    # ... and from a storage in rewrite mode (the replay replica positions
+    # by the rewritten binlog names)
+    qa_run pull_variety_test "pull_variety_test (gtid, rewrite)" \
+      --binsrv "$debug_binsrv" --workdir "$out/qa/variety-gtid-rewrite" \
+      --mode gtid --rewrite --port $((QA_PORT + 310)) --timeout 1500
     # network faults between pull and a MySQL replica (Toxiproxy outlives
     # the nightly: it must not hold the run lock)
     [ -x "$WS/qa/start_toxiproxy.sh" ] &&
@@ -619,7 +646,10 @@ if want qa; then
     binsrv=$asan_binsrv
     # the soak test watches pull's memory: ASan's quarantine would hide
     # the trend, so it uses the debug build too
-    if [ "$harness" = disk_fault_sweep ] || [ "$harness" = pull_soak_test ]; then
+    # the other MySQL versions run the harnesses of the 8.4 stage, which
+    # use the debug build
+    if [ "$harness" = disk_fault_sweep ] || [ "$harness" = pull_soak_test ] ||
+        [ "$harness" = pull_versions ]; then
       build=debug_gcc14
       binsrv=$debug_binsrv
     fi
@@ -684,6 +714,42 @@ if want qa; then
           "${common[@]}" --workdir "$out/qa/ps-$mode" \
           --port $((QA_PORT + 170)) --duration "$QA_SOAK_SECONDS" \
           --timeout $((QA_SOAK_SECONDS + 3600)) ;;
+      pull_versions)
+        # the replica harnesses of the nightly stage on another MySQL
+        # version ('mode' is the series), recorded as qa-<series>
+        series=$mode
+        dist=
+        for entry_dist in $MTR_DISTS; do
+          [ "${entry_dist%%:*}" = "$series" ] && dist=${entry_dist#*:}
+        done
+        if [ -z "$dist" ] || [ ! -d "$WS/dist/$dist" ]; then
+          log "pull_versions ($series) skipped: no distribution"
+        else
+          version=(--config "qa-$series" --dist "$WS/dist/$dist"
+                   --series "$series" --binsrv "$binsrv")
+          [ -x "$WS/qa/start_toxiproxy.sh" ] &&
+            "$WS/qa/start_toxiproxy.sh" 9>&- >> "$out/nightly.log" 2>&1
+          for version_mode in gtid position; do
+            [ -x "$OLD_BINSRV" ] &&
+              qa_run upgrade_test "upgrade_test ($series, $version_mode)" \
+                "${version[@]}" --old-binsrv "$OLD_BINSRV" \
+                --s3-bucket-dir "$S3_BUCKET_DIR" \
+                --workdir "$out/qa/v$series-upgrade-$version_mode" \
+                --mode "$version_mode" --port $((QA_PORT + 370)) --timeout 900
+            qa_run pull_variety_test \
+              "pull_variety_test ($series, $version_mode)" "${version[@]}" \
+              --workdir "$out/qa/v$series-variety-$version_mode" \
+              --mode "$version_mode" --port $((QA_PORT + 390)) --timeout 1500
+            qa_run pull_restart_test \
+              "pull_restart_test ($series, $version_mode)" "${version[@]}" \
+              --workdir "$out/qa/v$series-restart-$version_mode" \
+              --mode "$version_mode" --port $((QA_PORT + 410)) --timeout 1500
+          done
+          qa_run pull_replica_fault_test \
+            "pull_replica_fault_test ($series, gtid)" "${version[@]}" \
+            --workdir "$out/qa/v$series-replica-fault-gtid" --mode gtid \
+            --port $((QA_PORT + 430)) --timeout 1500
+        fi ;;
       *) log "unknown QA_ROTATION harness $harness" ;;
     esac
     log "$harness ($mode) done in $(( ($(date +%s) - stage_started) / 60 )) min"
@@ -724,9 +790,10 @@ if want fuzz; then
       > "$out/configure-fuzz_clang20.log" 2>&1 ||
       log "CONFIGURE FAILED: fuzz_clang20 (configure-fuzz_clang20.log)"
   fi
+  use_ccache "$fuzz_build"
   log "building fuzz_clang20"
   # shellcheck disable=SC2086 # one --target per word
-  if ! cmake --build "$fuzz_build" --parallel 4 \
+  if ! cmake --build "$fuzz_build" --parallel "$BUILD_JOBS" \
       $(printf -- '--target %s ' $FUZZ_TARGETS) \
       > "$out/build-fuzz_clang20.log" 2>&1; then
     log "BUILD FAILED: fuzz_clang20"

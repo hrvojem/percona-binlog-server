@@ -50,7 +50,11 @@ and a MySQL replica applies it from 'pull'. Kinds:
 The storage is a file storage by default; --encrypted encrypts it (KEK
 'alpha' of the repository's sample keyring, AES-256-CTR) and --storage s3 puts it
 on an S3-compatible server (--s3-bucket-dir), so the replicas are served
-through those read paths.
+through those read paths. --rewrite (GTID mode) stores the binlogs in
+rewrite mode, under names and sizes of the Binlog Server's own
+('rewritten.NNNNNN', 32 KB), and the 'replay' replica then starts by binlog
+name and position ('rewritten.000001', 4) instead of auto-positioning, so
+it follows the ROTATE events and positions that rewrite mode generates.
 
 Two phases: 'live' (the replica is connected while the workload runs) and
 'replay' (a reset replica replicates everything again from the storage).
@@ -97,6 +101,7 @@ PREFIX = "qv_"
 KEYRING_SOURCE = Path(__file__).resolve().parents[2] / "keyring_data.json"
 KEYRING: Path = None  # written into the work directory by main()
 ENCRYPTION = {"format": "generic", "kek_id": "alpha", "cipher": "AES-256-CTR"}
+REWRITE = {"base_file_name": "rewritten", "file_size": "32K"}
 
 
 def types() -> list:
@@ -547,23 +552,30 @@ def run(args) -> list:
                                f"variety-{args.mode}-{os.getpid()}")
     binsrv = harness.BinlogServer(args.binsrv, work / "binsrv", args.port,
                                   gtid_mode, s3)
-    if args.encrypted:
-        # every configuration written (also start_pull's) is encrypted
+    if args.encrypted or args.rewrite:
+        # every configuration written (also start_pull's) is encrypted /
+        # in rewrite mode
         write_config = binsrv.write_config
 
-        def write_encrypted_config():
+        def write_changed_config():
             write_config()
             config = json.loads(binsrv.config_path.read_text())
-            config["keyring"] = {"uri": f"file://{KEYRING}"}
-            config["storage"]["encryption"] = dict(ENCRYPTION)
+            if args.encrypted:
+                config["keyring"] = {"uri": f"file://{KEYRING}"}
+                config["storage"]["encryption"] = dict(ENCRYPTION)
+            if args.rewrite:
+                config["replication"]["rewrite"] = dict(REWRITE)
             binsrv.config_path.write_text(json.dumps(config, indent=2))
 
-        binsrv.write_config = write_encrypted_config
+        binsrv.write_config = write_changed_config
     binsrv.reset()
     binsrv.checkpoint_size = "1"
     pull_port = args.port + 2
     start = ("SOURCE_AUTO_POSITION=1" if gtid_mode else
              "SOURCE_LOG_FILE='binlog.000001', SOURCE_LOG_POS=4")
+    replay_start = (f"SOURCE_AUTO_POSITION=0, SOURCE_LOG_FILE="
+                    f"'{REWRITE['base_file_name']}.000001', SOURCE_LOG_POS=4"
+                    if args.rewrite else start)
     results = []
     pull = None
     source.start()
@@ -610,12 +622,17 @@ def run(args) -> list:
         drops = " ".join(f"DROP DATABASE IF EXISTS {database};"
                          for database in databases(replica))
         replication.replicate_from_pull(
-            replica, pull_port, gtid_mode, start,
+            replica, pull_port, gtid_mode, replay_start,
             f"SET SESSION SQL_LOG_BIN = 0; {drops} "
             "SET SESSION SQL_LOG_BIN = 1;")
         source.sql(f"INSERT INTO {PREFIX}marker.m VALUES (2)")
         replay, replay_kinds = compare(source, replica, gtid_mode, 2, kinds)
         replay["pull_alive"] = pull.poll() is None
+        if args.rewrite:
+            stored = sorted(path.name for path in binsrv.storage.glob(
+                f"{REWRITE['base_file_name']}.0*") if path.suffix != ".json")
+            replay["rewritten_binlogs"] = len(stored)
+            replay["ok"] = replay["ok"] and len(stored) > 1
         replay["ok"] = replay["ok"] and replay["pull_alive"]
         results.append({"case": "replay", **replay})
         print(json.dumps(results[-1]), flush=True)
@@ -655,6 +672,8 @@ def main():
                         default="gtid")
     parser.add_argument("--encrypted", action="store_true",
                         help="encrypt the storage")
+    parser.add_argument("--rewrite", action="store_true",
+                        help="GTID mode: store the binlogs in rewrite mode")
     parser.add_argument("--storage", choices=["file", "s3"], default="file")
     parser.add_argument("--s3-endpoint", default="127.0.0.1:9000")
     parser.add_argument("--s3-bucket", default="pbs-mtr")
@@ -665,9 +684,12 @@ def main():
     parser.add_argument("--kinds", default="",
                         help="comma-separated kinds (default: all)")
     args = parser.parse_args()
+    if args.rewrite and args.mode != "gtid":
+        parser.error("--rewrite needs --mode gtid (rewrite mode is GTID-only)")
     args.mysql_basedir = args.mysql_basedir.expanduser()
     args.binsrv = args.binsrv.expanduser()
     args.workdir = args.workdir.expanduser().resolve()
+    args.workdir.mkdir(parents=True, exist_ok=True)
     global KEYRING
     KEYRING = args.workdir / "keyring.json"
     keyring = json.loads(KEYRING_SOURCE.read_text())
@@ -677,7 +699,6 @@ def main():
         if args.s3_bucket_dir is None:
             parser.error("--storage s3 needs --s3-bucket-dir")
         args.s3_bucket_dir = args.s3_bucket_dir.expanduser().resolve()
-    args.workdir.mkdir(parents=True, exist_ok=True)
     results = run(args)
     (args.workdir / "results.json").write_text(json.dumps(results, indent=2))
     return 0 if all(result.get("ok") for result in results) else 1

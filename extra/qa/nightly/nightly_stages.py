@@ -152,7 +152,7 @@ def run_mtr(args) -> int:
         "./mtr", f"--vardir={args.vardir}",
         f"--build-thread={args.build_thread}", "--force",
         "--max-test-fail=0", "--retry=0", "--nounit-tests", "--big-test",
-        f"--parallel={args.parallel}", "--testcase-timeout=30",
+        f"--parallel={args.parallel}", "--testcase-timeout=10",
         f"--suite-timeout={args.suite_timeout}", "--shutdown-timeout=600",
         "--suite=binlog_streaming"]
     environment = dict(os.environ, BINSRV=str(args.binsrv))
@@ -293,6 +293,8 @@ def harness_command(args, workdir: Path) -> list:
         command = script + common + mode
         if args.encrypted:
             command.append("--encrypted")
+        if args.rewrite:
+            command.append("--rewrite")
         if args.storage == "s3":
             command += ["--storage", "s3", "--s3-endpoint", args.s3_endpoint,
                         "--s3-bucket-dir", str(args.s3_bucket_dir)]
@@ -305,6 +307,10 @@ def harness_command(args, workdir: Path) -> list:
     if args.harness == "upgrade_test":
         command = script + common + mode + ["--old-binsrv",
                                             str(args.old_binsrv)]
+        # as in fetch_crash_test: a kill between a binlog's last
+        # transaction and its ROTATE hits ticket 14 in GTID mode
+        if args.mode == "gtid":
+            command.append("--tolerate-ticket-14")
         if args.s3_bucket_dir:
             command += ["--s3-endpoint", args.s3_endpoint,
                         "--s3-bucket-dir", str(args.s3_bucket_dir)]
@@ -374,12 +380,14 @@ def harness_cases(args, returncode: int, output: str, lines: list,
                 details = {key: value for key, value in result.items()
                            if key not in ("case", "ok")}
                 reason = json.dumps(details)
-            # pull_variety_test on another storage:
-            # '<mode>/<case>/encrypted', '.../s3', '.../encrypted-s3'
+            # pull_variety_test on another storage or in rewrite mode:
+            # '<mode>/<case>/encrypted', '.../s3', '.../encrypted-s3',
+            # '.../rewrite'
             variant = "-".join(
                 name for name, used in (
                     ("encrypted", getattr(args, "encrypted", False)),
-                    ("s3", args.storage == "s3"))
+                    ("s3", args.storage == "s3"),
+                    ("rewrite", getattr(args, "rewrite", False)))
                 if used and args.harness == "pull_variety_test")
             suffix = f"/{variant}" if variant else ""
             cases.append((f"{mode}/{result['case']}{suffix}",
@@ -915,6 +923,8 @@ def main():
     parser.add_argument("--binsrv", type=Path)
     parser.add_argument("--encrypted", action="store_true",
                         help="an encrypted storage (pull_variety_test)")
+    parser.add_argument("--rewrite", action="store_true",
+                        help="rewrite mode (pull_variety_test, GTID)")
     parser.add_argument("--old-binsrv", type=Path,
                         help="binlog_server of the previous release "
                              "(upgrade_test)")

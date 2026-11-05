@@ -47,6 +47,29 @@ each):
                             exactly;
   replica_over_tls          a MySQL replica with SOURCE_SSL=1 replicates from
                             pull to the source's data;
+  tls12_client, tls13_client
+                            a --ssl-mode=REQUIRED client limited to
+                            --tls-version=TLSv1.2 / TLSv1.3 copies them
+                            exactly;
+  old_tls_refused           TLS 1.0 and TLS 1.1 handshakes ('openssl
+                            s_client -starttls mysql', which still offers
+                            them) fail, as MySQL allows TLS 1.2 and later
+                            only, TLS 1.2 and 1.3 ones succeed, and pull
+                            keeps serving;
+  weak_cipher_refused       a TLS 1.2 handshake offering only NULL, RC4,
+                            3DES or export ciphers fails, and pull keeps
+                            serving;
+  verify_identity_client    --ssl-mode=VERIFY_IDENTITY to 127.0.0.1, a
+                            name of the certificate, copies them exactly;
+  verify_identity_wrong_name
+                            ... to the host's own address, which the
+                            certificate does not name, is refused by the
+                            client in time (no hang), and pull keeps
+                            serving;
+  expired_cert              with an expired certificate (signed by the test
+                            CA), pull starts, a --ssl-mode=VERIFY_CA client
+                            is refused in time and a REQUIRED one copies
+                            them exactly;
   bad_cert_path, bad_key_path, mismatched_key, cert_not_pem
                             with a missing certificate, a missing key, a key
                             that is not the certificate's, or a certificate
@@ -145,14 +168,15 @@ def stop(process: subprocess.Popen) -> None:
 
 
 def copy(args, port: int, first_binlog: str, directory: Path,
-         ssl_options: list) -> subprocess.CompletedProcess:
+         ssl_options: list, host: str = "127.0.0.1"
+         ) -> subprocess.CompletedProcess:
     """mysqlbinlog --raw from 'first_binlog' to the end of the data."""
     shutil.rmtree(directory, ignore_errors=True)
     directory.mkdir(parents=True)
     try:
         return subprocess.run(
             [str(args.mysql_basedir / "bin" / "mysqlbinlog"), "--no-defaults",
-             "--read-from-remote-server", "--host=127.0.0.1",
+             "--read-from-remote-server", f"--host={host}",
              f"--port={port}", f"--user={replication.PULL_USER}",
              f"--password={replication.PULL_PASSWORD}", "--raw",
              "--to-last-log", f"--result-file={directory}/", *ssl_options,
@@ -161,6 +185,34 @@ def copy(args, port: int, first_binlog: str, directory: Path,
     except subprocess.TimeoutExpired as error:
         return subprocess.CompletedProcess(
             error.cmd, 124, "", f"timed out after {CLIENT_SECONDS} s")
+
+
+def handshake(port: int, options: list) -> "str | None":
+    """The protocol of a TLS handshake with the listener by 'openssl
+    s_client -starttls mysql' with 'options', None if it fails."""
+    try:
+        outcome = subprocess.run(
+            ["openssl", "s_client", "-starttls", "mysql", "-brief",
+             "-connect", f"127.0.0.1:{port}", *options],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=STARTUP_SECONDS)
+    except subprocess.TimeoutExpired:
+        return None
+    output = outcome.stdout + outcome.stderr
+    if "CONNECTION ESTABLISHED" not in output:
+        return None
+    for line in output.splitlines():
+        if line.startswith("Protocol version:"):
+            return line.split(":", 1)[1].strip()
+    return "?"
+
+
+def host_address() -> str:
+    """An address of this host other than the loopback one."""
+    output = subprocess.run(["hostname", "-I"], capture_output=True,
+                            text=True).stdout.split()
+    return next((address for address in output
+                 if "." in address and not address.startswith("127.")), "")
 
 
 def mismatches(source, names: list, directory: Path) -> list:
@@ -239,6 +291,97 @@ def run(args) -> list:
         copy_case("ssl_verify_ca_client", SSL, False, True, VERIFY_CA)
         copy_case("tls_without_rsa_key", SSL, False, False, REQUIRED)
         copy_case("tls_accepted_when_required", SSL, True, True, REQUIRED)
+        copy_case("tls12_client", SSL, False, True,
+                  REQUIRED + ["--tls-version=TLSv1.2"])
+        copy_case("tls13_client", SSL, False, True,
+                  REQUIRED + ["--tls-version=TLSv1.3"])
+        copy_case("verify_identity_client", SSL, False, True,
+                  ["--ssl-mode=VERIFY_IDENTITY", f"--ssl-ca={CA}"])
+
+        # protocol versions and ciphers, then a TLS client still served
+        pull = start_pull(binsrv, port, SSL, False, True)
+        try:
+            listening = wait_listening(port, pull)
+            # security level 0, so that the client side offers them at all
+            weak = ["-cipher", "DEFAULT@SECLEVEL=0"]
+            versions = {flag: handshake(port, [flag] + weak)
+                        if listening else None
+                        for flag in ("-tls1", "-tls1_1", "-tls1_2",
+                                     "-tls1_3")}
+            weak_cipher = handshake(port, [
+                "-tls1_2", "-cipher",
+                "NULL:eNULL:RC4:3DES:EXP:aNULL@SECLEVEL=0"]) \
+                if listening else None
+            after = copy(args, port, first, work / "copies" / "after-probes",
+                         REQUIRED) if listening else None
+            served = after is not None and after.returncode == 0 and \
+                not mismatches(source, closed, work / "copies" /
+                               "after-probes")
+            results.append({
+                "case": "old_tls_refused", "handshakes": versions,
+                "served_after": served,
+                "ok": versions["-tls1"] is None and
+                versions["-tls1_1"] is None and
+                versions["-tls1_2"] is not None and
+                versions["-tls1_3"] is not None and served and
+                pull.poll() is None})
+            results.append({
+                "case": "weak_cipher_refused", "handshake": weak_cipher,
+                "served_after": served,
+                "ok": listening and weak_cipher is None and served and
+                pull.poll() is None})
+            # a name the certificate does not hold: the client refuses
+            address = host_address()
+            wrong = copy(args, port, first, work / "copies" / "wrong-name",
+                         ["--ssl-mode=VERIFY_IDENTITY", f"--ssl-ca={CA}"],
+                         host=address) if listening and address else None
+            results.append({
+                "case": "verify_identity_wrong_name", "address": address,
+                "client_exit": wrong.returncode if wrong else None,
+                "client_error": wrong.stderr.strip()[-300:] if wrong else "",
+                "pull_alive": pull.poll() is None,
+                "ok": wrong is not None and wrong.returncode not in (0, 124)
+                and pull.poll() is None})
+        finally:
+            stop(pull)
+
+        # an expired certificate signed by the test CA
+        expired_dir = work / "expired-cert"
+        expired_dir.mkdir(parents=True, exist_ok=True)
+        request = expired_dir / "request.csr"
+        extensions = expired_dir / "extensions.cnf"
+        expired = expired_dir / "expired.pem"
+        extensions.write_text("subjectAltName=DNS:localhost,IP:127.0.0.1\n")
+        subprocess.run(["openssl", "req", "-new", "-key", str(KEY), "-subj",
+                        "/CN=localhost", "-out", str(request)],
+                       capture_output=True, check=True)
+        subprocess.run(["openssl", "x509", "-req", "-in", str(request),
+                        "-CA", str(CA), "-CAkey",
+                        str(STD_DATA / "rs_ca_priv.pem"), "-set_serial", "77",
+                        "-days", "-1", "-extfile", str(extensions), "-out",
+                        str(expired)], capture_output=True, check=True)
+        pull = start_pull(binsrv, port, {"cert": str(expired),
+                                         "key": str(KEY)}, False, True)
+        try:
+            listening = wait_listening(port, pull)
+            verified = copy(args, port, first, work / "copies" / "expired-ca",
+                            VERIFY_CA) if listening else None
+            plain_tls = copy(args, port, first,
+                             work / "copies" / "expired-required",
+                             REQUIRED) if listening else None
+            tls_wrong = mismatches(source, closed, work / "copies" /
+                                   "expired-required") if listening else []
+            results.append({
+                "case": "expired_cert", "pull_started": listening,
+                "verify_ca_exit": verified.returncode if verified else None,
+                "verify_ca_error": verified.stderr.strip()[-300:]
+                if verified else "",
+                "required_exit": plain_tls.returncode if plain_tls else None,
+                "ok": listening and verified.returncode not in (0, 124) and
+                plain_tls.returncode == 0 and not tls_wrong and
+                pull.poll() is None})
+        finally:
+            stop(pull)
 
         # a plain client under require_secure_transport
         pull = start_pull(binsrv, port, SSL, True, True)

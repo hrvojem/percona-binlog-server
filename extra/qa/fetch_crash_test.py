@@ -52,8 +52,12 @@ EIO), with the same checks.
 
 With '--tolerate-ticket-14' (GTID mode), the checks accept the two known
 effects of ticket 14 and nothing else: a closed binlog stored without the
-ROTATE event that ends it on the server, and server binlogs that hold no
-transactions missing from the storage and from 'binlog.index'. The test
+ROTATE event that ends it on the server, server binlogs that hold no
+transactions missing from the storage and from 'binlog.index', and such a
+binlog stored with only the binlog magic (indexed while it was the server's
+current one, then rotated away while fetch was not running: the storage
+writes a binlog's preamble with its first transaction, and the GTID-mode
+resume starts in the next binlog). The test
 prints how many times it accepted them. Ticket 14 itself is tested by the
 MTR test binlog_streaming.gtid_resume_after_rotation; this option keeps the
 rest of the GTID-mode checks able to report a different bug.
@@ -123,7 +127,8 @@ class Failure(AssertionError):
 
 # --tolerate-ticket-14: how often each known effect was accepted
 TOLERATE_TICKET_14 = False
-TICKET_14_HITS = {"missing_rotate": 0, "skipped_binlog": 0}
+TICKET_14_HITS = {"missing_rotate": 0, "skipped_binlog": 0,
+                  "magic_only_binlog": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +771,11 @@ class FetchCrashMachine(RuleBasedStateMachine):
                     stored == without_closing_rotate(source):
                 TICKET_14_HITS["missing_rotate"] += 1
                 continue
+            if stored == BINLOG_MAGIC and TOLERATE_TICKET_14 and \
+                    name != server_names[-1] and \
+                    not holds_transactions(source):
+                TICKET_14_HITS["magic_only_binlog"] += 1
+                continue
             if stored != source:
                 mismatch = next((i for i in range(min(len(stored),
                                                       len(source)))
@@ -858,7 +868,9 @@ def main():
             print(f"ticket 14 accepted: {TICKET_14_HITS['missing_rotate']} "
                   f"binlog(s) without their closing ROTATE, "
                   f"{TICKET_14_HITS['skipped_binlog']} binlog(s) without "
-                  f"transactions skipped (counted per check)")
+                  f"transactions skipped, "
+                  f"{TICKET_14_HITS['magic_only_binlog']} such binlog(s) "
+                  f"stored as the magic only (counted per check)")
         SERVER.stop()
 
 

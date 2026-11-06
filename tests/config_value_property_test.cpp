@@ -50,6 +50,7 @@
 //   part replaced with a JSON value of another type) are rejected with a
 //   regular exception, never with a crash or an allocation failure.
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -1901,28 +1902,34 @@ void check_config_file(const config_spec &spec) {
                      ? std::string{"/usr/local/percona/telemetry/pbs"}
                      : std::string{report_path->as_string()}),
             "telemetry.path differs in '" + text + "'");
+    // a configured interval is clamped into its permitted range (PBS-122)
     const auto same_interval{[&](const char *field, std::uint64_t actual,
-                                 std::uint64_t fallback) {
+                                 std::uint64_t fallback, std::uint64_t min,
+                                 std::uint64_t max) {
       const auto *value{written.if_contains(field)};
-      const auto expected{
+      auto expected{
           value == nullptr
               ? std::optional<std::uint64_t>{fallback}
               : model_unit(std::string{value->as_string()}, time_symbols)};
+      if (expected.has_value()) {
+        expected = std::clamp(*expected, min, max);
+      }
       require(expected == actual, std::string{"telemetry."} + field +
                                       " is " + std::to_string(actual) +
                                       " s in '" + text + "'");
     }};
+    constexpr std::uint64_t day{86400U};
     same_interval("grace_interval",
                   static_cast<std::uint64_t>(telemetry->grace_interval().count()),
-                  300U);
+                  300U, 20U, 2U * day);
     same_interval(
         "scrape_interval",
         static_cast<std::uint64_t>(telemetry->scrape_interval().count()),
-        86400U);
+        day, 10U, 7U * day);
     same_interval(
         "history_keep_interval",
         static_cast<std::uint64_t>(telemetry->history_keep_interval().count()),
-        604800U);
+        7U * day, 60U, 7U * day);
   }
 }
 

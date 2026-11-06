@@ -2516,7 +2516,23 @@ public:
         value.kind != damage_kind::index_crlf_line_endings &&
         (value.kind == damage_kind::add_unexpected_file ||
          (target_name != index_name && target_name != metadata_name))};
-    if (damages_one_binlog) {
+    // damage that changes the KEK a binlog's metadata names makes it name a
+    // KEK the keyring lacks, which PBS-108 reports as a configuration error
+    // (as StorageQueryingSkipsOnlyTheDamagedBinlog checks) instead of
+    // skipping that binlog
+    const bool renames_kek{
+        damages_one_binlog && value.kind != damage_kind::add_unexpected_file &&
+        settings_.encryption.has_value() && is_binlog_metadata(target_name) &&
+        copy->exists(target_name) &&
+        read_text(*copy, target_name)
+                .find('"' + settings_.encryption->kek_id + '"') ==
+            std::string::npos};
+    if (renames_kek && !queried.records.has_value()) {
+      require(names_keyring_error(queried.error),
+              description + ": opening for queries failed without naming "
+                            "the keyring: " +
+                  queried.error);
+    } else if (damages_one_binlog) {
       const auto damaged_binlog{
           value.kind == damage_kind::add_unexpected_file
               ? std::string{}

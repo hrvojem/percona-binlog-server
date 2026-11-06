@@ -120,7 +120,7 @@ JSON and exits non-zero on a failure.
 | `event_variety_test.py` | drives less common event types — transaction compression, `binlog_row_image=MINIMAL`, partial JSON, XA, tagged GTIDs — through a full fetch and a kill/resume | — (no bug) |
 | `pull_replica_fault_test.py` | network faults (Toxiproxy) between `pull` and a MySQL replica — resets, cuts at 1 KB / 100 KB / inside an 8 MB event / during the login, a stall past `replica_net_timeout`, refused connections, 1-byte pieces, latency, low bandwidth — while the source writes; the replica must reconnect and end with the source's data | — (no bug) |
 | `pull_restart_test.py` | a MySQL replica of `pull` (auto-positioning in GTID mode) across restarts of `pull` — SIGTERM or SIGKILL while idle, while the source writes, inside an 8 MB event, while the source rotates into binlogs without transactions, while a lagging replica catches up, and five quick kill/restart cycles; the replica must reconnect to the new `pull` and end with the source's data | — (no bug) |
-| `pull_variety_test.py` | a MySQL replica of `pull` must end with the source's data for a broad workload — every column type, row images, partial JSON, compression, statement format, DDL with routines and triggers, XA, an 8 MB row, savepoints, charsets, tagged GTIDs, empty transactions — live and replayed from the storage | — (no bug) |
+| `pull_variety_test.py` | a MySQL replica of `pull` must end with the source's data for a broad workload — every column type, row images, partial JSON, compression, statement format, DDL with routines and triggers, XA, an 8 MB row, savepoints, charsets, tagged GTIDs, empty transactions, VECTOR columns and Percona Server 9.7 vector indexes — live and replayed from the storage | — (no bug) |
 | `query_race_test.py` | runs `binlog_server list` `--runs` times (default 500) next to a `pull` writing a filesystem storage with `checkpoint_size` `"1K"` while the source gets small inserts and a `FLUSH BINARY LOGS` every 20 of them; reports the failed `list` runs and each distinct error message | ticket 29 |
 | `large_binlog_test.py` | binlogs and transactions past 4 GiB, where positions no longer fit the protocol's 32-bit fields. Case `binlog_over_4gib`: about 1 GB of 1 MiB transactions and one of about 3.5 GB leave a 4.5 GB binlog; `fetch` must store it byte for byte, a second `fetch` reopen the storage, `list` report its size, and `mysqlbinlog --raw` through `pull` copy it exactly (passes). Case `transaction_over_4gib`: one transaction of about 4.7 GB. Needs about 20 GB of disk; `--keep` keeps the data, `--cases` picks the cases. With `--storage s3 --s3-bucket-dir <dir>` the storage is in the S3 bucket, behind a counting `s3_fault_proxy.py` the harness starts (`--s3-proxy-port`), and a further check `s3_put_size` requires that no request uploads more than 5 GiB, the AWS limit for a single PUT, which local S3 servers do not enforce (only `binlog_over_4gib` by default; about 30 GB of disk). First run (2026-10-28, debug build): passes; the 4.5 GB binlog goes up as a multipart upload of 8 MiB parts (largest request 8 MiB), and `pull` streams it back from S3 byte for byte. Versity S3 Gateway 1.8.0 takes about a minute to join the parts, and the AWS SDK's CRT client repeats the CompleteMultipartUpload after about 5 s, which the gateway confirms at once, before the object exists; the harness therefore waits up to 5 min for the objects (`s3_object_late_seconds`, 54 s) before comparing. AWS S3 confirms a completion only once the object exists | ticket 41 (PBS-114) |
 
@@ -403,7 +403,19 @@ key and one without any key), `partial_json`, `compression`, `statement`
 view, a function, a procedure and a trigger), `xa` (committed, rolled back
 after PREPARE, ONE PHASE), `large` (20000 rows in one transaction, an 8 MB
 row), `savepoints` (with a MyISAM table), `charsets`, and in GTID mode
-`tagged` (8.3+) and `empty` (empty transactions of another UUID). Phase
+`tagged` (8.3+) and `empty` (empty transactions of another UUID), then
+`vector` (9.0+: VECTOR columns at the float limits, NULLs, a 16383-dimension
+64 KB value) and `vector_index` (Percona Server 9.7 HNSW indexes, Euclidean
+and cosine, through every DDL that rebuilds the table or moves the hidden
+aux table: the first index added in place to a table with rows, OPTIMIZE,
+drop and re-add in one ALTER, a COPY rebuild, one beside FULLTEXT, the last
+index dropped, renames across schemas, TRUNCATE). The aux tables are never
+binlogged, so each replica builds its own graph; besides matching the
+source, a replica's vector index must pass CHECK TABLE, be used for
+`ORDER BY DISTANCE(...) LIMIT k` and find a few stored vectors themselves.
+On 2026-11-06 both pass on Percona Server 9.7.2-2 (built from the 9.7
+branch, c6af080d) in GTID, position, encrypted and rewrite mode, and
+`vector` passes on MySQL 9.7.2 (`vector_index` skipped). Phase
 `live`: a replica of `pull` applies it as it is written; phase `replay`: a
 reset replica replicates everything again from the storage. After each the
 replica's tables (SHOW CREATE TABLE, row count, CHECKSUM TABLE), views,

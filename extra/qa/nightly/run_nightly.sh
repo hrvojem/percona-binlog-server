@@ -41,6 +41,8 @@
 #
 # STAGES selects what runs (default "cpp mtr qa release"); without "cpp" the
 # debug / ASan / TSan trees are not built and the existing binaries are used.
+# "rotation" runs only the QA rotation (part of "qa"), e.g. to try a rotation
+# entry: STAGES=rotation QA_ROTATION=1:pull_versions/ps-8.4 QA_ROTATION_DAY=1
 # OUT_DIR runs into another directory instead of runs/<date> and then leaves
 # history.tsv, the latest symlink and old runs alone, to try a stage out
 # without touching the nightly's own results, e.g.
@@ -120,8 +122,12 @@ QA_S3_EXAMPLES=${QA_S3_EXAMPLES:-5}
 S3_BUCKET_DIR=${S3_BUCKET_DIR:-$WS/s3/data/pbs-mtr}
 # the rotation of the heavier QA harnesses: '<weekday>:<harness>/<mode>'
 # (weekday 1-7 is Monday-Sunday, date +%u); 4-15 min a night (README.md)
-QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 7:network_fault_test/gtid 7:pull_soak_test/position"}
+QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 4:pull_versions/ps-8.4 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 6:pull_versions/ps-9.7 7:network_fault_test/gtid 7:pull_soak_test/position"}
 QA_ROTATION_DAY=${QA_ROTATION_DAY:-$(date -u +%u)}
+# pull_versions on Percona Server: '<label>:<series>:<distribution under
+# $WS/dist>' (8.4 is the release tarball, 9.7 a build of the 9.7 branch,
+# ~/ws/ps-9.7-build.sh, which has the HNSW vector indexes)
+PS_DISTS=${PS_DISTS:-"ps-8.4:8.4:Percona-Server-8.4.11-11-Linux.x86_64.glibc2.35-minimal ps-9.7:9.7:percona-server-9.7"}
 # each fuzz connection takes about 1 s since the listener always does full
 # caching_sha2_password authentication (PBS-10), 3000 would take 50 min
 QA_FUZZ_CONNECTIONS=${QA_FUZZ_CONNECTIONS:-600}
@@ -628,6 +634,8 @@ if want qa; then
         --timeout 1200
     done
   fi
+fi
+if want qa || want rotation; then
   # tonight's share of the heavier harnesses
   for entry in $QA_ROTATION; do
     entry_day=${entry%%:*}
@@ -716,38 +724,47 @@ if want qa; then
           --timeout $((QA_SOAK_SECONDS + 3600)) ;;
       pull_versions)
         # the replica harnesses of the nightly stage on another MySQL
-        # version ('mode' is the series), recorded as qa-<series>
+        # version ('mode' is the series of MTR_DISTS or a label of
+        # PS_DISTS), recorded as qa-<series> / qa-<label>
+        label=$mode
         series=$mode
         dist=
         for entry_dist in $MTR_DISTS; do
-          [ "${entry_dist%%:*}" = "$series" ] && dist=${entry_dist#*:}
+          [ "${entry_dist%%:*}" = "$label" ] && dist=${entry_dist#*:}
+        done
+        for entry_dist in $PS_DISTS; do
+          if [ "${entry_dist%%:*}" = "$label" ]; then
+            entry_dist=${entry_dist#*:}
+            series=${entry_dist%%:*}
+            dist=${entry_dist#*:}
+          fi
         done
         if [ -z "$dist" ] || [ ! -d "$WS/dist/$dist" ]; then
-          log "pull_versions ($series) skipped: no distribution"
+          log "pull_versions ($label) skipped: no distribution"
         else
-          version=(--config "qa-$series" --dist "$WS/dist/$dist"
+          version=(--config "qa-$label" --dist "$WS/dist/$dist"
                    --series "$series" --binsrv "$binsrv")
           [ -x "$WS/qa/start_toxiproxy.sh" ] &&
             "$WS/qa/start_toxiproxy.sh" 9>&- >> "$out/nightly.log" 2>&1
           for version_mode in gtid position; do
             [ -x "$OLD_BINSRV" ] &&
-              qa_run upgrade_test "upgrade_test ($series, $version_mode)" \
+              qa_run upgrade_test "upgrade_test ($label, $version_mode)" \
                 "${version[@]}" --old-binsrv "$OLD_BINSRV" \
                 --s3-bucket-dir "$S3_BUCKET_DIR" \
-                --workdir "$out/qa/v$series-upgrade-$version_mode" \
+                --workdir "$out/qa/v$label-upgrade-$version_mode" \
                 --mode "$version_mode" --port $((QA_PORT + 370)) --timeout 900
             qa_run pull_variety_test \
-              "pull_variety_test ($series, $version_mode)" "${version[@]}" \
-              --workdir "$out/qa/v$series-variety-$version_mode" \
+              "pull_variety_test ($label, $version_mode)" "${version[@]}" \
+              --workdir "$out/qa/v$label-variety-$version_mode" \
               --mode "$version_mode" --port $((QA_PORT + 390)) --timeout 1500
             qa_run pull_restart_test \
-              "pull_restart_test ($series, $version_mode)" "${version[@]}" \
-              --workdir "$out/qa/v$series-restart-$version_mode" \
+              "pull_restart_test ($label, $version_mode)" "${version[@]}" \
+              --workdir "$out/qa/v$label-restart-$version_mode" \
               --mode "$version_mode" --port $((QA_PORT + 410)) --timeout 1500
           done
           qa_run pull_replica_fault_test \
-            "pull_replica_fault_test ($series, gtid)" "${version[@]}" \
-            --workdir "$out/qa/v$series-replica-fault-gtid" --mode gtid \
+            "pull_replica_fault_test ($label, gtid)" "${version[@]}" \
+            --workdir "$out/qa/v$label-replica-fault-gtid" --mode gtid \
             --port $((QA_PORT + 430)) --timeout 1500
         fi ;;
       *) log "unknown QA_ROTATION harness $harness" ;;

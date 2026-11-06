@@ -631,16 +631,23 @@ server rather than starting one.
      | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7 | ASan; debug |
      | Tue | `disk_fault_sweep.py` (position); `pull_versions` on 8.0 | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first) |
      | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end) | ASan |
-     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid) | ASan |
+     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4 | ASan; debug |
      | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`) | ASan |
-     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position) | debug / ASan |
+     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7 | debug / ASan; debug |
      | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default) | ASan / debug |
 
      `pull_versions/<series>` runs the replica harnesses of the nightly 8.4
      stage against another MySQL version of `MTR_DISTS`: `upgrade_test.py`,
      `pull_variety_test.py` and `pull_restart_test.py` per mode and
      `pull_replica_fault_test.py` in GTID mode, recorded as `qa-9.7` /
-     `qa-8.0` (ports `QA_PORT`+370 to +430, about 40 min).
+     `qa-8.0` (ports `QA_PORT`+370 to +430, about 40 min). It also takes a
+     Percona Server label of `PS_DISTS` (`<label>:<series>:<distribution>`):
+     `ps-8.4` is the 8.4.11-11 release tarball (glibc 2.35, minimal) and
+     `ps-9.7` a RelWithDebInfo build of the `9.7` branch made by
+     `~/ws/ps-9.7-build.sh` and installed in `~/ws/dist/percona-server-9.7`
+     (it has the HNSW vector indexes the `vector_index` kind of
+     `pull_variety_test.py` needs), recorded as `qa-ps-8.4` / `qa-ps-9.7`.
+     A label whose distribution is missing is skipped with a log line.
      `QA_ROTATION_DAY` overrides the day (`1`-`7`, a comma list such as
      `2,4`, `all` or `none`), e.g. to try Tuesday's set now:
      `QA_ROTATION_DAY=2 STAGES=qa OUT_DIR=~/ws/qa/nightly-try ~/ws/nightly/run_nightly.sh`.

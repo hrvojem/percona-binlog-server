@@ -98,20 +98,20 @@ the run's statistics.
 ## Known bug filters and ignored reports
 
 A known crash that almost any input reaches ends nearly every run and hides
-everything else, so the targets treat the inputs that reach it as the clean
-rejection the fix should make them (`known_bug_filters.hpp`); build with
-`-DFUZZ_KEEP_<ticket>` to keep the crash, and remove a filter once its bug is
-fixed:
+everything else. Such a crash used to be filtered in the target: the inputs
+that reach it were treated as the clean rejection the fix should make them,
+and the filter was removed once the bug was fixed. None is in place now. The
+last two were removed with the merge of upstream's fix of PBS-68 and PBS-112
+(`dd136e5`, 2026-11-06):
 
 - **PBS-68** (ticket 1): a FORMAT_DESCRIPTION whose server version is not
-  `major.minor.patch` ends the process. In the first 30-minute run it
+  `major.minor.patch` ended the process. In the first 30-minute run it
   accounted for all 26,205 crashes of `event_stream_fuzzer` (seven variants:
   each version component missing or not numeric, or more than three).
-  Filtered in `event_stream_fuzzer` and `stored_binlog_fuzzer`.
+  It was filtered in `event_stream_fuzzer` and `stored_binlog_fuzzer`.
 - **PBS-112** (ticket 39): an event header with an invalid type code where the
   `pull` sender expects one (a dump position inside an event, corrupted
-  stored data) ends the process. Filtered in `stored_binlog_fuzzer`, which
-  only dumps from positions on the chain of events.
+  stored data) ended the process. It was filtered in `stored_binlog_fuzzer`.
 
 `ubsan_ignorelist.txt` (`-fsanitize-ignorelist`) silences a report in
 third-party code: Boost 1.90's `lexical_cast<unsigned short>` computes a digit

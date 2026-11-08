@@ -4,7 +4,6 @@
 # <test> is the test name (every combination of it) or <test>/<combination>.
 # A failure listed here is reported as known; any other failure is NEW.
 # Remove a line once its bug is fixed.
-* fde_invalid_server_version  ticket 1 (PBS-68): bad FDE server version terminates the utility
 * search_by_gtid_set_gno_range  ticket 3: gtid_set GNO bounds
 8.4 gtid_tagged_log_oversized_tag  ticket 5: oversized GTID tag in a GTID_TAGGED_LOG event
 9.7 gtid_tagged_log_oversized_tag  ticket 5: oversized GTID tag in a GTID_TAGGED_LOG event
@@ -15,7 +14,6 @@
 * gtid_resume_after_rotation  ticket 14: GTID-mode resume after a rotation misses the closing ROTATE and empty binlogs
 * rs_source_killed_after_rotation  ticket 6: closing a binlog mid-transaction keeps the dropped events' timestamps (pull aborts at storage.cpp:138 after the source is killed right after a rotation)
 * rs_position_based_replica_gtid_source  ticket 30 (PBS-102): a position-mode PBS of a GTID source reports GTID_MODE = OFF, so no replica can follow it
-* rs_misaligned_dump_position  ticket 39 (PBS-112): a dump from a position inside an event terminates pull (std::terminate from a noexcept indexed_event_block accessor)
 * fetch_ssl_disabled_caching_sha2  ticket 23: fetch cannot authenticate without SSL as a caching_sha2_password user (no MYSQL_OPT_GET_SERVER_PUBLIC_KEY)
 # the test leaves SOURCE_SSL at its default, which a 9.7 replica takes as
 # 'SSL required'; the replica never connects to pull's (TLS-less) listener,

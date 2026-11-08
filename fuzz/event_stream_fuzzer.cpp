@@ -22,20 +22,12 @@
 // reader_context::process_event_view(), then the materialized event, printed.
 // A rejection is a std::exception, on which the collector stops cleanly; a
 // crash, a std::terminate or a sanitizer report is a bug.
-//
-// Known bug filter (known_bug_filters.hpp): a FORMAT_DESCRIPTION whose server
-// version is not major.minor.patch ends the process (ticket 1 / PBS-68); left
-// in, it ended nearly every run, so such an event ends the stream like the
-// clean rejection the fix should make it (-DFUZZ_KEEP_PBS_68 keeps the
-// crash).
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <sstream>
-
-#include "known_bug_filters.hpp"
 
 #include "binsrv/replication_mode_type.hpp"
 
@@ -97,12 +89,6 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *data,
       const auto event_size{next_event_size(rest)};
       const auto portion{rest.subspan(0U, event_size)};
       rest = rest.subspan(event_size);
-#ifndef FUZZ_KEEP_PBS_68
-      if (fuzz_filters::has_unparsable_server_version(portion)) {
-        break;
-      }
-#endif
-
       const binsrv::events::event_view event_v{context, portion};
       std::ostringstream printed;
       printed << event_v;

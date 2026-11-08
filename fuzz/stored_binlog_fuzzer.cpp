@@ -25,12 +25,6 @@
 // switch to the next binlog). A crash, a std::terminate or a sanitizer report
 // is a bug.
 //
-// Known bug filters (known_bug_filters.hpp): a FORMAT_DESCRIPTION with an
-// unparsable server version (PBS-68), and an event header with an invalid
-// type code on the chain of events the sender walks (PBS-112, which a
-// position inside an event or corrupted data reaches); the input then counts
-// as rejected. -DFUZZ_KEEP_PBS_68 / -DFUZZ_KEEP_PBS_112 keep the crashes.
-//
 // Each input gets a fresh storage in a directory under $TMPDIR (default
 // /dev/shm, a RAM disk), removed when the process ends.
 
@@ -42,13 +36,10 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
-#include <optional>
 #include <string>
 #include <system_error>
 #include <unistd.h>
 #include <vector>
-
-#include "known_bug_filters.hpp"
 
 #include "binsrv/main_config.hpp"
 #include "binsrv/null_logger.hpp"
@@ -149,24 +140,12 @@ private:
 }
 
 // the offsets (in the stored data, after the magic) of the events chained by
-// their event_size fields, up to the end or the first size that does not fit;
-// std::nullopt when a header on the chain trips a known bug filter
-[[nodiscard]] std::optional<std::vector<std::size_t>>
+// their event_size fields, up to the end or the first size that does not fit
+[[nodiscard]] std::vector<std::size_t>
 event_chain(util::const_byte_span data) {
   std::vector<std::size_t> offsets;
   std::size_t offset{0U};
   while (std::size(data) - offset >= header::size_in_bytes) {
-    const auto event{data.subspan(offset)};
-#ifndef FUZZ_KEEP_PBS_112
-    if (fuzz_filters::has_invalid_type_code(event)) {
-      return std::nullopt;
-    }
-#endif
-#ifndef FUZZ_KEEP_PBS_68
-    if (fuzz_filters::has_unparsable_server_version(event)) {
-      return std::nullopt;
-    }
-#endif
     offsets.push_back(offset);
     const auto size{read_event_size(data, offset)};
     if (size < header::size_in_bytes || size > std::size(data) - offset) {
@@ -199,12 +178,9 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *input,
       size - selector_size};
 
   const auto chain{event_chain(data)};
-  if (!chain.has_value()) {
-    return 0;
-  }
   std::uint64_t position{binsrv::events::magic_binlog_offset};
-  if (from_position && !chain->empty()) {
-    position += (*chain)[boundary_choice % std::size(*chain)];
+  if (from_position && !chain.empty()) {
+    position += chain[boundary_choice % std::size(chain)];
   }
 
   auto &space{get_workspace()};

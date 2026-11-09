@@ -764,7 +764,7 @@ server rather than starting one.
   listing shows. Now `MySQLServer` and `BinlogServer` of the harness module
   (`fetch_crash_test.py`) stop any process whose command line names a path
   in their work directory when they are created
-  (`stop_leftover_processes`), leaving the run's own processes and their
+  (`stop_leftover_processes` in `leftovers.py`), leaving the run's own processes and their
   ancestors alone. `nightly_stages.py` does the same before it deletes a
   harness's workdir and after the harness exits. The harness's log notes
   each process it stopped.

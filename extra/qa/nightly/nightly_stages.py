@@ -668,12 +668,12 @@ def sanitizer_reports(directory: Path) -> list:
 
 def stop_leftovers(args, workdir: Path) -> list:
     """Stops what an earlier or a timed-out run left running in 'workdir'
-    (fetch_crash_test.stop_leftover_processes, which the harnesses also call
-    when they start), before its files are deleted under it; returns the
-    command lines stopped."""
+    (leftovers.stop_leftover_processes, which the harnesses also call when
+    they start), before its files are deleted under it; returns the command
+    lines stopped."""
     sys.path.insert(0, str(Path(args.qa_dir)))
     try:
-        from fetch_crash_test import stop_leftover_processes
+        from leftovers import stop_leftover_processes
     finally:
         sys.path.pop(0)
     return stop_leftover_processes(workdir)

@@ -666,11 +666,25 @@ def sanitizer_reports(directory: Path) -> list:
     return reports
 
 
+def stop_leftovers(args, workdir: Path) -> list:
+    """Stops what an earlier or a timed-out run left running in 'workdir'
+    (fetch_crash_test.stop_leftover_processes, which the harnesses also call
+    when they start), before its files are deleted under it; returns the
+    command lines stopped."""
+    sys.path.insert(0, str(Path(args.qa_dir)))
+    try:
+        from fetch_crash_test import stop_leftover_processes
+    finally:
+        sys.path.pop(0)
+    return stop_leftover_processes(workdir)
+
+
 def run_qa(args) -> int:
     recorder = Recorder(args, args.config or f"qa-{args.series}",
                         args.harness, args.harness + "/")
     known = read_known(Path(args.known))
     workdir = Path(args.workdir)
+    stop_leftovers(args, workdir)
     shutil.rmtree(workdir, ignore_errors=True)
     workdir.mkdir(parents=True)
     problem = precondition_failure(args)
@@ -713,6 +727,10 @@ def run_qa(args) -> int:
                 proxy.kill()
                 proxy.wait()
     seconds = time.time() - started
+    # the process group is gone; anything that left it (a server started in
+    # its own session) still runs from the workdir, which is deleted below
+    for line in stop_leftovers(args, workdir):
+        output += f"\nstopped a process the harness left running: {line}\n"
     reports = sanitizer_reports(reports_dir)
     log_text = " ".join(command) + "\n\n" + output + "".join(
         "\n" + text for _, _, text in reports)

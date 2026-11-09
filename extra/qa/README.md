@@ -747,6 +747,27 @@ server rather than starting one.
   ```sh
   STAGES="mtr qa" OUT_DIR=~/ws/qa/nightly-try ~/ws/nightly/run_nightly.sh
   ```
+
+  `STAGES=rotation` runs only the QA rotation (part of `qa`).
+
+  Before building, the run checks the free space on `~/ws`. With less than
+  `MIN_FREE_GB` (default 10) it builds and tests nothing and records one
+  build failure, `NOT ENOUGH DISK`, naming the free space, the largest
+  directories and any process holding more than 1 GB of deleted files. From
+  2026-11-07 to 2026-11-09 a full disk instead showed up as every build
+  failing.
+
+  Servers left running are stopped before their files are deleted. A
+  harness killed by a timeout used to leave its servers running, and a
+  `mysqld` whose data directory was then deleted logged InnoDB errors in a
+  loop into its deleted error log (99 GB in three days), which no file
+  listing shows. Now `MySQLServer` and `BinlogServer` of the harness module
+  (`fetch_crash_test.py`) stop any process whose command line names a path
+  in their work directory when they are created
+  (`stop_leftover_processes`), leaving the run's own processes and their
+  ancestors alone. `nightly_stages.py` does the same before it deletes a
+  harness's workdir and after the harness exits. The harness's log notes
+  each process it stopped.
 - **`nightly_stages.py`** — runs one MTR suite, one QA harness, one fuzz
   target or the mutation testing for `run_nightly.sh`, parses its outcome
   into cases, matches them against the stage's known-failure list and

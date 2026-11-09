@@ -135,6 +135,9 @@ QA_FUZZ_CONNECTIONS=${QA_FUZZ_CONNECTIONS:-600}
 QA_SOAK_SECONDS=${QA_SOAK_SECONDS:-7200}
 # release stage: one short fetch_crash_test run with the release binary
 RELEASE_QA_EXAMPLES=${RELEASE_QA_EXAMPLES:-5}
+# below this much free space (GB) on $WS the run builds and tests nothing and
+# reports why (a full disk otherwise shows up as every build failing)
+MIN_FREE_GB=${MIN_FREE_GB:-10}
 export PYTHONPATH=${PYTHONPATH:-$WS/qa/pylib}
 want() { [[ "$STAGES" == *" $1 "* ]]; }
 
@@ -318,6 +321,28 @@ results=()
 : > "$stage_lines"
 # builds that failed tonight (the later stages skip what needs them)
 declare -A build_failed
+
+# enough disk for the night? From 2026-11-07 to -09 every build failed on a
+# full disk: a mysqld left running by a timed-out harness logged errors in a
+# loop into a deleted error log (99 GB), which no file listing shows
+free_gb=$(df --output=avail -BG "$WS" | tail -1 | tr -dc 0-9)
+if [ "${free_gb:-0}" -lt "$MIN_FREE_GB" ]; then
+  # space held by deleted files that processes still have open
+  held=$(find /proc/[0-9]*/fd -lname '* (deleted)' -printf '%p\n' 2>/dev/null |
+    while read -r fd; do stat -L -c '%s %n' "$fd" 2>/dev/null; done |
+    awk '{split($2, part, "/"); size[part[3]] += $1}
+         END {for (pid in size) if (size[pid] > 1e9)
+                printf "pid %s %.1f GB; ", pid, size[pid] / 1e9}')
+  reason="${free_gb} GB free on $WS, $MIN_FREE_GB GB needed (MIN_FREE_GB)"
+  [ -n "$held" ] && reason="$reason; held by deleted open files: $held"
+  log "NOT ENOUGH DISK: $reason"
+  log "largest under $WS: $(du -xsh "$WS"/* 2>/dev/null | sort -rh | head -5 | tr '\n\t' '; ')"
+  results+=("NOT ENOUGH DISK  $reason")
+  record disk "" "free-space" "build-failed" "" "$reason" 0 >> "$results_file"
+  broken=$((broken + 1))
+  # nothing else runs tonight
+  STAGES=" "
+fi
 
 cpp_configs=()
 want cpp && cpp_configs+=(debug_gcc14 asan_gcc14 tsan_gcc14)

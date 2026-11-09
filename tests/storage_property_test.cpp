@@ -3150,6 +3150,22 @@ public:
                   ", expected the missing KEK to be reported");
       return;
     }
+    // a random change inside the KEK the binlog's metadata names (rare, but
+    // a one-bit change of its first letter does it) is the same
+    // configuration error
+    const bool damage_renamed_kek{
+        metadata && settings_.encryption.has_value() &&
+        copy->exists(target_name) &&
+        read_text(*copy, target_name)
+                .find('"' + settings_.encryption->kek_id + '"') ==
+            std::string::npos};
+    if (damage_renamed_kek && !queried.records.has_value()) {
+      require(names_keyring_error(queried.error),
+              description + ": opening for queries failed without naming "
+                            "the keyring: " +
+                  queried.error);
+      return;
+    }
     require(queried.records.has_value(),
             description + ": opening for queries failed: " + queried.error);
     for (const auto &record : reference) {

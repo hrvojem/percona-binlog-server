@@ -69,6 +69,7 @@
 
 #include "heartbeat_test_helpers.hpp"
 #include "property_test_helpers.hpp"
+#include "sender_test_helpers.hpp"
 
 #include "operations/event_generation_helpers.hpp"
 #include "binsrv/basic_storage_backend.hpp"
@@ -368,7 +369,7 @@ struct stream_outcome {
     // an error is an exception; 'waiting' (and an empty event) once no
     // more data is stored
     try {
-      if (reader.get_event(event) !=
+      if (sender_test::get_validated_event(reader, event) !=
           operations::event_fetching_result_type::success) {
         event = {};
       }

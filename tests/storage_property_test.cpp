@@ -138,6 +138,7 @@
 
 #include "heartbeat_test_helpers.hpp"
 #include "property_test_helpers.hpp"
+#include "sender_test_helpers.hpp"
 
 #include "binsrv/basic_storage_backend.hpp"
 #include "binsrv/main_config.hpp"
@@ -1112,7 +1113,7 @@ void read_until_end(operations::sender_context &reader, event_list &received,
     // an error is an exception; 'waiting' (and an empty event) once no more
     // data is stored
     try {
-      if (reader.get_event(event) !=
+      if (sender_test::get_validated_event(reader, event) !=
           operations::event_fetching_result_type::success) {
         event = {};
       }
@@ -1904,7 +1905,7 @@ void read_concurrently(const std::stop_token &stop,
     while (true) {
       // an error is an exception (reported below); 'waiting' (and an empty
       // event) once no more data is stored
-      if (reader.get_event(event) !=
+      if (sender_test::get_validated_event(reader, event) !=
           operations::event_fetching_result_type::success) {
         event = {};
       }

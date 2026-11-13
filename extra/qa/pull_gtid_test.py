@@ -34,8 +34,11 @@ SOURCE_AUTO_POSITION=1. Cases (one JSON line each):
              (the replica lacks GTIDs the source no longer has) instead of
              streaming what is left;
   ahead      a replica that has a GTID of the source's UUID beyond anything
-             the source wrote connects: as a MySQL source does, pull refuses
-             it with ER 1236 (the replica has more GTIDs than the source).
+             the source wrote connects: unlike a MySQL source, pull accepts
+             it and waits (PBS-120: PBS never originates transactions, so a
+             replica ahead of it is treated as one ahead of a lagging
+             intermediate replica), and a transaction the source writes next
+             reaches it.
 
 Uses the helpers of fetch_crash_test.py and pull_replica_test.py. Example:
 
@@ -188,8 +191,8 @@ def run(args) -> list:
 
         # ahead: a GTID of the source's UUID the source never wrote
         source_uuid = source.sql("SELECT @@GLOBAL.SERVER_UUID").strip()
-        # it has everything the source wrote, so that only being ahead can
-        # be refused
+        # it has everything the source wrote, so that it differs from the
+        # source only by being ahead
         replication.replicate_from_pull(
             replica, pull_port, True, "SOURCE_AUTO_POSITION=1",
             f"SET GLOBAL GTID_PURGED='{source_executed}'; "
@@ -197,9 +200,25 @@ def run(args) -> list:
             "SET GTID_NEXT='AUTOMATIC';")
         state = wait_refusal(replica)
         refused = refusal(state)
+        # accepted (no error, the I/O thread is connected) and still served:
+        # the source's next transaction reaches the replica
+        source.sql("CREATE DATABASE IF NOT EXISTS pull_gtid_ahead")
+        source_after = source.sql(
+            "SELECT @@GLOBAL.GTID_EXECUTED").strip().replace("\\n", "")
+        deadline = time.monotonic() + CATCH_UP_SECONDS
+        received_next = False
+        while time.monotonic() < deadline and not received_next:
+            received_next = replica.sql(
+                f"SELECT GTID_SUBSET('{source_after}', "
+                "@@GLOBAL.GTID_EXECUTED)").strip() == "1"
+            if not received_next:
+                time.sleep(1)
         results["ahead"].update(io_state=state,
                                 source_gtid_executed=source_executed,
-                                ok=refused)
+                                received_next=received_next,
+                                ok=not refused and len(state) > 1 and
+                                state[0] == "ON" and
+                                state[1] in ("", "0") and received_next)
         replica.sql("STOP REPLICA")
     finally:
         if pull is not None and pull.poll() is None:

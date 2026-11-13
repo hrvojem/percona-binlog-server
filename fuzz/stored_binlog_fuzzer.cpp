@@ -219,6 +219,13 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *input,
         position,
         binsrv::gtids::gtid_set{},
         session_checksum};
+    // since PBS-120 a dump is validated before its first event, as
+    // network_service does; a refused dump (or a storage without binlogs)
+    // streams nothing
+    if (reader.check_for_non_empty_and_validate() !=
+        operations::sender_context_check_result_type::ready) {
+      return 0;
+    }
     util::const_byte_span event{};
     for (std::size_t count{0U}; count < max_events; ++count) {
       if (reader.get_event(event) !=

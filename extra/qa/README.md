@@ -331,13 +331,14 @@ it must still end with the source's data and GTID_EXECUTED. `purged`: `pull`
 is stopped, `purge_binlogs` removes the older half of its binlogs (nothing
 else uses the storage, see PBS-75), `pull` is restarted and a replica with
 an empty GTID set connects. `ahead`: a replica holding every GTID the
-source wrote plus one of its UUID beyond them (`:1000000`) connects. In both
-of the last two cases a MySQL source refuses the replica with ER 1236 (the
-replica reports 13114). On 2026-10-29 the first two pass; `pull` accepts
-both of the others (ticket 20, PBS-120): the purged replica is silently streamed
-what is left (transactions 80-104 of 1-104, so its SQL thread fails on a
-missing table), the replica that is ahead waits for transactions that
-never come. The nightly runs it every night (`QA_PORT`+230, about 3 min).
+source wrote plus one of its UUID beyond them (`:1000000`) connects. Since
+PBS-120 (1659166) the purged replica is refused with ER 1236 as a MySQL
+source does (the replica reports 13114, 'the source purged required binary
+logs'). The replica that is ahead is accepted by design (PBS never
+originates transactions, so its own UUID never appears in a GTID): the case
+expects its I/O thread to stay up with no error and to receive the next
+transaction the source writes. Before PBS-120 (ticket 20) the purged replica
+was silently streamed what was left. The nightly runs it every night (`QA_PORT`+230, about 3 min).
 
 `pull_gtid_set_test.py` checks where `pull` starts an auto-positioned dump
 (PBS-29 part 3) for replicas with uneven GTID sets. The source writes six
@@ -809,8 +810,6 @@ server rather than starting one.
   `pull_soak_test position/log` (ticket 45, PBS-118: info-level log volume),
   `pull_tls_test position/plain_refused_when_required` (ticket 48: no error
   packet for a plain client under `require_secure_transport`),
-  `pull_gtid_test gtid/purged` and `gtid/ahead` (ticket 20, PBS-120: no ER 1236 for
-  a replica lacking purged GTIDs or ahead of the source),
   `telemetry_test position/settings_in_storage` (ticket 50:
   `local_settings_path` in the storage directory). GTID-mode
   `fetch_crash_test` runs pass `--tolerate-ticket-14`: they accept only
@@ -881,8 +880,8 @@ idle dump reports, ticket 40, and in a GTID-mode storage the auto-positioned
 start at the first binlog holding a GTID the replica lacks, PBS-29 part 3) and `replication_source_property_test` (the
 real `pull` listener in-process with a test client: handshake statements,
 authentication, dump positions, heartbeat timing, and `COM_BINLOG_DUMP_GTID`,
-written ahead of PBS-29 part 2; since part 2 it fails only on a replica that
-lacks purged GTIDs, ticket 20, PBS-120).
+written ahead of PBS-29 part 2; it passes since PBS-120, which refuses a
+replica that lacks purged GTIDs with ER 1236, ticket 20).
 Since PBS-41 every configuration these tests write has an
 `instance.local_settings_path` (a directory in the test's scratch tree).
 `storage_property_test`'s concurrent property runs a second reader that

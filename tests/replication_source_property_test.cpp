@@ -555,6 +555,12 @@ private:
     for (binsrv::gtids::gno_t gno{1U}; gno < layout.first_gno; ++gno) {
       previous.add(stored_uuid, binsrv::gtids::tag{}, gno);
     }
+    // as 'fetch'/'pull' do for an empty storage (from the server's
+    // @@GLOBAL.gtid_purged): the storage does not parse the
+    // PREVIOUS_GTIDS_LOG it stores, and the replication source checks a
+    // replica against the purged GTIDs recorded in the storage's metadata
+    // (PBS-120)
+    storage_->set_purged_gtids(previous);
     auto gno{layout.first_gno};
     std::uint64_t xid{1U};
     for (std::size_t index{0U};
@@ -2440,19 +2446,24 @@ BOOST_AUTO_TEST_CASE(ReplicationSourceLogsDisconnectsAsRoutine) {
   });
 }
 
-// a COM_BINLOG_DUMP the sender cannot serve (a binlog name that is not
-// stored, or not a binlog name at all) ends that session with the reason in
-// the log ("exception caught in session ..."), and the listener goes on
-// accepting connections
+// a COM_BINLOG_DUMP the sender cannot serve ends that session with the reason
+// in the log, and the listener goes on accepting connections: a binlog name
+// that is not stored is refused, as MySQL does, with ER 1236 "Could not find
+// first log file name in binary log index file" (PBS-120), and a string that
+// is not a binlog name at all ends the session with an exception ("exception
+// caught in session ...")
 BOOST_AUTO_TEST_CASE(ReplicationSourceLogsAFailedDumpAndKeepsListening) {
   const source_settings settings{.gtid_mode = false,
                                  .server_id = 142U,
                                  .server_uuid =
                                      "00000000-0000-0000-0000-00000000008e"};
+  static constexpr std::uint16_t er_source_fatal_error_reading_binlog{1236U};
   for (const std::string binlog : {"binlog.000099", "not-a-binlog-name"}) {
+    const bool refused{binlog == "binlog.000099"};
     const auto logger{std::make_shared<capturing_logger>()};
     const replication_source source{settings, nullptr, logger};
     const std::string label{"a dump of '" + binlog + "'"};
+    reply dump_reply{};
     {
       mysql_client client{source.port()};
       client.authenticate(replica_user, replica_password);
@@ -2466,15 +2477,33 @@ BOOST_AUTO_TEST_CASE(ReplicationSourceLogsAFailedDumpAndKeepsListening) {
                                          .statement = {},
                                          .dump_binlog = binlog},
                                         client.capabilities()));
-      static_cast<void>(client.read_dump_reply());
+      dump_reply = client.read_dump_reply();
     }
-    const auto log{wait_for_session_end(*logger, std::chrono::seconds{10})};
-    const auto end{session_end_line(*logger)};
-    BOOST_TEST_INFO(label << ", listener log:" << log);
-    BOOST_REQUIRE(end.has_value());
-    BOOST_TEST_INFO(label << ", listener log:" << log);
-    BOOST_CHECK(end->find("exception caught in session ") !=
-                std::string::npos);
+    if (refused) {
+      BOOST_TEST_INFO(label << ": " << dump_reply);
+      BOOST_CHECK(dump_reply.kind == reply_kind::error &&
+                  dump_reply.error_code ==
+                      er_source_fatal_error_reading_binlog);
+      // the refusal is sent before the reply is read, so it is logged by now
+      std::string log;
+      bool logged{false};
+      for (const auto &line : logger->lines()) {
+        log += "\n  " + line;
+        logged = logged ||
+                 line.find("net    : sent server error (binlog requested by "
+                           "the replica does not exist)") != std::string::npos;
+      }
+      BOOST_TEST_INFO(label << ", listener log:" << log);
+      BOOST_CHECK(logged);
+    } else {
+      const auto log{wait_for_session_end(*logger, std::chrono::seconds{10})};
+      const auto end{session_end_line(*logger)};
+      BOOST_TEST_INFO(label << ", listener log:" << log);
+      BOOST_REQUIRE(end.has_value());
+      BOOST_TEST_INFO(label << ", listener log:" << log);
+      BOOST_CHECK(end->find("exception caught in session ") !=
+                  std::string::npos);
+    }
 
     mysql_client next{source.port()};
     next.authenticate(replica_user, replica_password);

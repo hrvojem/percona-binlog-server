@@ -2484,14 +2484,26 @@ BOOST_AUTO_TEST_CASE(ReplicationSourceLogsAFailedDumpAndKeepsListening) {
       BOOST_CHECK(dump_reply.kind == reply_kind::error &&
                   dump_reply.error_code ==
                       er_source_fatal_error_reading_binlog);
-      // the refusal is sent before the reply is read, so it is logged by now
+      // the listener logs the refusal once its write has completed, which
+      // may be after the client has read it
+      const auto refusal_logged{[&logger] {
+        for (const auto &line : logger->lines()) {
+          if (line.find("net    : sent server error (binlog requested by "
+                        "the replica does not exist)") != std::string::npos) {
+            return true;
+          }
+        }
+        return false;
+      }};
+      const auto deadline{std::chrono::steady_clock::now() +
+                          std::chrono::seconds{10}};
+      while (!refusal_logged() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+      }
+      const bool logged{refusal_logged()};
       std::string log;
-      bool logged{false};
       for (const auto &line : logger->lines()) {
         log += "\n  " + line;
-        logged = logged ||
-                 line.find("net    : sent server error (binlog requested by "
-                           "the replica does not exist)") != std::string::npos;
       }
       BOOST_TEST_INFO(label << ", listener log:" << log);
       BOOST_CHECK(logged);

@@ -25,7 +25,6 @@
 #include <string>
 #include <vector>
 
-#include <boost/crc.hpp>
 
 #include "binsrv/events/code_type.hpp"
 #include "binsrv/events/common_header_flag_type.hpp"
@@ -38,6 +37,7 @@
 #include "binsrv/events/rotate_post_header_impl.hpp"
 
 #include "util/byte_span.hpp"
+#include "util/crc_helpers.hpp"
 
 namespace heartbeat_testing {
 
@@ -160,15 +160,14 @@ heartbeat_error(const std::vector<std::byte> &heartbeat,
   }
   const auto body_end{std::size(heartbeat) - footer};
   if (with_checksum) {
-    boost::crc_32_type crc;
-    crc.process_bytes(std::data(heartbeat), body_end);
     std::uint32_t stored{0U};
     for (std::size_t index{0U}; index < footer_size; ++index) {
       stored |= static_cast<std::uint32_t>(
                     std::to_integer<unsigned char>(heartbeat[body_end + index]))
                 << (8U * index);
     }
-    if (stored != crc.checksum()) {
+    if (stored != util::calculate_crc32(
+                      util::const_byte_span{heartbeat}.subspan(0U, body_end))) {
       return "the heartbeat for " + expected + " has a wrong CRC32 footer";
     }
   }

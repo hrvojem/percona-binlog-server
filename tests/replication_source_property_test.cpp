@@ -81,7 +81,6 @@
 
 #include <boost/system/system_error.hpp>
 
-#include <boost/crc.hpp>
 
 // needed for 'digest_storage'
 #include <boost/container/static_vector.hpp> // IWYU pragma: keep
@@ -154,6 +153,7 @@
 #include "opensslpp/digest_context_fwd.hpp"
 
 #include "util/byte_span.hpp"
+#include "util/crc_helpers.hpp"
 #include "util/ctime_timestamp.hpp"
 #include "util/semantic_version.hpp"
 
@@ -347,9 +347,10 @@ make_xid_event(std::uint64_t offset, std::uint32_t event_server_id,
                     4U);
   put_little_endian(result, header::flags_offset, 0U, 2U);
   put_little_endian(result, header::size_in_bytes, xid, xid_size);
-  boost::crc_32_type crc;
-  crc.process_bytes(std::data(result), size - footer_size);
-  put_little_endian(result, size - footer_size, crc.checksum(), footer_size);
+  put_little_endian(result, size - footer_size,
+                    util::calculate_crc32(util::const_byte_span{result}.subspan(
+                        0U, size - footer_size)),
+                    footer_size);
   return result;
 }
 

@@ -235,7 +235,7 @@ afterwards. `oversized_headers` sends 150 frame headers announcing almost
 `header_drip` check that the per-frame read timeout ends a slowly fed
 session. On 2026-11-16 (`pbt-init` @ `23ef45c`, debug build) the last three
 pass (memory grew 2.4 MB for 150 connections; the drip was closed at exactly
-`read_timeout`) and `idle_flood` fails (ticket 55): `accept()` fails with
+`read_timeout`) and `idle_flood` fails (ticket 55, PBS-128): `accept()` fails with
 EMFILE, `handle_exception("listener")` ends the accept loop, and `pull`
 stays up without a listener for good.
 

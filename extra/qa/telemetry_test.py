@@ -33,6 +33,11 @@ report as 'effective' and the clamping cases check; reports therefore come
                        '.tmp' left, exactly the fields db_instance_id (the
                        instance_id file), pillar_version and a growing
                        uptime;
+  no_network_egress    grace 20s, scrape 10s, under strace: every outbound
+                       connect() goes to the MySQL source, none elsewhere
+                       and no DNS lookup (PBS sends no telemetry itself),
+                       and no report holds the host name, a password, a
+                       user name or the storage path;
   scrape_zero          grace and scrape_interval 0: clamped to 20 s and
                        10 s (logged), so 2 to 4 reports in 45 s, not a
                        tight loop (ticket 49, fixed by PBS-122);
@@ -119,6 +124,8 @@ import json
 import os
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import time
@@ -212,7 +219,8 @@ class Pull:
 
     def __init__(self, binsrv, port: int, telemetry: dict,
                  local_settings: "Path | None" = None, server_id: int = 4242,
-                 extra_environment: "dict | None" = None):
+                 extra_environment: "dict | None" = None,
+                 command_prefix: "list | None" = None):
         self.binsrv = binsrv
         self.port = port
         binsrv.read_timeout = SOURCE_READ_TIMEOUT
@@ -234,6 +242,7 @@ class Pull:
             config["instance"]["local_settings_path"] = str(local_settings)
         binsrv.config_path.write_text(json.dumps(config, indent=2))
         self.process = subprocess.Popen(
+            (command_prefix or []) +
             [str(binsrv.binary), "pull", str(binsrv.config_path)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=dict(environment(), **(extra_environment or {})))
@@ -366,6 +375,78 @@ class Cases:
                 "effective": run["effective"],
                 "alive": run["alive"], "serves": run["serves"],
                 "ok": not wrong and run["serves"]}
+
+    def no_network_egress(self) -> dict:
+        """'pull' with telemetry on (grace 20s, scrape 10s) runs under strace
+        past two reports: every outbound connection it makes goes to the
+        MySQL source (127.0.0.1:<source port>), none to another address and
+        no DNS lookup (telemetry is written to a local directory for the
+        Percona telemetry agent, PBS sends nothing itself), and no report
+        holds the host name, a password, a user name or the storage path."""
+        binsrv = self.binsrv("no_network_egress")
+        binsrv.telemetry.mkdir(parents=True, exist_ok=True)
+        trace = binsrv.workdir / "connect.strace"
+        pull = Pull(binsrv, self.port(),
+                    {"path": str(binsrv.telemetry), "grace_interval": "20s",
+                     "scrape_interval": "10s",
+                     "history_keep_interval": "1h"},
+                    command_prefix=["strace", "-f", "-qq", "-e",
+                                    "trace=connect", "-o", str(trace)])
+        time.sleep(REPORT_SECONDS)
+        serves = pull.alive() and streams_binlogs(pull.port)
+        alive = pull.alive()
+        # SIGTERM to strace would only detach it and leave 'pull' running:
+        # stop the traced 'pull' first, then strace exits on its own
+        children = subprocess.run(
+            ["pgrep", "-P", str(pull.process.pid)], capture_output=True,
+            text=True, check=False).stdout.split()
+        for child in children:
+            try:
+                os.kill(int(child), signal.SIGTERM)
+            except OSError:
+                pass
+        try:
+            pull.process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pull.stop()
+        destinations = set()
+        for line in trace.read_text(errors="replace").splitlines():
+            if "connect(" not in line:
+                continue
+            family = re.search(r"sa_family=(AF_[A-Z0-9]+)", line)
+            port = re.search(r"sin6?_port=htons\((\d+)\)", line)
+            address = (re.search(r'inet_addr\("([^"]+)"\)', line) or
+                       re.search(r'inet_pton\(AF_INET6, "([^"]+)"', line) or
+                       re.search(r'sun_path="([^"]+)"', line))
+            destinations.add((family.group(1) if family else "?",
+                              address.group(1) if address else "?",
+                              int(port.group(1)) if port else None))
+        source = ("AF_INET", "127.0.0.1", self.args.port)
+        unexpected = sorted(
+            f"{family} {address}{'' if port is None else f':{port}'}"
+            for family, address, port in destinations
+            if (family, address, port) != source and
+            family not in ("AF_UNIX", "AF_NETLINK", "AF_UNSPEC"))
+        dns = sorted(f"{family} {address}:{port}"
+                     for family, address, port in destinations if port == 53)
+        found = reports(binsrv.telemetry)
+        secrets = {"host name": socket.gethostname(),
+                   "replication password": harness.REPLICATION_PASSWORD,
+                   "replication user": harness.REPLICATION_USER,
+                   "pull password": replication.PULL_PASSWORD,
+                   "storage path": str(binsrv.storage)}
+        leaked = sorted({what for _, _, path in found
+                         for what, secret in secrets.items()
+                         if secret and secret in path.read_text()})
+        return {"connections": sorted(
+                    f"{family} {address}{'' if port is None else f':{port}'}"
+                    for family, address, port in destinations),
+                "unexpected": unexpected, "dns": dns,
+                "reports": len(found), "leaked": leaked,
+                "alive": alive, "serves": serves,
+                "ok": (not unexpected and not dns and not leaked and
+                       len(found) >= 1 and serves and
+                       source in destinations)}
 
     def clamped(self, name: str, telemetry: dict, seconds: int,
                 expected: dict, writes: range) -> dict:
@@ -746,7 +827,7 @@ class Cases:
         return result
 
 
-PULL_CASES = ["reports", "scrape_zero", "scrape_negative", "scrape_huge",
+PULL_CASES = ["reports", "no_network_egress", "scrape_zero", "scrape_negative", "scrape_huge",
               "grace_huge", "path_is_file", "path_unwritable",
               "cleanup_odd_names", "shared_directory", "settings_in_storage",
               "damaged_id"]

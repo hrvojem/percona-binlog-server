@@ -134,6 +134,8 @@
 
 #include <boost/test/unit_test_suite.hpp>
 
+#include <boost/json.hpp>
+
 #include <hegel/hegel.h>
 
 #include "heartbeat_test_helpers.hpp"
@@ -3987,6 +3989,67 @@ tamper_event_bytes(std::size_t payload_size, std::uint64_t seed,
                        bytes.subspan(0U, std::size(event) - footer));
 }
 
+// writes a FORMAT_DESCRIPTION announcing CRC32, a PREVIOUS_GTIDS_LOG and
+// one event of each payload size, each with a valid CRC32, to the open
+// binlog of 'writer' (which must be empty) and flushes; returns the events
+[[nodiscard]] event_list
+write_crc32_binlog(binsrv::storage &writer,
+                   const std::vector<std::size_t> &payload_sizes,
+                   std::uint64_t seed) {
+  event_list written;
+  std::uint64_t position{binsrv::events::magic_binlog_offset};
+  binsrv::events::event_storage fde;
+  operations::generate_format_description_event_ex(
+      fde, util::semantic_version{8U, 4U, 8U},
+      static_cast<std::uint32_t>(position), 1U,
+      /*enable_checksum_algorithm=*/true, /*artificial=*/false);
+  written.emplace_back(std::cbegin(fde), std::cend(fde));
+  position += std::size(fde);
+  written.push_back(make_previous_gtids_log(position, 1U));
+  position += std::size(written.back());
+  for (const auto payload_size : payload_sizes) {
+    const auto size{binsrv::events::common_header_view_base::size_in_bytes +
+                    payload_size + binsrv::events::default_footer_length};
+    written.push_back(tamper_event_bytes(
+        payload_size, seed++, static_cast<std::uint32_t>(position + size)));
+    position += size;
+  }
+  for (const auto &event : written) {
+    writer.write_event(util::const_byte_span{event},
+                       /*at_transaction_boundary=*/true, binsrv::gtids::gtid{},
+                       util::ctime_timestamp{std::time_t{1}}, 0ULL);
+  }
+  writer.flush_event_buffer();
+  return written;
+}
+
+// opens the storage of 'config' for queries and reads every stored event
+// from the start through sender_context, as 'pull' serves a replica that
+// declares CRC32 (artificial ROTATE events dropped); returns the error if
+// opening or reading failed (empty on success)
+[[nodiscard]] std::string
+read_back_from_start(const std::filesystem::path &config, event_list &received,
+                     std::size_t max_events) {
+  try {
+    const auto storage{make_storage(
+        config, binsrv::storage_construction_mode_type::querying_only)};
+    operations::sender_context reader{
+        std::make_shared<binsrv::null_logger>(),
+        storage,
+        operations::sender_single_file_context::min_allowed_block_size,
+        binsrv::replication_mode_type::position,
+        std::string_view{},
+        binsrv::events::magic_binlog_offset,
+        binsrv::gtids::gtid_set{},
+        /*session_source_binlog_checksum=*/true};
+    read_until_end(reader, received, max_events, "reading back");
+  } catch (const std::exception &e) {
+    return e.what();
+  }
+  strip_artificial_rotates(received);
+  return {};
+}
+
 // AES-CTR encrypts by XOR with a keystream, so XORing a ciphertext byte
 // XORs the same plaintext byte; and CRC32 is affine in its input:
 // crc(m ^ d) = crc(m) ^ crc(d) ^ crc(0) for inputs of equal length. Someone
@@ -4058,62 +4121,29 @@ void run_tampering_property(hegel::TestCase &tc) {
   // opened, as after a rotation
   static constexpr std::size_t preamble_events{2U};
   event_list written;
-  std::vector<std::size_t> event_offsets;
   {
     const auto writer{make_storage(config)};
     require(writer->open_binlog(name) == binsrv::open_binlog_status::created,
             "the binlog was not created");
-    std::uint64_t position{binsrv::events::magic_binlog_offset};
-    binsrv::events::event_storage fde;
-    operations::generate_format_description_event_ex(
-        fde, util::semantic_version{8U, 4U, 8U},
-        static_cast<std::uint32_t>(position), 1U,
-        /*enable_checksum_algorithm=*/true, /*artificial=*/false);
-    written.emplace_back(std::cbegin(fde), std::cend(fde));
-    position += std::size(fde);
-    written.push_back(make_previous_gtids_log(position, 1U));
-    position += std::size(written.back());
-    std::uint64_t seed{7U};
-    for (const auto payload_size : payload_sizes) {
-      const auto size{binsrv::events::common_header_view_base::size_in_bytes +
-                      payload_size + binsrv::events::default_footer_length};
-      event_offsets.push_back(position);
-      written.push_back(tamper_event_bytes(
-          payload_size, seed++, static_cast<std::uint32_t>(position + size)));
-      position += size;
-    }
-    for (const auto &event : written) {
-      writer->write_event(util::const_byte_span{event},
-                          /*at_transaction_boundary=*/true,
-                          binsrv::gtids::gtid{},
-                          util::ctime_timestamp{std::time_t{1}}, 0ULL);
-    }
-    writer->flush_event_buffer();
+    written = write_crc32_binlog(*writer, payload_sizes, 7U);
     writer->close_binlog();
     require(writer->open_binlog(name.next()) ==
                 binsrv::open_binlog_status::created,
             "the second binlog was not created");
   }
+  std::vector<std::size_t> event_offsets;
+  {
+    std::size_t position{binsrv::events::magic_binlog_offset};
+    for (std::size_t index{0U}; index < std::size(written); ++index) {
+      if (index >= preamble_events) {
+        event_offsets.push_back(position);
+      }
+      position += std::size(written[index]);
+    }
+  }
 
   const auto read_back{[&config](event_list &received) -> std::string {
-    const auto storage{make_storage(
-        config, binsrv::storage_construction_mode_type::querying_only)};
-    operations::sender_context reader{
-        std::make_shared<binsrv::null_logger>(),
-        storage,
-        operations::sender_single_file_context::min_allowed_block_size,
-        binsrv::replication_mode_type::position,
-        std::string_view{},
-        binsrv::events::magic_binlog_offset,
-        binsrv::gtids::gtid_set{},
-        /*session_source_binlog_checksum=*/true};
-    try {
-      read_until_end(reader, received, max_events + 8U, "reading back");
-    } catch (const std::exception &e) {
-      return e.what();
-    }
-    strip_artificial_rotates(received);
-    return {};
+    return read_back_from_start(config, received, max_events + 8U);
   }};
 
   // sanity: the untouched binlog reads back as written, and is encrypted
@@ -4183,6 +4213,195 @@ void run_tampering_property(hegel::TestCase &tc) {
   }
   require(tampered == written,
           "the tampered binlog read back a different number of events");
+}
+
+
+// ---------------------------------------------------------------------------
+// downgrading an encrypted storage to plaintext (security catalog property
+// encrypted-storage-never-downgraded)
+// ---------------------------------------------------------------------------
+
+// replaces the JSON object 'name' of 'location' by what 'edit' makes of it
+void edit_json_object(storage_location &location, std::string_view name,
+                      const std::function<void(boost::json::object &)> &edit) {
+  const auto bytes{location.read(name)};
+  const std::string text(reinterpret_cast<const char *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+                             std::data(bytes)),
+                         std::size(bytes));
+  auto value{boost::json::parse(text)};
+  edit(value.as_object());
+  const auto edited{boost::json::serialize(value)};
+  object_bytes content(std::size(edited));
+  std::ranges::transform(edited, std::begin(content), [](char character) {
+    return static_cast<std::byte>(static_cast<unsigned char>(character));
+  });
+  location.write(name, content);
+}
+
+[[nodiscard]] bool starts_with_plaintext_magic(const object_bytes &bytes) {
+  const auto &magic{binsrv::events::magic_binlog_payload};
+  return std::size(bytes) >= std::size(magic) &&
+         std::equal(std::cbegin(magic), std::cend(magic), std::cbegin(bytes));
+}
+
+enum class downgrade_kind : std::uint8_t {
+  // the storage is started again with a configuration without an
+  // 'encryption' section (a mistake in a deployment, or someone who can edit
+  // the configuration but not read the keyring), optionally with the
+  // storage metadata's 'encryption' field removed as well
+  config_without_encryption,
+  // someone who can write the storage but holds no key replaces a binlog's
+  // data with plaintext events of their choosing and removes the encryption
+  // record from its metadata
+  binlog_replaced_with_plaintext,
+  // the binlog metadata names another KEK of the keyring for the file key
+  file_key_kek_swapped
+};
+
+// a storage written with encryption stays encrypted: whatever the storage's
+// next start is given (a configuration without 'encryption', a storage
+// metadata without it), it refuses to start or writes every new binlog
+// encrypted; and a binlog of it whose encryption record was removed or
+// changed is never served as plaintext or with the wrong key, the read
+// fails instead
+void run_downgrade_property(hegel::TestCase &tc, downgrade_kind kind) {
+  const auto kek_id{tc.draw("kek_id", gs::sampled_from(keyring_key_ids))};
+  const bool block_mode_kek{std::ranges::find(block_mode_key_ids, kek_id) !=
+                            std::cend(block_mode_key_ids)};
+  const auto data_cipher{tc.draw(
+      "data_cipher",
+      gs::sampled_from(block_mode_kek
+                           ? std::vector<std::string>{"AES-128-CTR",
+                                                      "AES-256-CTR"}
+                           : std::vector<std::string>{"AES-128-CTR",
+                                                      "AES-192-CTR",
+                                                      "AES-256-CTR"}))};
+  static constexpr std::size_t max_events{6U};
+  static constexpr std::size_t max_payload{120U};
+  const auto payload_sizes{tc.draw(
+      "payload_sizes",
+      gs::vectors(gs::integers<std::size_t>(
+                      {.min_value = 1U, .max_value = max_payload}),
+                  {.min_size = 1U, .max_size = max_events}))};
+
+  const storage_settings encrypted{
+      .s3 = std::nullopt,
+      .gtid_mode = false,
+      .checkpoint_size = std::nullopt,
+      .encryption =
+          encryption_settings{.kek_id = kek_id, .data_cipher = data_cipher},
+      .tailing_reader_block_size = 0U,
+      .fresh_reader_block_size = 0U,
+      .reader_checksum = false};
+  const scratch_directory root{};
+  {
+    std::ofstream keyring{root.path() / keyring_name};
+    keyring << keyring_content;
+  }
+  directory_location location{root.path() / "storage"};
+  const auto config{
+      write_config(root.path(), location.config_members(), encrypted)};
+  const binsrv::events::composite_binlog_name first{binlog_base_name, 1U};
+  const binsrv::events::composite_binlog_name second{first.next()};
+
+  event_list written;
+  {
+    const auto writer{make_storage(config)};
+    require(writer->open_binlog(first) == binsrv::open_binlog_status::created,
+            "the binlog was not created");
+    written = write_crc32_binlog(*writer, payload_sizes, 3U);
+    writer->close_binlog();
+  }
+  require(!starts_with_plaintext_magic(location.read(first.str())),
+          "the binlog is stored unencrypted");
+
+  switch (kind) {
+  case downgrade_kind::config_without_encryption: {
+    const bool strip_storage_metadata{
+        tc.draw("strip_storage_metadata", gs::booleans())};
+    if (strip_storage_metadata) {
+      edit_json_object(location, "metadata.json", [](auto &object) {
+        object["encryption"] = nullptr;
+      });
+    }
+    // the keyring is kept (the existing binlogs need it to be read) or
+    // removed with the 'encryption' section
+    const bool keep_keyring{tc.draw("keep_keyring", gs::booleans())};
+    std::filesystem::path plain_config;
+    if (keep_keyring) {
+      plain_config =
+          write_config(root.path(), location.config_members(), encrypted);
+      std::ifstream input{plain_config};
+      std::stringstream text;
+      text << input.rdbuf();
+      input.close();
+      auto value{boost::json::parse(text.str())};
+      value.as_object()["storage"].as_object().erase("encryption");
+      std::ofstream output{plain_config, std::ios::trunc};
+      output << boost::json::serialize(value);
+    } else {
+      storage_settings plain{encrypted};
+      plain.encryption = std::nullopt;
+      plain_config =
+          write_config(root.path(), location.config_members(), plain);
+    }
+    try {
+      const auto writer{make_storage(plain_config)};
+      if (writer->open_binlog(second) != binsrv::open_binlog_status::created) {
+        return;
+      }
+      static_cast<void>(write_crc32_binlog(*writer, payload_sizes, 11U));
+      writer->close_binlog();
+    } catch (const std::exception &) {
+      return; // refused: the storage was not downgraded
+    }
+    require(!starts_with_plaintext_magic(location.read(second.str())),
+            std::string{"started without an 'encryption' section"} +
+                (keep_keyring ? " but with the keyring" : "") +
+                (strip_storage_metadata
+                     ? " (and the storage metadata's 'encryption' removed)"
+                     : "") +
+                ", the storage of an encrypted binlog wrote the next binlog "
+                "in plaintext without an error");
+    break;
+  }
+  case downgrade_kind::binlog_replaced_with_plaintext: {
+    object_bytes plaintext{std::cbegin(binsrv::events::magic_binlog_payload),
+                           std::cend(binsrv::events::magic_binlog_payload)};
+    for (const auto &event : written) {
+      plaintext.insert(std::end(plaintext), std::cbegin(event),
+                       std::cend(event));
+    }
+    location.write(first.str(), plaintext);
+    edit_json_object(location, first.str() + ".json", [](auto &object) {
+      object["encryption"] = nullptr;
+    });
+    event_list received;
+    const auto error{read_back_from_start(config, received, max_events + 8U)};
+    require(!error.empty() || received != written,
+            "a binlog of an encrypted storage, replaced with plaintext and "
+            "its metadata's encryption record removed, was served as "
+            "plaintext without an error");
+    break;
+  }
+  case downgrade_kind::file_key_kek_swapped: {
+    std::vector<std::string> others;
+    std::ranges::copy_if(keyring_key_ids, std::back_inserter(others),
+                         [&kek_id](const auto &id) { return id != kek_id; });
+    const auto other{tc.draw("other_kek_id", gs::sampled_from(others))};
+    edit_json_object(location, first.str() + ".json", [&other](auto &object) {
+      object["encryption"].as_object()["file_key_envelope"].as_object()["kek_id"] =
+          other;
+    });
+    event_list received;
+    const auto error{read_back_from_start(config, received, max_events + 8U)};
+    require(!error.empty(),
+            "a binlog whose metadata names another KEK ('" + other +
+                "' instead of '" + kek_id + "') was read without an error (" +
+                std::to_string(std::size(received)) + " event(s))");
+    break;
+  }
+  }
 }
 
 } // anonymous namespace
@@ -4368,4 +4587,29 @@ BOOST_AUTO_TEST_CASE(StorageNeverReusesKeystreamAfterCrashRecovery) {
 // malleable and CRC32 is affine, so the CRC32 footer can be patched to match
 BOOST_AUTO_TEST_CASE(StorageDetectsTamperingWithEncryptedBinlogData) {
   run_property([](hegel::TestCase &tc) { run_tampering_property(tc); });
+}
+
+// an encrypted storage is never downgraded to plaintext (security catalog
+// property encrypted-storage-never-downgraded), one case per way in:
+// started without an 'encryption' section (and optionally with the storage
+// metadata's 'encryption' removed) it refuses or keeps encrypting
+BOOST_AUTO_TEST_CASE(StorageStartedWithoutEncryptionKeepsEncrypting) {
+  run_property([](hegel::TestCase &tc) {
+    run_downgrade_property(tc, downgrade_kind::config_without_encryption);
+  });
+}
+
+// a binlog of an encrypted storage replaced with plaintext, its metadata's
+// encryption record removed, is not served
+BOOST_AUTO_TEST_CASE(StorageNeverServesABinlogStrippedOfEncryption) {
+  run_property([](hegel::TestCase &tc) {
+    run_downgrade_property(tc, downgrade_kind::binlog_replaced_with_plaintext);
+  });
+}
+
+// a binlog whose metadata names another KEK of the keyring is not read
+BOOST_AUTO_TEST_CASE(StorageNeverDecryptsWithAnotherKek) {
+  run_property([](hegel::TestCase &tc) {
+    run_downgrade_property(tc, downgrade_kind::file_key_kek_swapped);
+  });
 }

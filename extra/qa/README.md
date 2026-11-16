@@ -225,6 +225,42 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/listener_fuzz_test.py \
   --workdir ~/ws/qa/listener-fuzz --connections 5000 --seed 7
 ```
 
+### Listener exhaustion — `listener_exhaustion_test.py`
+
+Clients that never log in against the `pull` listener. `idle_flood` lowers
+`pull`'s RLIMIT_NOFILE (`--fd-limit`, default 256), opens 200 more idle
+connections than that, then closes them all: the listener must serve again
+afterwards. `oversized_headers` sends 150 frame headers announcing almost
+16 MB and checks that resident memory stays bounded. `payload_drip` and
+`header_drip` check that the per-frame read timeout ends a slowly fed
+session. On 2026-11-16 (`pbt-init` @ `23ef45c`, debug build) the last three
+pass (memory grew 2.4 MB for 150 connections; the drip was closed at exactly
+`read_timeout`) and `idle_flood` fails (ticket 55): `accept()` fails with
+EMFILE, `handle_exception("listener")` ends the accept loop, and `pull`
+stays up without a listener for good.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/listener_exhaustion_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/listener-exhaustion
+```
+
+### Storage file modes and symlinks — `file_security_test.py`
+
+Records the modes of everything `fetch` creates under umask 022 and 000, and
+plants symlinks in the storage directory, while `pull` runs, under the names
+it creates next: the next binlog, its metadata's `.tmp` and `binlog.index.tmp`.
+On 2026-11-16 all three cases fail. Under umask 022, binlog data and metadata
+are 0644 (MySQL makes its binlogs 0640); under umask 000, the binlogs, their
+metadata, the index, `metadata.json` and the log are 0666 (ticket 56). Every
+planted symlink is written through into the file outside the storage, and the
+rename that follows leaves `binlog.index` and the binlog metadata as
+permanent symlinks (ticket 57).
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/file_security_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/file-security
+```
+
 ## S3 storage tests
 
 These need the local S3-compatible server running (`~/ws/s3/start_s3.sh`
@@ -358,6 +394,9 @@ all pass on 8.0, 8.4 and 9.7 (see below). The nightly runs it every night
 instance_id (PBS-41) beyond the MTR tests. `pull` cases (`pull` runs for 8 s
 with its own `telemetry` section and must keep serving a binlog to
 mysqlbinlog): `reports` (names, one tag, mode 0644, fields, growing uptime),
+`no_network_egress` (under strace every outbound `connect()` goes to the
+MySQL source, none elsewhere and no DNS lookup, and no report holds the host
+name, a password, a user name or the storage path; passes on 2026-11-16),
 `scrape_zero`, `scrape_negative` and `scrape_huge` (`200000d`, past the ~292
 years of int64 nanoseconds: no tight loop), `grace_huge` (no report),
 `path_is_file` and `path_unwritable` (no report, a logged failure),

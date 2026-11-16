@@ -32,3 +32,12 @@ report_multiple_failures = true
 test_cases = 500
 database = "@NIGHTLY_DIR@/hegel-db/release_gcc14"
 report_multiple_failures = true
+
+# ubsan_gcc14 (the debug preset with UndefinedBehaviorSanitizer): a report does
+# not fail the property by itself, run_nightly.sh looks for 'runtime error:'
+# in each case's output
+[profiles.nightly_ubsan]
+test_cases = 500
+database = "@NIGHTLY_DIR@/hegel-db/ubsan_gcc14"
+suppress_health_check = ["too_slow"]
+report_multiple_failures = true

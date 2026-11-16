@@ -39,7 +39,16 @@
 # fetch_crash_test run uses the release binary. Release-only behaviour of a
 # known failure is listed in known_failures.txt as 'release_gcc14:<case>'.
 #
-# STAGES selects what runs (default "cpp mtr qa release"); without "cpp" the
+# The ubsan stage builds ubsan_gcc14 (the debug_gcc14 preset with
+# UndefinedBehaviorSanitizer, against the debug builds of Boost and the AWS
+# SDK) in its own build directory, configuring it the first time, and runs its
+# unit tests and every property test case like the C++ stage (profile
+# nightly_ubsan). A report does not stop a test (halt_on_error=0); a case
+# with a 'runtime error:' line fails, and the unit tests' reports are
+# collected through log_path, as ctest shows a passing test's output nowhere
+# ('ubsan_gcc14:unit_tests' in known_failures.txt covers known ones).
+#
+# STAGES selects what runs (default "cpp mtr qa release ubsan"); without "cpp" the
 # debug / ASan / TSan trees are not built and the existing binaries are used.
 # "rotation" runs only the QA rotation (part of "qa"), e.g. to try a rotation
 # entry: STAGES=rotation QA_ROTATION=1:pull_versions/ps-8.4 QA_ROTATION_DAY=1
@@ -85,7 +94,7 @@ TSAN_JOBS=${TSAN_JOBS:-4}
 # through it (use_ccache), so a rebuild after a merge reuses every object
 # whose sources did not change
 BUILD_JOBS=${BUILD_JOBS:-12}
-STAGES=" ${STAGES:-cpp mtr qa release fuzz mull} "
+STAGES=" ${STAGES:-cpp mtr qa release ubsan fuzz mull} "
 # MTR stage: <series>:<distribution under $WS/dist>; its own build thread
 # (ports) and var directories so it does not collide with manual MTR runs.
 # A worker of build thread N uses ports 10000+10*N.. (30 per worker) and the
@@ -203,9 +212,15 @@ run_case() {
   local case_seconds=$(( $(date +%s) - case_started ))
   local tsan_reports
   tsan_reports=$(grep -c "WARNING: ThreadSanitizer" "$case_log")
+  # UndefinedBehaviorSanitizer reports do not change the exit code
+  # (halt_on_error=0), so that one case shows all of them
+  local ubsan_reports=0
+  [ "$config" = ubsan_gcc14 ] &&
+    ubsan_reports=$(grep -c "runtime error:" "$case_log")
   local ticket=${known[$config:$test_case]:-${known[$test_case]:-}}
   local status reason="" line=""
-  if [ $rc -eq 0 ] && [ "$tsan_reports" -eq 0 ]; then
+  if [ $rc -eq 0 ] && [ "$tsan_reports" -eq 0 ] &&
+      [ "$ubsan_reports" -eq 0 ]; then
     rm -f "$case_log"
     if [ -n "$ticket" ]; then
       status=known-passed
@@ -222,6 +237,8 @@ run_case() {
       reason="TIMEOUT: no result after ${case_timeout}s (hang?)"
     fi
     [ "$tsan_reports" -gt 0 ] && reason="$tsan_reports ThreadSanitizer reports"
+    [ "$ubsan_reports" -gt 0 ] &&
+      reason="$ubsan_reports UndefinedBehaviorSanitizer reports: $(grep -m1 -oE "[^/ ]+:[0-9]+:[0-9]+: runtime error: .{0,100}" "$case_log")"
     grep -q "ERROR: AddressSanitizer" "$case_log" &&
       reason=$(grep -m1 -oE "ERROR: AddressSanitizer: .{0,120}" "$case_log")
     if [ -n "$ticket" ]; then
@@ -347,12 +364,14 @@ fi
 cpp_configs=()
 want cpp && cpp_configs+=(debug_gcc14 asan_gcc14 tsan_gcc14)
 want release && cpp_configs+=(release_gcc14)
+want ubsan && cpp_configs+=(ubsan_gcc14)
 for config in "${cpp_configs[@]}"; do
   build_dir=$WS/percona-binlog-server-build-$config
   config_started=$(date +%s)
   targets=()
   run_prefix=()
   property_tests=()
+  unit_env=()
   case_timeout=$CASE_TIMEOUT
   case_memory_kb=""
   case $config in
@@ -368,6 +387,27 @@ for config in "${cpp_configs[@]}"; do
           -DWITH_PROPERTY_TESTS=ON > "$out/configure-$config.log" 2>&1 ||
           log "CONFIGURE FAILED: $config (configure-$config.log)"
       fi
+      ;;
+    ubsan_gcc14)
+      profile=nightly_ubsan
+      # configured here the first time, like release_gcc14. With the
+      # instrumentation GCC reports -Wconversion in a few places it does
+      # not report otherwise (the checks widen intermediate values), and
+      # the project builds with -Werror, so those two warnings stay
+      # warnings in this tree
+      if [ ! -f "$build_dir/CMakeCache.txt" ]; then
+        log "configuring $config"
+        ubsan_flags="-fsanitize=undefined,float-divide-by-zero,float-cast-overflow -fno-omit-frame-pointer -Wno-error=conversion -Wno-error=sign-conversion"
+        cmake -S "$SRC" -B "$build_dir" --preset debug_gcc14 \
+          -DWITH_PROPERTY_TESTS=ON \
+          "-DCMAKE_C_FLAGS=$ubsan_flags" "-DCMAKE_CXX_FLAGS=$ubsan_flags" \
+          "-DCMAKE_EXE_LINKER_FLAGS=$ubsan_flags" \
+          "-DCMAKE_SHARED_LINKER_FLAGS=$ubsan_flags" \
+          > "$out/configure-$config.log" 2>&1 ||
+          log "CONFIGURE FAILED: $config (configure-$config.log)"
+      fi
+      export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0"
+      unit_env=("UBSAN_OPTIONS=$UBSAN_OPTIONS:log_path=$out/ubsan-unit")
       ;;
     debug_gcc14) profile=nightly_debug ;;
     asan_gcc14)  profile=nightly_asan ;;
@@ -397,8 +437,8 @@ for config in "${cpp_configs[@]}"; do
   if [ "$config" != tsan_gcc14 ]; then
     log "unit tests ($config)"
     unit_started=$(date +%s)
-    if (cd "$build_dir" && ctest -E "_property_test$" --output-on-failure \
-        --timeout 600 > "$out/unit-$config.log" 2>&1); then
+    if (cd "$build_dir" && env "${unit_env[@]}" ctest -E "_property_test$" \
+        --output-on-failure --timeout 600 > "$out/unit-$config.log" 2>&1); then
       passed=$((passed + 1))
       record "$config" "ctest" "unit tests" "passed" "" "" \
         $(( $(date +%s) - unit_started )) >> "$results_file"
@@ -407,6 +447,37 @@ for config in "${cpp_configs[@]}"; do
       new=$((new + 1))
       record "$config" "ctest" "unit tests" "new" "" "see unit-$config.log" \
         $(( $(date +%s) - unit_started )) >> "$results_file"
+    fi
+    if [ "$config" = ubsan_gcc14 ]; then
+      # the unit tests' UndefinedBehaviorSanitizer reports, one file per
+      # process that had any (log_path)
+      ubsan_unit_log=$out/unit-$config-reports.log
+      cat "$out"/ubsan-unit.* > "$ubsan_unit_log" 2> /dev/null
+      rm -f "$out"/ubsan-unit.*
+      ubsan_reports=$(grep -c "runtime error:" "$ubsan_unit_log")
+      ticket=${known[$config:unit_tests]:-}
+      if [ "$ubsan_reports" -eq 0 ]; then
+        rm -f "$ubsan_unit_log"
+        if [ -n "$ticket" ]; then
+          unexpected_pass=$((unexpected_pass + 1))
+          results+=("KNOWN PASSED  $config  unit_tests  ($ticket; fixed, or not hit tonight?)")
+          record "$config" "ctest" "unit_tests" "known-passed" "$ticket" "" 0 \
+            >> "$results_file"
+        fi
+      else
+        reason="$ubsan_reports UndefinedBehaviorSanitizer reports: $(grep -m1 -oE "[^/ ]+:[0-9]+:[0-9]+: runtime error: .{0,100}" "$ubsan_unit_log")"
+        if [ -n "$ticket" ]; then
+          known_failed=$((known_failed + 1))
+          results+=("known         $config  unit_tests  ($ticket)")
+          record "$config" "ctest" "unit_tests" "known" "$ticket" "$reason" 0 \
+            >> "$results_file"
+        else
+          new=$((new + 1))
+          results+=("NEW FAILURE   $config  unit_tests  $reason  ($(basename "$ubsan_unit_log"))")
+          record "$config" "ctest" "unit_tests" "new" "" "$reason" 0 \
+            >> "$results_file"
+        fi
+      fi
     fi
     mapfile -t property_tests < <(find "$build_dir/tests" -maxdepth 1 \
       -name "*_property_test" -type f -perm -u+x | sort)
@@ -1004,7 +1075,7 @@ duration=$(( ($(date +%s) - started) / 60 ))
   echo
   printf '%s\n' "${results[@]}" | sort
   echo
-  echo "Replay a property failure: cd $out/work-<build> && HEGEL_DEFAULT_PROFILE=<profile> <test binary> --run_test=<test case> (profile nightly_<debug|asan|tsan|release>; release cases under 'timeout $RELEASE_CASE_TIMEOUT')"
+  echo "Replay a property failure: cd $out/work-<build> && HEGEL_DEFAULT_PROFILE=<profile> <test binary> --run_test=<test case> (profile nightly_<debug|asan|tsan|release|ubsan>; release cases under 'timeout $RELEASE_CASE_TIMEOUT')"
   echo "Replay an MTR failure: cd $WS/dist/<distribution>/mysql-test && BINSRV=$debug_binsrv ./mtr --build-thread=$MTR_BUILD_THREAD binlog_streaming.<test> (log: mtr-<series>-<test>.log)"
   echo "Replay a QA failure: see the command at the top of qa-<series>-<case>.log"
   echo "Replay a fuzzing finding: $WS/percona-binlog-server-build-fuzz_clang20/fuzz/<target> <input> (inputs listed in fuzz-<target>-<finding>.log)"

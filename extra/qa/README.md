@@ -846,7 +846,7 @@ server rather than starting one.
 
 [`nightly/`](nightly) holds the nightly test runner and its data:
 
-- **`run_nightly.sh`** — runs six stages:
+- **`run_nightly.sh`** — runs seven stages:
   1. **C++** (`cpp`): builds the `debug_gcc14`, `asan_gcc14` and
      `tsan_gcc14` trees in place, runs the unit tests, then runs **every
      Hegel property-test case separately** with many more cases than the
@@ -977,7 +977,27 @@ server rather than starting one.
      the first night longest, then the failure database replays the known
      failures quickly; `fetch_crash_test` 1-2 min) plus the incremental
      build (a clean build is about 8 min).
-  5. **Fuzzing** (`fuzz`), last: the libFuzzer targets of
+  5. **UBSan** (`ubsan`): the `debug_gcc14` preset with
+     UndefinedBehaviorSanitizer (`-fsanitize=undefined,float-divide-by-zero,float-cast-overflow`)
+     in its own tree, `percona-binlog-server-build-ubsan_gcc14`, which the
+     stage configures the first time. Boost and the AWS SDK are the debug
+     installs, so only the project's code is instrumented. GCC reports
+     `-Wconversion` in three places only with this instrumentation
+     (`byte_span_inserters.hpp`, `flag_set.hpp`, `gtid_set.cpp`), so in this
+     tree those warnings are not errors. The stage runs the unit tests and
+     every property-test case (profile `nightly_ubsan`, 500 cases). A report
+     does not stop a test (`halt_on_error=0`): a property case with a
+     `runtime error:` line in its output fails, and the unit tests' reports
+     are collected through `log_path` into `unit-ubsan_gcc14-reports.log`
+     (ctest keeps a passing test's output) and compared with the
+     `ubsan_gcc14:unit_tests` line of `known_failures.txt`. First run on
+     2026-11-16: one report, a signed overflow in
+     `util::microseconds_to_high_resolution_time_point` for a 2^60 µs
+     timestamp in `event_test` (ticket 79; only tests call the getters that
+     use it). The QA harnesses were run once by hand against this build's
+     `binlog_server` on the same day (25 runs, no report); the nightly does
+     not repeat that.
+  6. **Fuzzing** (`fuzz`), last: the libFuzzer targets of
      [`fuzz/`](../../fuzz) in their own Clang 20 build
      (`$WS/percona-binlog-server-build-fuzz_clang20`, configured by the
      nightly the first time), each for 10 min (`FUZZ_SECONDS`) with 12
@@ -985,7 +1005,7 @@ server rather than starting one.
      distinct finding is a case `<target>/<signature>` of the build `fuzz`,
      compared with `fuzz_known_failures.txt`; see
      [`fuzz/README.md`](../../fuzz/README.md).
-  6. **Mutation testing** (`mull`), weekly on Sundays (`MULL_DAY`, `all` for
+  7. **Mutation testing** (`mull`), weekly on Sundays (`MULL_DAY`, `all` for
      every run): [Mull](https://github.com/mull-project/mull) builds the
      unit and property tests of the GTID, util and event libraries, the
      configuration validators and the units with its compiler plugin in
@@ -1014,7 +1034,7 @@ server rather than starting one.
   C++ stage plus 35-50 min of MTR (9-26 min per version) and 20-35 min of QA harnesses: about 11 min for `pull_replica_test`, `query_race_test` and `fetch_crash_test` on file storage, about 5 min for `pull_heartbeat_test`, about 7 min for `fetch_crash_test` on S3 (mostly Hypothesis shrinking the known ticket 14, PBS-80 failure in `gtid/s3`), plus the night's rotation (measured on MySQL 8.4.8: `s3_fault_sweep` 15 min per mode, 84 cases; `disk_fault_sweep` 3-6 min, 80 cases (plus 6 recovery cases, about 1.5 min); `network_fault_test` 4-5 min, 37 cases; `source_change_test` 3-4 min per mode, 4 cases; `large_binlog_test` about 20 min on the debug build, mostly MySQL writing the large transactions; `pull_load_test` about 6 min, 4 cases; `listener_fuzz_test` about 11 min per mode at 600 connections: about 1 s per connection since the listener always does full `caching_sha2_password` authentication (PBS-10), 2-3 min for 3000 before).
 
   To try a stage without touching the nightly's own results, select stages
-  with `STAGES` (default `cpp mtr qa release fuzz mull`; without `cpp` the debug,
+  with `STAGES` (default `cpp mtr qa release ubsan fuzz mull`; without `cpp` the debug,
   ASan and TSan trees are not built) and
   write elsewhere with `OUT_DIR` (then `history.tsv`, `latest` and old runs
   are left alone):
@@ -1048,7 +1068,7 @@ server rather than starting one.
   into cases, matches them against the stage's known-failure list and
   appends the result lines.
 - **`hegel.toml`** — the Hegel settings profiles (`nightly_debug`,
-  `nightly_asan`, `nightly_tsan`, `nightly_release`) selected per build via
+  `nightly_asan`, `nightly_tsan`, `nightly_release`, `nightly_ubsan`) selected per build via
   `HEGEL_DEFAULT_PROFILE`; each has its own failure database so a failure found
   one night is replayed first the next. Before each build's run,
   `run_nightly.sh` copies into its database every input the other builds have

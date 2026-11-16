@@ -148,6 +148,7 @@ def builds(runs):
                  "asan_gcc14": "AddressSanitizer, 500 cases",
                  "tsan_gcc14": "ThreadSanitizer, storage test only, "
                                "300 cases",
+                 "ubsan_gcc14": "UndefinedBehaviorSanitizer, 500 cases",
                  "release_gcc14": "release (RelWithDebInfo, NDEBUG), 500 "
                                   "cases, 600 s and 4 GB limits per case (a "
                                   "hang is a TIMEOUT failure); short "

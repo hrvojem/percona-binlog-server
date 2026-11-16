@@ -9,7 +9,8 @@
 # source_change_test, large_binlog_test, pull_load_test,
 # listener_exhaustion_test, file_security_test, hostile_source_test,
 # secrets_exposure_test, upstream_tls_test, listener_replica_dos_test,
-# metadata_tamper_test, listener_login_test) run
+# metadata_tamper_test, listener_login_test, listener_command_fuzz_test,
+# tls_config_test) run
 # about once a week,
 # so their known failures show up on those nights only.
 # A sanitizer report is never covered by a pattern line (its reason names
@@ -42,3 +43,25 @@ hostile_source_test position/reannounce  ticket 69: an artificial ROTATE that na
 hostile_source_test position/lower_sequence  ticket 70: a binlog with a lower sequence number than the first stored one is created and indexed, and the next start takes it for the leftover of an interrupted purge ('binlog index contains a reference to a non-existing object')
 hostile_source_test position/case_variant  ticket 71: on a file system that ignores case (--case-insensitive-dir), 'BINLOG.000001' is new to binlog.index and is opened with truncation, which replaces the stored 'binlog.000001'
 listener_login_test position/long_statement  ticket 72: a COM_QUERY of 'SET' and 100,000 spaces from a logged-in client is matched with std::regex, which recurses per character: pull ends with SIGSEGV (debug and release builds)
+metadata_tamper_test */encryption_null  ticket 62: 'encryption': null in the last binlog's metadata is taken as no record, like a removed one: fetch appends plaintext and exits 0
+metadata_tamper_test */data_iv_counter_lowered  ticket 63: with the block counter in the stored data IV lowered by size / 16, the appended data is encrypted with the keystream of the same binlog's start (no second binlog needed)
+metadata_tamper_test gtid/size_rewrite  ticket 63: in GTID mode with rewrite, a lowered 'size' truncates the binlog at the next start and the new transactions are encrypted over the cut-off ones' keystream; the cut-off transactions are not fetched again
+metadata_tamper_test */kek_id_other_existing  ticket 53 (PBS-126): a kek_id changed to another KEK of the keyring is accepted (the CTR-wrapped file key has no integrity check): fetch exits 0 and appends data under a key nobody chose, and the binlog is no longer served
+metadata_tamper_test */kek_id_other_existing_smaller  ticket 53 (PBS-126): as kek_id_other_existing, with a smaller KEK
+metadata_tamper_test */data_iv_changed  ticket 53 (PBS-126): a changed data IV is accepted: fetch exits 0, appends under the wrong IV, and the binlog is no longer served
+metadata_tamper_test */data_iv_zeroed  ticket 53 (PBS-126): as data_iv_changed, with an all-zero IV
+metadata_tamper_test */file_key_changed  ticket 53 (PBS-126): a changed wrapped file key (CTR KEK) is accepted: fetch exits 0, appends under a wrong key, and the binlog is no longer served
+metadata_tamper_test */key_iv_changed  ticket 53 (PBS-126): as file_key_changed, through the key-wrapping IV
+metadata_tamper_test */index_first_entry_dropped  ticket 53 (PBS-126): with the first entry removed from binlog.index, the next fetch takes that binlog for the leftover of an interrupted purge and deletes it and its metadata
+metadata_tamper_test */kek_id_other_existing_gcm  ticket 73: the final flush fails (the file key cannot be unwrapped), the storage destructor swallows the error, and fetch logs 'successfully fetched everything' and exits 0 with nothing stored
+metadata_tamper_test */cipher_*  ticket 73: a data cipher name that is not a CTR cipher makes the final flush fail; fetch still exits 0 with nothing stored
+metadata_tamper_test */data_iv_shortened  ticket 73: as cipher_*, through a data IV of the wrong length
+metadata_tamper_test */file_key_shortened  ticket 73: as cipher_*, through a wrapped file key of the wrong length
+metadata_tamper_test */key_iv_*  ticket 73: as cipher_*, through a key-wrapping IV of the wrong length or without one (key_iv_changed is ticket 53)
+metadata_tamper_test */key_tag_added  ticket 73: as cipher_*, through a tag on a CTR-wrapped file key
+metadata_tamper_test */gcm_file_key_changed  ticket 73: the GCM tag detects the changed wrapped key at the final flush, but fetch exits 0 with nothing stored
+metadata_tamper_test */gcm_key_*  ticket 73: as gcm_file_key_changed, through the tag or the key-wrapping IV
+listener_login_test position/plain_password_without_tls  ticket 76: a line feed in the user name of a failed login puts a line of the client's choosing into the pull log (the user name is logged raw, and without a length limit)
+listener_command_fuzz_test */query_max_frame  ticket 74: one COM_QUERY of 16 MB is run through four std::regex searches on the listener's only thread: no client is served for 25 s (debug build; 3 s on a release build)
+listener_command_fuzz_test */heartbeat_1*ns_blocking_dump  ticket 75: a heartbeat period of 1 ns or 1,000 ns is accepted, and an idle blocking dump then sends and logs thousands of heartbeats a second: one core busy and megabytes of log every second
+listener_command_fuzz_test */regex_run_*  ticket 72: other statements with a run of 40,000 or more characters matched by one of the handshake patterns (digits after the heartbeat period, white space in any SET statement) end pull the same way

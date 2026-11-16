@@ -284,6 +284,31 @@ keystream the previous binlog's known plaintext gives, every appended byte
 decrypts (ticket 63). A `fetch` that refuses the edited metadata passes
 either case.
 
+A sweep added later that day edits one member at a time (82 cases in
+position mode, 84 in GTID mode; `--cases` selects some, `--storage s3` runs
+them on the local S3 server, where the edits go through the S3 API): `size`,
+the GTID sets, timestamps, `last_sequence_number`, `version`, every part of
+the `encryption` record, the whole file, `binlog.index` and `metadata.json`.
+After each edit it runs `list`, `fetch` and `list` again and requires that
+no process dies or hangs, nothing readable is appended, no keystream is
+reused, the other binlogs keep their bytes, and, if `fetch` exits 0, that
+`pull` still serves an exact copy of the source's binlog. Malformed values,
+wrong types, GTID edits and index edits are refused cleanly. 27 cases fail
+(28 in GTID mode), the same on file storage, on S3 and with the ASan build:
+
+- `"encryption": null` gives plaintext like a removed record (ticket 62).
+- Lowering the block counter in the stored data IV makes the appended data
+  reuse the keystream of the same binlog's start, and in GTID mode with
+  rewrite a lowered `size` does the same over the truncated transactions
+  (`size_rewrite`; both ticket 63).
+- A `kek_id` of another KEK, or a changed IV or wrapped key, is accepted:
+  `fetch` exits 0 and appends data nobody can read. A first index entry that
+  is removed makes `fetch` delete that binlog (ticket 53).
+- Sixteen edits that make the final flush fail (a cipher name that is not a
+  CTR cipher, an IV or key of the wrong length, a GCM tag that no longer
+  verifies) end with "successfully fetched everything" and exit 0 while
+  nothing is stored: the storage destructor swallows the error (ticket 73).
+
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/metadata_tamper_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/metadata-tamper
@@ -299,6 +324,74 @@ authentication", so the first reply tells whether a name is the replication
 user (ticket 67). `long_statement` logs in and sends `SET` followed by 1,000
 to 1,000,000 spaces: at 100,000 `pull` ends with a segmentation fault, in the
 debug and the release build (ticket 72). Both fail on 2026-11-16.
+
+Three more cases (`--cases` selects some; `long_statement` stays last, as it
+ends `pull`):
+
+- `guess_rate` measures wrong-password logins for 10 s per phase, with 1 and
+  8 clients, over the full (RSA) and the fast path. Nothing throttles them:
+  about 490 a second on the full path and 1,500 on the fast path (debug
+  build; 713 and 4,674 with the release build), every one answered ERR 1045
+  and logged, while a legitimate login is still served within 50 ms. It
+  passes: MySQL has no lockout by default either.
+- `rsa_exchange` sends 15 malformed answers on the RSA path (all refused),
+  compares the timing of padding-valid and padding-invalid ciphertexts (no
+  difference beyond 50 µs over loopback) and replays a captured scramble
+  and a captured ciphertext (both refused). It passes.
+- `plain_password_without_tls` runs 66 checks of odd logins: a plain
+  password outside TLS, passwords with and without the NUL, user name
+  variants, other plugins and the auth switch, an SSLRequest without a
+  ClientHello, packets after the OK. One fails: a line feed in the user
+  name of a failed login puts a line of the client's choosing into the
+  `pull` log, and a 1 MB user name is logged twice and echoed in a 1 MB
+  error packet (ticket 76).
+
+### What a logged-in client can send — `listener_command_fuzz_test.py`
+
+Logs in with the raw client and sends what `mysqlbinlog` and a replica never
+would: every handshake statement with long or overflowing values,
+COM_REGISTER_SLAVE, COM_BINLOG_DUMP and COM_BINLOG_DUMP_GTID with truncated
+bodies, absurd positions, names and GTID sets, COM_CHANGE_USER, every
+command byte, wrong sequence numbers, a second handshake, commands during a
+dump; then 300 random connections (`--connections`, `--seed`). After each it
+requires `pull` to run, to serve a new login within 10 s and to stay under
+1 GiB. 31 of 43 cases pass on 2026-11-16, the random phase included. Three
+failures are new: one COM_QUERY of 16 MB keeps every client waiting for 25 s
+(3 s with the release build; ticket 74), and a heartbeat period of 1 ns or
+1,000 ns makes an idle dump send and log thousands of heartbeats a second
+(ticket 75). The other nine are ticket 72 again, with other statements: any
+run of 40,000 or more characters that one of the handshake patterns matches
+ends `pull`; they run last (`--no-long-runs` leaves them out).
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/listener_command_fuzz_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/listener-commands
+```
+
+### TLS settings on both sides — `tls_config_test.py`
+
+On the listener it enumerates the protocol versions and cipher suites with
+hand-built ClientHello messages and real handshakes, and checks
+renegotiation, compression, resumption and that a TLS client is never served
+in plain. With Ubuntu 24.04's OpenSSL policy the listener takes TLS 1.2 and
+1.3 only and no NULL, anonymous, export, RC4 or 3DES suite; it does take
+four CBC-SHA1 and six static-RSA suites. The listener sets no minimum
+version or cipher list itself, so under a legacy OpenSSL policy
+(`OPENSSL_CONF` with `MinProtocol = TLSv1`) the same binary accepts TLS 1.0
+and 1.1; that case only records what it finds (ticket 77). Towards a TLS
+source it runs `fetch` with `connection.ssl` and `connection.tls` settings:
+a client certificate for a `REQUIRE X509` user (missing, of another CA,
+expired, with the wrong key), `ca` / `capath`, `crl` / `crlpath` with the
+source's certificate revoked, `cipher`, TLS versions and cipher suites, and
+`verify_identity` to an address that is not in the certificate. All 30
+settings that must make the connection fail do, and the 10 controls
+connect; none of the 30 refusals says why in the log (ticket 47, PBS-121).
+All 51 cases pass on 2026-11-16.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/tls_config_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/tls-config
+```
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/listener_login_test.py \
@@ -810,13 +903,13 @@ server rather than starting one.
 
      | Day | Harness (mode) | Build |
      | --- | --- | --- |
-     | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position, about 2 min) | ASan; debug |
-     | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 1 min) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
-     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) | ASan; debug |
+     | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position, about 3 min) and `tls_config_test.py` (position, about 5 min) | ASan; debug |
+     | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 4 min) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
+     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min) | ASan; debug |
      | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) | ASan; debug |
      | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 4 min, with the local S3 server) | ASan; debug |
      | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min) | debug / ASan; debug |
-     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 1 min) | ASan / debug; debug |
+     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) | ASan / debug; debug |
 
      `pull_versions/<series>` runs the replica harnesses of the nightly 8.4
      stage against another MySQL version of `MTR_DISTS`: `upgrade_test.py`,

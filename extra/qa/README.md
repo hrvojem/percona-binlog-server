@@ -261,6 +261,43 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/file_security_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/file-security
 ```
 
+### Hostile source binlog names — `hostile_source_test.py`
+
+A man-in-the-middle proxy between a real MySQL source and `fetch` rewrites
+the binlog name in the ROTATE events that announce the next binlog (fixing
+the event size, log_pos, CRC32 and packet length), as a compromised source
+or an attacker on a connection without TLS verification could. `fetch`
+reads the dump without TLS (the server's cached password hash, as in
+`fetch_ssl_disabled_caching_sha2`). After each case every stored binlog must
+keep its data, `metadata.json` must be unchanged and the storage must still
+open (`list`). On 2026-11-16 four of six names fail (ticket 59). With
+`binlog.000001\0.000002`, `binlog.000001` loses its data. With
+`metadata.json\0...`, `metadata.json` is overwritten ("unable to extract
+mode"). With `binlog.index\0...` and a name containing a newline,
+`binlog.index` gets an invalid entry and the storage no longer opens. In all
+four cases `fetch` exits 0. `..` as a base name stays inside the storage, and
+a 3000-byte name makes `fetch` fail cleanly.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/hostile_source_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/hostile-source
+```
+
+### Secrets in output — `secrets_exposure_test.py`
+
+Runs `fetch`, `pull` (with right and wrong client logins), `list` and
+`search_by_timestamp` at log level `trace`, with distinctive secrets: the
+source password (and a wrong one), the listener password, a wrong client
+password, KEK bytes, the bytes of a malformed keyring record, and S3
+credentials in the storage URI, against an unreachable and a refusing S3
+endpoint. Then it searches the log, stdout / stderr and telemetry for each
+secret. On 2026-11-16 nothing was found in 7 runs.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/secrets_exposure_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/secrets
+```
+
 ## S3 storage tests
 
 These need the local S3-compatible server running (`~/ws/s3/start_s3.sh`
@@ -668,9 +705,9 @@ server rather than starting one.
 
      | Day | Harness (mode) | Build |
      | --- | --- | --- |
-     | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7 | ASan; debug |
+     | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position, about 2 min) | ASan; debug |
      | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0 | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
-     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end) | ASan |
+     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) | ASan; debug |
      | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4 | ASan; debug |
      | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 2 min) | ASan; debug |
      | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7 | debug / ASan; debug |

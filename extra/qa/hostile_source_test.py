@@ -51,6 +51,14 @@ The names (the sequence number is the real next one, N):
   dot_dot              '...N' (base name '..'): stays in the storage
   long_name            a 3000-byte base name: the file system refuses it
 
+Two attacks on resources run in the same way: 'size_lie' makes the first
+ordinary event of the next binlog claim 0xFFFFFF00 bytes (its CRC32 kept
+valid), and 'gtid_bloat' (GTID mode) replaces the next binlog's
+PREVIOUS_GTIDS_LOG with 900,000 intervals and shifts the later positions to
+match; for these the peak memory and the duration of the proxied 'fetch' are
+recorded as well (at most 2 GiB and 120 s). --mode gtid runs every case in
+GTID mode, and --storage s3 against the local S3 server.
+
 The binlog dump is read without TLS, so 'fetch' authenticates as the
 caching_sha2_password user with the server's cached hash (a mysql client
 login with --get-server-public-key first), as in the MTR test
@@ -72,6 +80,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import zlib
 from pathlib import Path
 
@@ -95,6 +104,16 @@ CASES = {
     "dot_dot": lambda n: b".." + b".%06d" % n,
     "long_name": lambda n: b"b" * 3000 + b".%06d" % n,
 }
+# attacks on resources rather than names: 'size_lie' makes the first
+# ordinary event of the next binlog claim 0xFFFFFF00 bytes (CRC32 kept
+# valid); 'gtid_bloat' (GTID mode) replaces the next binlog's
+# PREVIOUS_GTIDS_LOG with GTID_BLOAT_INTERVALS intervals (about 14 MB) and
+# shifts the positions of the events after it to match
+RESOURCE_CASES = ["size_lie", "gtid_bloat"]
+GTID_BLOAT_INTERVALS = 900_000
+FORMAT_DESCRIPTION_EVENT = 15
+PREVIOUS_GTIDS_LOG_EVENT = 35
+ARTIFICIAL_FLAG = 0x20
 
 
 class RenamingProxy:
@@ -103,11 +122,16 @@ class RenamingProxy:
     and a ROTATE event naming 'old_name' is rewritten to name 'new_name'."""
 
     def __init__(self, listen_port: int, source_port: int, old_name: bytes,
-                 new_name: bytes):
+                 new_name: bytes, attack: str = "rename"):
         self.source_port = source_port
         self.old_name = old_name
         self.new_name = new_name
+        self.attack = attack
         self.rewritten = 0
+        # set by the artificial ROTATE that starts the next binlog
+        self.in_next_binlog = False
+        # bytes added to the next binlog so far (gtid_bloat)
+        self.shift = 0
         self.dumping = threading.Event()
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -173,31 +197,80 @@ class RenamingProxy:
                 except OSError:
                     pass
 
+    @staticmethod
+    def _finish(event: bytearray, has_crc: bool) -> bytes:
+        """'event' (without a footer) with its size field and, if the
+        stream has them, a fresh CRC32 footer, as a packet payload."""
+        struct.pack_into("<I", event, 9, len(event) + (4 if has_crc else 0))
+        if has_crc:
+            event += struct.pack("<I", zlib.crc32(bytes(event)))
+        return b"\x00" + bytes(event)
+
     def _rewrite(self, payload: bytes) -> bytes:
-        """The packet with its ROTATE event renamed, or unchanged."""
-        if len(payload) < 1 + HEADER_SIZE + ROTATE_POST_HEADER_SIZE or \
-                payload[0] != 0 or payload[1 + 4] != ROTATE_EVENT:
+        """The packet with its event changed by the attack, or unchanged."""
+        if len(payload) < 1 + HEADER_SIZE or payload[0] != 0:
             return payload
         event = payload[1:]
-        has_crc = (len(event) >= HEADER_SIZE + ROTATE_POST_HEADER_SIZE + 4 and
+        code = event[4]
+        flags = struct.unpack_from("<H", event, 17)[0]
+        has_crc = (len(event) >= HEADER_SIZE + 4 and
                    zlib.crc32(event[:-4]) == struct.unpack("<I",
                                                            event[-4:])[0])
         body_end = len(event) - (4 if has_crc else 0)
-        name = event[HEADER_SIZE + ROTATE_POST_HEADER_SIZE:body_end]
-        if name != self.old_name:
+        if code == ROTATE_EVENT and \
+                len(event) >= HEADER_SIZE + ROTATE_POST_HEADER_SIZE:
+            name = event[HEADER_SIZE + ROTATE_POST_HEADER_SIZE:body_end]
+            if name == self.old_name and flags & ARTIFICIAL_FLAG:
+                self.in_next_binlog = True
+            if self.attack == "rename" and name == self.old_name:
+                new_event = bytearray(
+                    event[:HEADER_SIZE + ROTATE_POST_HEADER_SIZE] +
+                    self.new_name)
+                log_pos = struct.unpack_from("<I", new_event, 13)[0]
+                if log_pos != 0:
+                    struct.pack_into("<I", new_event, 13, log_pos +
+                                     len(self.new_name) - len(name))
+                self.rewritten += 1
+                return self._finish(new_event, has_crc)
             return payload
-        delta = len(self.new_name) - len(name)
-        new_event = bytearray(event[:HEADER_SIZE + ROTATE_POST_HEADER_SIZE] +
-                              self.new_name)
-        struct.pack_into("<I", new_event, 9, len(new_event) +
-                         (4 if has_crc else 0))
-        log_pos = struct.unpack_from("<I", new_event, 13)[0]
-        if log_pos != 0:
-            struct.pack_into("<I", new_event, 13, log_pos + delta)
-        if has_crc:
-            new_event += struct.pack("<I", zlib.crc32(bytes(new_event)))
-        self.rewritten += 1
-        return b"\x00" + bytes(new_event)
+        if not self.in_next_binlog or code == FORMAT_DESCRIPTION_EVENT:
+            return payload
+        new_event = bytearray(event[:body_end])
+        if self.attack == "gtid_bloat" and \
+                code == PREVIOUS_GTIDS_LOG_EVENT and self.shift == 0:
+            uuid = (event[HEADER_SIZE + 8:HEADER_SIZE + 24]
+                    if body_end >= HEADER_SIZE + 24 else b"\x5a" * 16)
+            base = 1_000_000_000
+            body = (struct.pack("<q", 1) + uuid +
+                    struct.pack("<q", GTID_BLOAT_INTERVALS) +
+                    b"".join(struct.pack("<qq", base + 2 * k,
+                                         base + 2 * k + 1)
+                             for k in range(GTID_BLOAT_INTERVALS)))
+            new_event = bytearray(event[:HEADER_SIZE]) + body
+            self.shift = len(new_event) - body_end
+            log_pos = struct.unpack_from("<I", new_event, 13)[0]
+            struct.pack_into("<I", new_event, 13, log_pos + self.shift)
+            self.rewritten += 1
+            return self._finish(new_event, has_crc)
+        if self.attack == "gtid_bloat" and self.shift:
+            log_pos = struct.unpack_from("<I", new_event, 13)[0]
+            if log_pos != 0:
+                struct.pack_into("<I", new_event, 13, log_pos + self.shift)
+                return self._finish(new_event, has_crc)
+            return payload
+        if self.attack == "size_lie" and self.rewritten == 0 and \
+                code != PREVIOUS_GTIDS_LOG_EVENT:
+            self.rewritten += 1
+            event_with_lie = bytearray(event[:body_end])
+            if has_crc:
+                event_with_lie += b"\x00" * 4
+            struct.pack_into("<I", event_with_lie, 9, 0xFFFFFF00)
+            if has_crc:
+                struct.pack_into("<I", event_with_lie,
+                                 len(event_with_lie) - 4,
+                                 zlib.crc32(bytes(event_with_lie[:-4])))
+            return b"\x00" + bytes(event_with_lie)
+        return payload
 
     def _server_to_client(self, server, client):
         try:
@@ -224,6 +297,34 @@ class RenamingProxy:
 def snapshot(storage: Path) -> dict:
     return {path.name: path.read_bytes()
             for path in storage.iterdir() if path.is_file()}
+
+
+def run_fetch_sampled(binsrv, config_path: Path) -> dict:
+    """Runs fetch, sampling its resident memory; returns its exit code,
+    peak memory (MiB), duration and stderr tail."""
+    started = time.monotonic()
+    process = subprocess.Popen(
+        [str(binsrv.binary), "fetch", str(config_path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        env=dict(os.environ, AWS_EC2_METADATA_DISABLED="true"))
+    peak = 0
+    stderr = b""
+    while process.poll() is None:
+        try:
+            for line in Path(f"/proc/{process.pid}/status").read_text(
+            ).splitlines():
+                if line.startswith("VmRSS:"):
+                    peak = max(peak, int(line.split()[1]))
+        except OSError:
+            pass
+        if time.monotonic() - started > 180:
+            process.kill()
+            break
+        time.sleep(0.1)
+    _, stderr = process.communicate()
+    return {"exit": process.returncode, "peak_rss_mib": peak // 1024,
+            "seconds": round(time.monotonic() - started, 1),
+            "stderr": stderr.decode(errors="replace")[-600:]}
 
 
 def run_fetch(binsrv, config_path: Path) -> "tuple[int, str]":
@@ -263,7 +364,8 @@ def run_case(name: str, args, proxy_port: int) -> dict:
     before = snapshot(binsrv.storage)
     upcoming = stored[-1] + 1
     old_name = b"binlog.%06d" % upcoming
-    new_name = CASES[name](upcoming)
+    attack = "rename" if name in CASES else name
+    new_name = CASES[name](upcoming) if attack == "rename" else old_name
     harness.SERVER.sql("FLUSH BINARY LOGS")
     machine.run_workload(WORKLOAD)
 
@@ -275,11 +377,12 @@ def run_case(name: str, args, proxy_port: int) -> dict:
     proxied_config = binsrv.workdir / "binsrv-proxied.json"
     proxied_config.write_text(json.dumps(config, indent=2))
     cache_password_hash(args.mysql_basedir, args.port)
-    proxy = RenamingProxy(proxy_port, args.port, old_name, new_name)
+    proxy = RenamingProxy(proxy_port, args.port, old_name, new_name, attack)
     try:
-        proxied_exit, proxied_stderr = run_fetch(binsrv, proxied_config)
+        proxied = run_fetch_sampled(binsrv, proxied_config)
     finally:
         proxy.close()
+    proxied_exit, proxied_stderr = proxied["exit"], proxied["stderr"]
     after = snapshot(binsrv.storage)
     # a stored binlog may only grow (the ROTATE at its end is appended) and
     # its metadata follows it, so binlog data must keep its old bytes as a
@@ -310,9 +413,12 @@ def run_case(name: str, args, proxy_port: int) -> dict:
               if "[  error]" in line or "exception caught" in line][-3:] \
         if binsrv.log_path.exists() else []
     result = {
-        "case": name, "hostile_name": repr(new_name)[:120],
-        "rotates_rewritten": proxy.rewritten,
+        "case": name, "attack": attack,
+        "hostile_name": repr(new_name)[:120],
+        "events_rewritten": proxy.rewritten,
         "proxied_fetch_exit": proxied_exit,
+        "proxied_fetch_peak_rss_mib": proxied["peak_rss_mib"],
+        "proxied_fetch_seconds": proxied["seconds"],
         "files_changed": changed, "shared_files_changed": damaged_shared,
         "storage_entries": sorted(repr(entry)[1:-1][:60] for entry in
                                   os.listdir(binsrv.storage))[-10:],
@@ -322,7 +428,7 @@ def run_case(name: str, args, proxy_port: int) -> dict:
     }
     if proxy.rewritten == 0:
         result["ok"] = False
-        result["why"] = ("the proxy saw no ROTATE naming the next binlog "
+        result["why"] = ("the proxy changed nothing in the next binlog "
                          f"({old_name!r}): the case did not run")
         result["proxied_stderr"] = proxied_stderr
         return result
@@ -335,6 +441,10 @@ def run_case(name: str, args, proxy_port: int) -> dict:
     if list_exit != 0:
         problems.append("the storage no longer opens ('list' exit "
                         f"{list_exit}: {list_output.strip()[-200:]})")
+    if proxied["peak_rss_mib"] > 2048:
+        problems.append(f"fetch used {proxied['peak_rss_mib']} MiB")
+    if proxied["seconds"] > 120:
+        problems.append(f"fetch took {proxied['seconds']} s")
     result["ok"] = not problems
     if problems:
         result["why"] = "; ".join(problems)
@@ -347,20 +457,38 @@ def main():
     parser.add_argument("--binsrv", type=Path, required=True)
     parser.add_argument("--workdir", type=Path, required=True)
     parser.add_argument("--port", type=int, default=23580)
-    parser.add_argument("--mode", choices=["position"], default="position",
-                        help="position only: the GTID-mode resume differs and "
-                             "is not covered yet")
-    parser.add_argument("--cases", nargs="*", default=list(CASES),
-                        choices=list(CASES))
+    parser.add_argument("--mode", choices=["position", "gtid"],
+                        default="position")
+    parser.add_argument("--storage", choices=["file", "s3"], default="file")
+    parser.add_argument("--s3-endpoint", default="127.0.0.1:9000")
+    parser.add_argument("--s3-bucket", default="pbs-mtr")
+    parser.add_argument("--s3-bucket-dir", type=Path)
+    parser.add_argument("--s3-access-key", default="pbsaccesskey")
+    parser.add_argument("--s3-secret-key", default="pbs/secret+key=1")
+    parser.add_argument("--cases", nargs="*",
+                        choices=list(CASES) + RESOURCE_CASES)
     args = parser.parse_args()
     args.mysql_basedir = args.mysql_basedir.expanduser()
     args.workdir.mkdir(parents=True, exist_ok=True)
+    gtid_mode = args.mode == "gtid"
+    if args.cases is None:
+        args.cases = list(CASES) + [
+            name for name in RESOURCE_CASES
+            if name != "gtid_bloat" or gtid_mode]
+    s3 = None
+    if args.storage == "s3":
+        if args.s3_bucket_dir is None:
+            parser.error("--storage s3 needs --s3-bucket-dir")
+        s3 = harness.S3Storage(args.s3_endpoint, args.s3_bucket,
+                               args.s3_bucket_dir.expanduser(),
+                               args.s3_access_key, args.s3_secret_key,
+                               f"hostile-source-{args.mode}-{os.getpid()}")
     harness.SERVER = harness.MySQLServer(args.mysql_basedir,
                                          args.workdir / "mysql", args.port,
-                                         False, server_id=1)
+                                         gtid_mode, server_id=1)
     harness.BINSRV = harness.BinlogServer(args.binsrv.expanduser(),
                                           args.workdir / "binsrv", args.port,
-                                          False)
+                                          gtid_mode, s3)
     results = []
     harness.SERVER.start()
     try:

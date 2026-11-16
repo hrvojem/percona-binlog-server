@@ -355,7 +355,8 @@ def harness_command(args, workdir: Path) -> list:
     if args.harness in ("source_change_test", "large_binlog_test",
                         "pull_load_test", "listener_exhaustion_test",
                         "file_security_test", "hostile_source_test",
-                        "secrets_exposure_test"):
+                        "secrets_exposure_test", "upstream_tls_test",
+                        "listener_replica_dos_test"):
         return script + common + mode
     raise SystemExit(f"unknown harness {args.harness}")
 
@@ -374,7 +375,8 @@ def harness_cases(args, returncode: int, output: str, lines: list,
                         "pull_variety_test", "pull_replica_fault_test",
                         "pull_restart_test", "listener_exhaustion_test",
                         "file_security_test", "hostile_source_test",
-                        "secrets_exposure_test"):
+                        "secrets_exposure_test", "upstream_tls_test",
+                        "listener_replica_dos_test"):
         cases = []
         for result, _ in objects:
             if "case" not in result:

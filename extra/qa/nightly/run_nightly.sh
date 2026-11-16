@@ -122,7 +122,7 @@ QA_S3_EXAMPLES=${QA_S3_EXAMPLES:-5}
 S3_BUCKET_DIR=${S3_BUCKET_DIR:-$WS/s3/data/pbs-mtr}
 # the rotation of the heavier QA harnesses: '<weekday>:<harness>/<mode>'
 # (weekday 1-7 is Monday-Sunday, date +%u); 4-15 min a night (README.md)
-QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 4:pull_versions/ps-8.4 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 6:pull_versions/ps-9.7 7:network_fault_test/gtid 7:pull_soak_test/position 2:listener_exhaustion_test/position 5:file_security_test/position 1:hostile_source_test/position 3:secrets_exposure_test/position"}
+QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 4:pull_versions/ps-8.4 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 6:pull_versions/ps-9.7 7:network_fault_test/gtid 7:pull_soak_test/position 2:listener_exhaustion_test/position 5:file_security_test/position 1:hostile_source_test/position 3:secrets_exposure_test/position 4:upstream_tls_test/position 6:listener_replica_dos_test/gtid"}
 QA_ROTATION_DAY=${QA_ROTATION_DAY:-$(date -u +%u)}
 # pull_versions on Percona Server: '<label>:<series>:<distribution under
 # $WS/dist>' (8.4 is the release tarball, 9.7 a build of the 9.7 branch,
@@ -688,7 +688,9 @@ if want qa || want rotation; then
         [ "$harness" = listener_exhaustion_test ] ||
         [ "$harness" = file_security_test ] ||
         [ "$harness" = hostile_source_test ] ||
-        [ "$harness" = secrets_exposure_test ]; then
+        [ "$harness" = secrets_exposure_test ] ||
+        [ "$harness" = upstream_tls_test ] ||
+        [ "$harness" = listener_replica_dos_test ]; then
       build=debug_gcc14
       binsrv=$debug_binsrv
     fi
@@ -822,6 +824,18 @@ if want qa || want rotation; then
         qa_run secrets_exposure_test "secrets_exposure_test ($mode)" \
           "${common[@]}" --workdir "$out/qa/se-$mode" \
           --port $((QA_PORT + 510)) --timeout 900 ;;
+      upstream_tls_test)
+        # a man in the middle with attacker certificates, or stripping TLS,
+        # against each connection.ssl.mode; uses ports +10 to +30
+        qa_run upstream_tls_test "upstream_tls_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/ut-$mode" \
+          --port $((QA_PORT + 530)) --timeout 900 ;;
+      listener_replica_dos_test)
+        # logged-in replicas: a huge GTID set, many dumps, stalled readers,
+        # timing an ordinary client meanwhile (about 30 MB stored)
+        qa_run listener_replica_dos_test "listener_replica_dos_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/rd-$mode" \
+          --port $((QA_PORT + 570)) --timeout 1500 ;;
       *) log "unknown QA_ROTATION harness $harness" ;;
     esac
     log "$harness ($mode) done in $(( ($(date +%s) - stage_started) / 60 )) min"

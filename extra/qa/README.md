@@ -251,7 +251,7 @@ plants symlinks in the storage directory, while `pull` runs, under the names
 it creates next: the next binlog, its metadata's `.tmp` and `binlog.index.tmp`.
 On 2026-11-16 all three cases fail. Under umask 022, binlog data and metadata
 are 0644 (MySQL makes its binlogs 0640); under umask 000, the binlogs, their
-metadata, the index, `metadata.json` and the log are 0666 (ticket 56). Every
+metadata, the index, `metadata.json` and the log are 0666 (ticket 56, PBS-129). Every
 planted symlink is written through into the file outside the storage, and the
 rename that follows leaves `binlog.index` and the binlog metadata as
 permanent symlinks (ticket 57).
@@ -276,7 +276,12 @@ open (`list`). On 2026-11-16 four of six names fail (ticket 59). With
 mode"). With `binlog.index\0...` and a name containing a newline,
 `binlog.index` gets an invalid entry and the storage no longer opens. In all
 four cases `fetch` exits 0. `..` as a base name stays inside the storage, and
-a 3000-byte name makes `fetch` fail cleanly.
+a 3000-byte name makes `fetch` fail cleanly. The same four names fail in GTID
+mode (`--mode gtid`) and against an S3 storage on the local gateway
+(`--storage s3`). Two resource attacks pass: `size_lie` (an event that claims
+almost 4 GB is refused at once) and `gtid_bloat` (a PREVIOUS_GTIDS_LOG of
+900,000 intervals is stored in 0.9 s with 32 MB; what it later costs is not
+measured).
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/hostile_source_test.py \
@@ -296,6 +301,45 @@ secret. On 2026-11-16 nothing was found in 7 runs.
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/secrets_exposure_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/secrets
+```
+
+### Upstream TLS verification — `upstream_tls_test.py`
+
+A test CA signs the source's certificate. A proxy that understands the MySQL
+TLS upgrade sits between `fetch` and the source. It either terminates TLS with
+an attacker certificate (self-signed, or issued by the trusted CA for
+`evil.example`) and opens its own TLS to the source, or it clears CLIENT_SSL
+in the greeting. Each case logs in as a new user, so the source performs a
+caching_sha2_password full authentication. On 2026-11-16 every case behaves
+as MySQL's client does. `verify_ca` and `verify_identity` refuse the
+self-signed certificate, `verify_identity` also refuses the CA's certificate
+for another host, and `required` / `verify_*` refuse a stripped greeting. An
+HTTPS S3 endpoint with a self-signed certificate is refused before any
+request. Without an `ssl` section, and with `preferred` or `required`, the man
+in the middle is accepted and captures the replication password in clear;
+without a section, or with `preferred`, a stripped greeting is accepted too
+(ticket 60). Those cases pass, as this is the MySQL client's design, and the
+summary lists them.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/upstream_tls_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/upstream-tls
+```
+
+### Denial of service by logged-in replicas — `listener_replica_dos_test.py`
+
+Hostile but authenticated clients against `pull` (GTID mode, about 28 MB
+stored). While they run, the test measures how long an ordinary `mysqlbinlog`
+takes to be served, and `pull`'s memory. On 2026-11-16, `many_dumps` (300
+open blocking dumps) and `stalled_readers` (20 dumps that never read) pass:
+the ordinary client is served in about 0.2 s. `huge_gtid_set` fails (ticket
+61): one COM_BINLOG_DUMP_GTID with 1,000,000 intervals takes about 12 s, no
+other client is served meanwhile, and about 100 MB stays resident;
+`huge_gtid_sets_parallel` shows 8 such requests answered one after another.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/listener_replica_dos_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/listener-replica-dos
 ```
 
 ## S3 storage tests
@@ -708,9 +752,9 @@ server rather than starting one.
      | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position, about 2 min) | ASan; debug |
      | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0 | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
      | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) | ASan; debug |
-     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4 | ASan; debug |
+     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) | ASan; debug |
      | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 2 min) | ASan; debug |
-     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7 | debug / ASan; debug |
+     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min) | debug / ASan; debug |
      | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default) | ASan / debug |
 
      `pull_versions/<series>` runs the replica harnesses of the nightly 8.4

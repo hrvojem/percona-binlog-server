@@ -8,7 +8,8 @@
 # (s3_fault_sweep, disk_fault_sweep, network_fault_test, listener_fuzz_test,
 # source_change_test, large_binlog_test, pull_load_test,
 # listener_exhaustion_test, file_security_test, hostile_source_test,
-# secrets_exposure_test) run about once a week,
+# secrets_exposure_test, upstream_tls_test, listener_replica_dos_test) run
+# about once a week,
 # so their known failures show up on those nights only.
 # A sanitizer report is never covered by a pattern line (its reason names
 # the report) unless the ticket text mentions the sanitizer.
@@ -25,7 +26,8 @@ pull_soak_test position/log  ticket 45 (PBS-118): at info level pull logs every 
 pull_tls_test position/plain_refused_when_required  ticket 48: under require_secure_transport pull closes the connection of a plain client without an error packet, so the client sees only 'Lost connection to MySQL server during query' instead of ER_SECURE_TRANSPORT_REQUIRED (3159, 'Connections using insecure transport are prohibited'); pull keeps serving TLS clients
 telemetry_test position/settings_in_storage  ticket 50: with instance.local_settings_path pointing at the storage directory, the instance_id file is created before the storage is opened, so on a fresh storage fetch, list and pull all fail with 'storage is not empty but does not contain metadata'
 listener_exhaustion_test position/idle_flood  ticket 55: idle connections past pull's RLIMIT_NOFILE make accept() fail with EMFILE, handle_exception("listener") ends the accept loop and pull stays up without a listener for good
-file_security_test position/modes/*  ticket 56: storage files take their mode from the umask (binlog data and metadata 0644 under umask 022, everything 0666 under umask 000; MySQL creates binlogs 0640)
+file_security_test position/modes/*  ticket 56 (PBS-129): storage files take their mode from the umask (binlog data and metadata 0644 under umask 022, everything 0666 under umask 000; MySQL creates binlogs 0640)
 file_security_test position/symlinks  ticket 57: symlinks planted in the storage directory under the next binlog, its metadata's .tmp and binlog.index.tmp are written through into files outside the storage
 hostile_source_test position/nul_*  ticket 59: a binlog name from the source's ROTATE with a NUL byte ('binlog.000001\0.000002', 'metadata.json\0...', 'binlog.index\0...') passes composite_binlog_name::parse and is opened truncated at the NUL: a stored binlog loses its data, metadata.json or binlog.index is overwritten, and fetch exits 0
 hostile_source_test position/newline  ticket 59: a newline in a binlog name from the source's ROTATE is written into binlog.index, which then no longer opens
+listener_replica_dos_test gtid/huge_gtid_set*  ticket 61: a logged-in replica's COM_BINLOG_DUMP_GTID with a 1,000,000-interval GTID set (16 MB) occupies the listener for about 12 s, during which no other client is served, and leaves about 100 MB of resident memory behind

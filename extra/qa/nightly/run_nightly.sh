@@ -122,7 +122,7 @@ QA_S3_EXAMPLES=${QA_S3_EXAMPLES:-5}
 S3_BUCKET_DIR=${S3_BUCKET_DIR:-$WS/s3/data/pbs-mtr}
 # the rotation of the heavier QA harnesses: '<weekday>:<harness>/<mode>'
 # (weekday 1-7 is Monday-Sunday, date +%u); 4-15 min a night (README.md)
-QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 4:pull_versions/ps-8.4 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 6:pull_versions/ps-9.7 7:network_fault_test/gtid 7:pull_soak_test/position"}
+QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 4:pull_versions/ps-8.4 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 6:pull_versions/ps-9.7 7:network_fault_test/gtid 7:pull_soak_test/position 2:listener_exhaustion_test/position 5:file_security_test/position"}
 QA_ROTATION_DAY=${QA_ROTATION_DAY:-$(date -u +%u)}
 # pull_versions on Percona Server: '<label>:<series>:<distribution under
 # $WS/dist>' (8.4 is the release tarball, 9.7 a build of the 9.7 branch,
@@ -681,8 +681,12 @@ if want qa || want rotation; then
     # the trend, so it uses the debug build too
     # the other MySQL versions run the harnesses of the 8.4 stage, which
     # use the debug build
+    # the security harnesses measure pull's descriptors and memory, which
+    # ASan's shadow memory and quarantine would distort
     if [ "$harness" = disk_fault_sweep ] || [ "$harness" = pull_soak_test ] ||
-        [ "$harness" = pull_versions ]; then
+        [ "$harness" = pull_versions ] ||
+        [ "$harness" = listener_exhaustion_test ] ||
+        [ "$harness" = file_security_test ]; then
       build=debug_gcc14
       binsrv=$debug_binsrv
     fi
@@ -792,6 +796,18 @@ if want qa || want rotation; then
             --workdir "$out/qa/v$label-replica-fault-gtid" --mode gtid \
             --port $((QA_PORT + 430)) --timeout 1500
         fi ;;
+      listener_exhaustion_test)
+        # clients that never log in: an idle flood past pull's descriptor
+        # limit, oversized frame headers, slowly fed frames (about 2 min)
+        qa_run listener_exhaustion_test "listener_exhaustion_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/lx-$mode" \
+          --port $((QA_PORT + 450)) --timeout 900 ;;
+      file_security_test)
+        # storage file modes under umask 022 / 000 and symlinks planted in
+        # the storage directory (about 2 min)
+        qa_run file_security_test "file_security_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/fs-$mode" \
+          --port $((QA_PORT + 470)) --timeout 900 ;;
       *) log "unknown QA_ROTATION harness $harness" ;;
     esac
     log "$harness ($mode) done in $(( ($(date +%s) - stage_started) / 60 )) min"

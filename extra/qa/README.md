@@ -644,7 +644,7 @@ server rather than starting one.
      `gtid/catch_up`, `gtid/restart`, `gtid/purged` and `gtid/ahead`, port
      `QA_PORT`+230), `pull_gtid_set_test.py` (auto-positioning with
      uneven replica GTID sets, 10 `gtid/...` cases, port `QA_PORT`+250) and
-     `telemetry_test.py` (telemetry and instance_id, 24 `position/...`
+     `telemetry_test.py` (telemetry and instance_id, 25 `position/...`
      cases with the file system fault cases, port `QA_PORT`+270) and
      `upgrade_test.py` per mode (a storage of the release in `OLD_BINSRV`
      taken over: 5 position and 6 gtid cases, port `QA_PORT`+290; skipped
@@ -669,10 +669,10 @@ server rather than starting one.
      | Day | Harness (mode) | Build |
      | --- | --- | --- |
      | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7 | ASan; debug |
-     | Tue | `disk_fault_sweep.py` (position); `pull_versions` on 8.0 | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first) |
+     | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0 | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
      | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end) | ASan |
      | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4 | ASan; debug |
-     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`) | ASan |
+     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 2 min) | ASan; debug |
      | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7 | debug / ASan; debug |
      | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default) | ASan / debug |
 

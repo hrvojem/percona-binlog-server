@@ -61,6 +61,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -465,6 +466,11 @@ public:
 
   [[nodiscard]] std::uint16_t port() const {
     return source_config_.get<"port">();
+  }
+  // the scratch directory holding the configuration and, in 'storage', the
+  // storage
+  [[nodiscard]] const std::filesystem::path &root_path() const {
+    return root_.path();
   }
 
 private:
@@ -2524,6 +2530,173 @@ BOOST_AUTO_TEST_CASE(ReplicationSourceLogsAFailedDumpAndKeepsListening) {
     BOOST_TEST_INFO(label);
     BOOST_CHECK(next.read_reply().kind == reply_kind::ok);
   }
+}
+
+// the names of the files under 'directory' with their content, to see that
+// nothing was created, changed or removed
+[[nodiscard]] std::map<std::string, std::string>
+directory_snapshot(const std::filesystem::path &directory) {
+  std::map<std::string, std::string> result;
+  for (const auto &entry :
+       std::filesystem::recursive_directory_iterator{directory}) {
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+    std::ifstream file{entry.path(), std::ios::binary};
+    std::ostringstream content;
+    content << file.rdbuf();
+    result.emplace(entry.path().lexically_relative(directory).generic_string(),
+                   content.str());
+  }
+  return result;
+}
+
+// the binlog name of a COM_BINLOG_DUMP is chosen by the client: a name that
+// is not in the storage's binlog index - a path out of the storage
+// ('../secret.000001', an absolute path), another storage object (the
+// index, a metadata file), a file planted in the storage directory that the
+// index does not list, a name with a NUL byte, a case variant, an oversized
+// name - is never served (security catalog property
+// dump-name-never-escapes-the-index): the reply is an error or a closed
+// connection, never an event; no file inside or outside the storage is
+// created, changed or removed; and the listener goes on accepting
+// connections. Since PBS-120 a named binlog is looked up in the index
+// (storage::contains_binlog) before anything is opened.
+BOOST_AUTO_TEST_CASE(ReplicationSourceServesOnlyIndexedBinlogNames) {
+  run_property([](hegel::TestCase &tc) {
+    const auto settings{tc.draw("settings", source_settings_generator())};
+    static constexpr std::size_t max_long_name{8192U};
+    std::string binlog;
+    if (tc.draw("oversized", gs::integers<int>({.min_value = 0, .max_value = 9})) ==
+        0) {
+      binlog.assign(tc.draw("length", gs::integers<std::size_t>(
+                                          {.min_value = 256U,
+                                           .max_value = max_long_name})),
+                    'a');
+      binlog += ".000001";
+    } else {
+      const auto prefix{tc.draw(
+          "prefix",
+          gs::sampled_from(std::vector<std::string>{
+              "", "../", "../../", "../../../../../../", "/", "./",
+              "storage/", "../storage/", "/tmp/", "/etc/", "..\\",
+              "%2e%2e/", std::string{"\0../", 4U}}))};
+      const auto base{tc.draw(
+          "base", gs::sampled_from(std::vector<std::string>{
+                      "secret", "binlog", "orphan", "BINLOG", "Binlog",
+                      "metadata", "binlog.index", "binlog.000001",
+                      "config", "passwd", "..", ".", " binlog", "binlog ",
+                      std::string{"binlog\0", 7U},
+                      std::string{"binlog\0../secret", 16U}}))};
+      const auto suffix{tc.draw(
+          "suffix", gs::sampled_from(std::vector<std::string>{
+                        ".000001", ".000002", ".000001.json", ".json", "",
+                        "/.000001", std::string{"\0.000001", 8U}, ".1",
+                        ".0000001", ".-00001", ".+00001", ". 00001",
+                        ".000001/", ".000001/..", ".index"}))};
+      binlog = prefix + base + suffix;
+    }
+    if (binlog == "binlog.000001" || binlog.empty()) {
+      // the one stored binlog, and the empty name (the first binlog): both
+      // are served
+      return;
+    }
+    static constexpr std::uint64_t max_position{512U};
+    const command dump{
+        .kind = command_kind::binlog_dump,
+        .statement = {},
+        .dump_binlog = binlog,
+        .dump_position = tc.draw(
+            "position", gs::integers<std::uint64_t>(
+                            {.min_value = 0U, .max_value = max_position}))};
+
+    const replication_source source{settings};
+    // canaries: a file beside the storage that a path out of it would reach,
+    // and binlog-named files in the storage directory that the index does
+    // not list; each is a complete binlog preamble (the magic, a
+    // FORMAT_DESCRIPTION and a PREVIOUS_GTIDS_LOG), so a reader that opened
+    // one would stream from it
+    const auto storage_dir{source.root_path() / "storage"};
+    std::vector<std::byte> canary{
+        std::cbegin(binsrv::events::magic_binlog_payload),
+        std::cend(binsrv::events::magic_binlog_payload)};
+    {
+      binsrv::events::event_storage fde;
+      operations::generate_format_description_event_ex(
+          fde, util::semantic_version{8U, 4U, 8U},
+          binsrv::events::magic_binlog_offset, stored_fde_server_id,
+          /*enable_checksum_algorithm=*/true, /*artificial=*/false);
+      canary.insert(std::end(canary), std::cbegin(fde), std::cend(fde));
+      const auto previous_gtids{
+          make_previous_gtids_log(std::size(canary), stored_fde_server_id)};
+      canary.insert(std::end(canary), std::cbegin(previous_gtids),
+                    std::cend(previous_gtids));
+    }
+    for (const auto &path :
+         {source.root_path() / "secret.000001", storage_dir / "orphan.000001",
+          storage_dir / "binlog.000002"}) {
+      std::ofstream file{path, std::ios::binary};
+      file.write(reinterpret_cast<const char *>( // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+                     std::data(canary)),
+                 static_cast<std::streamsize>(std::size(canary)));
+    }
+    const auto before{directory_snapshot(source.root_path())};
+
+    reply received{};
+    {
+      mysql_client client{source.port()};
+      client.authenticate(replica_user, replica_password);
+      client.write_frame(encode_command(
+          {.kind = command_kind::query,
+           .statement = "SET @source_binlog_checksum = 'NONE', "
+                        "@master_binlog_checksum = 'NONE'"},
+          client.capabilities()));
+      require(client.read_reply().kind == reply_kind::ok,
+              "the checksum SET was not answered with OK");
+      client.write_frame(encode_command(dump, client.capabilities()));
+      received = client.read_dump_reply();
+    }
+
+    std::string printable;
+    for (const char character : binlog.substr(0U, 80U)) {
+      printable += (character == '\0') ? std::string{"\\0"}
+                                       : std::string{character};
+    }
+    if (std::size(binlog) > 80U) {
+      printable += "... (" + std::to_string(std::size(binlog)) + " bytes)";
+    }
+    std::ostringstream label;
+    label << "a dump of '" << printable << "':" << dump.dump_position;
+    std::ostringstream reply_text;
+    reply_text << received;
+    require(received.events == 0U &&
+                (received.kind == reply_kind::error ||
+                 received.kind == reply_kind::closed),
+            label.str() + " was not refused: " + reply_text.str() +
+                (received.detail.empty() ? "" : " (" + received.detail + ")"));
+
+    // the session may still be ending; the files are compared after a new
+    // session has been answered
+    mysql_client next{source.port()};
+    next.authenticate(replica_user, replica_password);
+    next.write_frame(encode_command({.kind = command_kind::ping, .statement = {}},
+                                    next.capabilities()));
+    require(next.read_reply().kind == reply_kind::ok,
+            "after " + label.str() +
+                " a new connection was not answered with OK to COM_PING");
+    const auto after{directory_snapshot(source.root_path())};
+    for (const auto &[name, content] : after) {
+      const auto found{before.find(name)};
+      require(found != std::cend(before) || name.starts_with("local_settings"),
+              label.str() + " created '" + name + "'");
+      require(found == std::cend(before) || found->second == content ||
+                  name.starts_with("local_settings"),
+              label.str() + " changed '" + name + "'");
+    }
+    for (const auto &[name, content] : before) {
+      require(after.contains(name), label.str() + " removed '" + name + "'");
+    }
+  });
 }
 
 // COM_RESET_CONNECTION and COM_CHANGE_USER, which a connection pool or the

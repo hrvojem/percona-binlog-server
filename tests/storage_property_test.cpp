@@ -174,6 +174,7 @@
 #include "util/byte_span.hpp"
 #include "util/byte_span_fwd.hpp"
 #include "util/byte_span_inserters.hpp"
+#include "util/crc_helpers.hpp"
 #include "util/ctime_timestamp.hpp"
 #include "util/semantic_version.hpp"
 #include "util/ctime_timestamp_range.hpp"
@@ -3928,6 +3929,262 @@ void run_keystream_property(hegel::TestCase &tc) {
               " differing byte(s) encrypted with the same keystream");
 }
 
+
+// ---------------------------------------------------------------------------
+// tampering with encrypted binlog data (security catalog property
+// encrypted-binlog-tampering-detected)
+// ---------------------------------------------------------------------------
+
+// an event with a valid common header, 'payload_size' bytes of a pattern
+// that depends on 'seed' and a valid CRC32 footer, as MySQL writes it with
+// binlog_checksum=CRC32
+[[nodiscard]] std::vector<std::byte>
+tamper_event_bytes(std::size_t payload_size, std::uint64_t seed,
+                   std::uint32_t log_pos) {
+  using header = binsrv::events::common_header_view_base;
+  static constexpr std::uint64_t byte_multiplier{131ULL};
+  const auto size{header::size_in_bytes + payload_size +
+                  binsrv::events::default_footer_length};
+  std::vector<std::byte> result(size);
+  for (std::size_t index{header::size_in_bytes};
+       index < size - binsrv::events::default_footer_length; ++index) {
+    result[index] =
+        static_cast<std::byte>((seed + index * byte_multiplier) & 0xFFU);
+  }
+  const auto write_field{[&result](std::size_t offset, auto value) {
+    util::byte_span field{std::next(std::data(result),
+                                    static_cast<std::ptrdiff_t>(offset)),
+                          sizeof value};
+    util::insert_fixed_int_to_byte_span(field, value);
+  }};
+  write_field(header::timestamp_offset, std::uint32_t{1U});
+  write_field(header::type_code_offset,
+              static_cast<std::uint8_t>(binsrv::events::code_type::query));
+  write_field(header::server_id_offset, std::uint32_t{1U});
+  write_field(header::event_size_offset, static_cast<std::uint32_t>(size));
+  write_field(header::next_event_position_offset, log_pos);
+  write_field(size - binsrv::events::default_footer_length,
+              util::calculate_crc32(util::const_byte_span{result}.subspan(
+                  0U, size - binsrv::events::default_footer_length)));
+  return result;
+}
+
+// whether the CRC32 footer of an event matches its content (what a replica
+// with source_verify_checksum / binlog_checksum=CRC32 checks)
+[[nodiscard]] bool has_valid_crc32(const std::vector<std::byte> &event) {
+  const auto footer{binsrv::events::default_footer_length};
+  if (std::size(event) < footer) {
+    return false;
+  }
+  const util::const_byte_span bytes{event};
+  std::uint32_t stored{0U};
+  for (std::size_t index{0U}; index < footer; ++index) {
+    stored |= static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(
+                  bytes[std::size(event) - footer + index]))
+              << (8U * index);
+  }
+  return stored == util::calculate_crc32(
+                       bytes.subspan(0U, std::size(event) - footer));
+}
+
+// AES-CTR encrypts by XOR with a keystream, so XORing a ciphertext byte
+// XORs the same plaintext byte; and CRC32 is affine in its input:
+// crc(m ^ d) = crc(m) ^ crc(d) ^ crc(0) for inputs of equal length. Someone
+// who can write the storage (a filesystem or S3 bucket) but holds no key can
+// therefore change chosen bytes of an encrypted event and patch its CRC32
+// footer to match, knowing only where the event lies in the file (the sizes
+// of the events, which the ciphertext's length and the metadata reveal).
+// The storage keeps no MAC of binlog data (the file key envelope has a GCM
+// tag, the data has none), so the change can only be caught if the reader
+// rejects the data. The property: every event read back from an encrypted
+// binlog is the event written, or the read fails.
+void run_tampering_property(hegel::TestCase &tc) {
+  const auto kek_id{tc.draw("kek_id", gs::sampled_from(keyring_key_ids))};
+  const bool block_mode_kek{std::ranges::find(block_mode_key_ids, kek_id) !=
+                            std::cend(block_mode_key_ids)};
+  const auto data_cipher{tc.draw(
+      "data_cipher",
+      gs::sampled_from(block_mode_kek
+                           ? std::vector<std::string>{"AES-128-CTR",
+                                                      "AES-256-CTR"}
+                           : std::vector<std::string>{"AES-128-CTR",
+                                                      "AES-192-CTR",
+                                                      "AES-256-CTR"}))};
+  static constexpr std::size_t max_events{8U};
+  static constexpr std::size_t max_payload{200U};
+  const auto payload_sizes{tc.draw(
+      "payload_sizes",
+      gs::vectors(gs::integers<std::size_t>(
+                      {.min_value = 1U, .max_value = max_payload}),
+                  {.min_size = 1U, .max_size = max_events}))};
+  const auto target{tc.draw(
+      "target_event",
+      gs::integers<std::size_t>(
+          {.min_value = 0U, .max_value = std::size(payload_sizes) - 1U}))};
+  const auto target_payload{payload_sizes[target]};
+  const auto offset{tc.draw(
+      "offset_in_payload",
+      gs::integers<std::size_t>(
+          {.min_value = 0U, .max_value = target_payload - 1U}))};
+  static constexpr std::size_t max_delta{16U};
+  const auto delta{tc.draw(
+      "delta",
+      gs::vectors(gs::integers<std::uint8_t>({.min_value = 1U, .max_value = 255U}),
+                  {.min_size = 1U,
+                   .max_size = std::min(max_delta, target_payload - offset)}))};
+  const bool fix_crc{tc.draw("patch_crc32", gs::booleans())};
+
+  const storage_settings settings{
+      .s3 = std::nullopt,
+      .gtid_mode = false,
+      .checkpoint_size = std::nullopt,
+      .encryption =
+          encryption_settings{.kek_id = kek_id, .data_cipher = data_cipher},
+      .tailing_reader_block_size = 0U,
+      .fresh_reader_block_size = 0U,
+      .reader_checksum = false};
+  const scratch_directory root{};
+  {
+    std::ofstream keyring{root.path() / keyring_name};
+    keyring << keyring_content;
+  }
+  directory_location location{root.path() / "storage"};
+  const auto config{
+      write_config(root.path(), location.config_members(), settings)};
+  const binsrv::events::composite_binlog_name name{binlog_base_name, 1U};
+
+  // a FORMAT_DESCRIPTION announcing CRC32, a PREVIOUS_GTIDS_LOG and the
+  // events, each with a valid CRC32; the binlog is closed and a second one
+  // opened, as after a rotation
+  static constexpr std::size_t preamble_events{2U};
+  event_list written;
+  std::vector<std::size_t> event_offsets;
+  {
+    const auto writer{make_storage(config)};
+    require(writer->open_binlog(name) == binsrv::open_binlog_status::created,
+            "the binlog was not created");
+    std::uint64_t position{binsrv::events::magic_binlog_offset};
+    binsrv::events::event_storage fde;
+    operations::generate_format_description_event_ex(
+        fde, util::semantic_version{8U, 4U, 8U},
+        static_cast<std::uint32_t>(position), 1U,
+        /*enable_checksum_algorithm=*/true, /*artificial=*/false);
+    written.emplace_back(std::cbegin(fde), std::cend(fde));
+    position += std::size(fde);
+    written.push_back(make_previous_gtids_log(position, 1U));
+    position += std::size(written.back());
+    std::uint64_t seed{7U};
+    for (const auto payload_size : payload_sizes) {
+      const auto size{binsrv::events::common_header_view_base::size_in_bytes +
+                      payload_size + binsrv::events::default_footer_length};
+      event_offsets.push_back(position);
+      written.push_back(tamper_event_bytes(
+          payload_size, seed++, static_cast<std::uint32_t>(position + size)));
+      position += size;
+    }
+    for (const auto &event : written) {
+      writer->write_event(util::const_byte_span{event},
+                          /*at_transaction_boundary=*/true,
+                          binsrv::gtids::gtid{},
+                          util::ctime_timestamp{std::time_t{1}}, 0ULL);
+    }
+    writer->flush_event_buffer();
+    writer->close_binlog();
+    require(writer->open_binlog(name.next()) ==
+                binsrv::open_binlog_status::created,
+            "the second binlog was not created");
+  }
+
+  const auto read_back{[&config](event_list &received) -> std::string {
+    const auto storage{make_storage(
+        config, binsrv::storage_construction_mode_type::querying_only)};
+    operations::sender_context reader{
+        std::make_shared<binsrv::null_logger>(),
+        storage,
+        operations::sender_single_file_context::min_allowed_block_size,
+        binsrv::replication_mode_type::position,
+        std::string_view{},
+        binsrv::events::magic_binlog_offset,
+        binsrv::gtids::gtid_set{},
+        /*session_source_binlog_checksum=*/true};
+    try {
+      read_until_end(reader, received, max_events + 8U, "reading back");
+    } catch (const std::exception &e) {
+      return e.what();
+    }
+    strip_artificial_rotates(received);
+    return {};
+  }};
+
+  // sanity: the untouched binlog reads back as written, and is encrypted
+  event_list untouched;
+  const auto untouched_error{read_back(untouched)};
+  require(untouched_error.empty() && untouched == written,
+          "the untouched encrypted binlog did not read back as written" +
+              (untouched_error.empty() ? std::string{}
+                                       : ": " + untouched_error));
+  auto ciphertext{location.read(name.str())};
+  require(std::size(ciphertext) >= event_offsets[target],
+          "the binlog file is shorter than its events");
+  require(!std::equal(std::next(std::cbegin(ciphertext),
+                                static_cast<std::ptrdiff_t>(
+                                    event_offsets[target])),
+                      std::next(std::cbegin(ciphertext),
+                                static_cast<std::ptrdiff_t>(
+                                    event_offsets[target] +
+                                    std::size(written[target + preamble_events]))),
+                      std::cbegin(written[target + preamble_events])),
+          "the binlog is stored unencrypted");
+
+  // the attacker's change: XOR 'delta' into the target event's payload at
+  // 'offset' and, if chosen, the matching change into its CRC32 footer
+  using header = binsrv::events::common_header_view_base;
+  const auto event_start{event_offsets[target]};
+  const auto event_size{std::size(written[target + preamble_events])};
+  const auto covered{event_size - binsrv::events::default_footer_length};
+  std::vector<std::byte> difference(covered);
+  for (std::size_t index{0U}; index < std::size(delta); ++index) {
+    const auto at{header::size_in_bytes + offset + index};
+    difference[at] = static_cast<std::byte>(delta[index]);
+    ciphertext[event_start + at] ^= static_cast<std::byte>(delta[index]);
+  }
+  if (fix_crc) {
+    const std::vector<std::byte> zeros(covered);
+    const auto crc_delta{
+        util::calculate_crc32(util::const_byte_span{difference}) ^
+        util::calculate_crc32(util::const_byte_span{zeros})};
+    for (std::size_t index{0U};
+         index < binsrv::events::default_footer_length; ++index) {
+      ciphertext[event_start + covered + index] ^=
+          static_cast<std::byte>((crc_delta >> (8U * index)) & 0xFFU);
+    }
+  }
+  location.write(name.str(), ciphertext);
+
+  event_list tampered;
+  const auto tampered_error{read_back(tampered)};
+  if (!tampered_error.empty()) {
+    return; // the change was detected
+  }
+  for (std::size_t index{0U};
+       index < std::min(std::size(tampered), std::size(written)); ++index) {
+    if (tampered[index] != written[index]) {
+      require(false,
+              "a changed event was read back from the encrypted binlog "
+              "without an error (event " +
+                  std::to_string(index) + ", " + std::to_string(std::size(delta)) +
+                  " byte(s) changed at payload offset " +
+                  std::to_string(offset) + ", its CRC32 " +
+                  (has_valid_crc32(tampered[index])
+                       ? "valid, so a replica accepts it"
+                       : "invalid, so only a replica checking it notices") +
+                  ")");
+    }
+  }
+  require(tampered == written,
+          "the tampered binlog read back a different number of events");
+}
+
 } // anonymous namespace
 
 BOOST_AUTO_TEST_CASE(StorageMatchesModel) {
@@ -4103,4 +4360,12 @@ BOOST_AUTO_TEST_CASE(StorageRestartSurvivesAFaultOnS3) {
 // ctr-keystream-not-reused-across-truncation)
 BOOST_AUTO_TEST_CASE(StorageNeverReusesKeystreamAfterCrashRecovery) {
   run_property([](hegel::TestCase &tc) { run_keystream_property(tc); });
+}
+
+// a change to an encrypted binlog's data, by someone who can write the
+// storage but holds no key, is detected when it is read back (security
+// catalog property encrypted-binlog-tampering-detected): AES-CTR is
+// malleable and CRC32 is affine, so the CRC32 footer can be patched to match
+BOOST_AUTO_TEST_CASE(StorageDetectsTamperingWithEncryptedBinlogData) {
+  run_property([](hegel::TestCase &tc) { run_tampering_property(tc); });
 }

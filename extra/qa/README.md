@@ -887,6 +887,17 @@ Since PBS-41 every configuration these tests write has an
 `storage_property_test`'s concurrent property runs a second reader that
 resumes from a position mid-run and checks every artificial event and
 heartbeat; the heartbeat checks are shared in `tests/heartbeat_test_helpers.hpp`.
+Two of the properties are security checks. `ReplicationSourceServesOnlyIndexedBinlogNames`
+sends COM_BINLOG_DUMP with names a client could use to get out of the
+storage: paths out of it, other storage objects, files planted beside or
+inside it that the binlog index does not list, NUL bytes, case variants and
+oversized names. Every one must be refused with no event streamed and no
+file created, changed or removed; it passes since PBS-120 looks a named
+binlog up in the index. `StorageDetectsTamperingWithEncryptedBinlogData`
+changes bytes of an encrypted binlog's ciphertext as someone with write
+access to the storage but no key could, optionally patching the event's
+CRC32 footer to match (AES-CTR is malleable, CRC32 is affine). It fails
+(ticket 53, PBS-126): the changed event is read back without an error.
 Build them with
 `-DWITH_PROPERTY_TESTS=ON` and run them with `ctest`. Their design, settings profiles (`hegel.toml`), how to
 replay a failure, and a per-test rundown are documented in

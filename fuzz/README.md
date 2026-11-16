@@ -8,7 +8,7 @@ malformed traffic at a running `pull`. libFuzzer keeps every input that reaches
 new code and mutates it further, so over time it digs into parsing paths that
 random generation rarely reaches. What it finds is the class of bug these
 parsers have had before: a crash, a `std::terminate` or a sanitizer report on
-malformed input (tickets 1, 3, 5, 7 and 39 / PBS-112).
+malformed input (tickets 1, 3, 5, 7 and 39: PBS-68, PBS-70, PBS-71, PBS-73 and PBS-112).
 
 | Target | Input | Code under test |
 | --- | --- | --- |

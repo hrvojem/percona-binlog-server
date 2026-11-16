@@ -2,32 +2,32 @@
 # <test case> <ticket>
 # A failure listed here is reported as known; any other failure is NEW.
 # Remove a line once its bug is fixed.
-EventParsingOfCorruptedEventsFailsCleanly  ticket 5: oversized GTID tag (a corrupted tag length in a GTID_TAGGED_LOG overflows the 32-byte tag buffer: boost::container::bad_alloc, not a clean rejection)
-EventPrintingOfCorruptedEventsFailsCleanly  ticket 5: oversized GTID tag (a corrupted tag length in the lazily decoded GTID set of a PREVIOUS_GTIDS_LOG overflows the 32-byte tag buffer when printed: boost::container::bad_alloc)
-GtidSetParseRejectsOutOfRangeGno  ticket 3: gtid_set GNO bounds
-GtidSetAddIntervalRejectsOutOfRangeUpperBound  ticket 3: gtid_set GNO bounds
-GtidSetSubtractIntervalBeyondMaxGnoRemovesTail  ticket 3: gtid_set GNO bounds
-GtidSetDecodedFromBinaryIsPrintable  ticket 3: gtid_set GNO bounds
-CipherContextOffsetMatchesCounterReference  ticket 8: CTR counter carry in create_with_offset
-CipherContextDecryptionAtOffsetsRoundTrips  ticket 8: CTR counter carry in create_with_offset
-CipherContextSplitEncryptionMatchesWhole  ticket 8: CTR counter carry (split encryption variant)
+EventParsingOfCorruptedEventsFailsCleanly  ticket 5 (PBS-71): oversized GTID tag (a corrupted tag length in a GTID_TAGGED_LOG overflows the 32-byte tag buffer: boost::container::bad_alloc, not a clean rejection)
+EventPrintingOfCorruptedEventsFailsCleanly  ticket 5 (PBS-71): oversized GTID tag (a corrupted tag length in the lazily decoded GTID set of a PREVIOUS_GTIDS_LOG overflows the 32-byte tag buffer when printed: boost::container::bad_alloc)
+GtidSetParseRejectsOutOfRangeGno  ticket 3 (PBS-70): gtid_set GNO bounds
+GtidSetAddIntervalRejectsOutOfRangeUpperBound  ticket 3 (PBS-70): gtid_set GNO bounds
+GtidSetSubtractIntervalBeyondMaxGnoRemovesTail  ticket 3 (PBS-70): gtid_set GNO bounds
+GtidSetDecodedFromBinaryIsPrintable  ticket 3 (PBS-70): gtid_set GNO bounds
+CipherContextOffsetMatchesCounterReference  ticket 8 (PBS-74): CTR counter carry in create_with_offset
+CipherContextDecryptionAtOffsetsRoundTrips  ticket 8 (PBS-74): CTR counter carry in create_with_offset
+CipherContextSplitEncryptionMatchesWhole  ticket 8 (PBS-74): CTR counter carry (split encryption variant)
 MinimysqlBinlogEventFramesRoundTrip  ticket 10 (PBS-76): binlog events of 16 MB or more in pull mode
-TimestampParsingMatchesModel  ticket 11: out-of-range time of day accepted (search_by_timestamp)
-FilesystemStorageUriMatchesModel  ticket 12: file URI with %00 opens the directory before it
+TimestampParsingMatchesModel  ticket 11 (PBS-77): out-of-range time of day accepted (search_by_timestamp)
+FilesystemStorageUriMatchesModel  ticket 12 (PBS-78): file URI with %00 opens the directory before it
 EmptyStorageIsPolledUntilTheBinlogArrivesFromPosition  ticket 26 (PBS-96): resuming from a position on an empty storage disconnects the client
-MisalignedDumpPositionNeverStreamsGarbage  tickets 7/39 (PBS-112): since the PBS-112 fix a misaligned position no longer terminates, but bytes from inside an event whose header looks valid are streamed as an event (from position 20, 16 bytes into the FORMAT_DESCRIPTION) instead of the dump being refused (ER 1236 on MySQL)
-StorageQueryingLeavesItUnchanged  ticket 28: querying_only open rewrites metadata.json when the config adds encryption (storage_core.cpp:174-178)
-StorageQueryingLeavesItUnchangedOnS3  ticket 28: querying_only open rewrites metadata.json when the config adds encryption (S3 backend variant)
-StorageClosingMidTransactionDropsIt  ticket 6: closing a binlog mid-transaction keeps the dropped events' timestamps (assert at storage.cpp:138)
-StorageConcurrentQueriesSucceed  ticket 29: a query next to a writer fails stat()ing a .tmp file the writer renamed away
-StorageNeverReusesKeystreamAfterCrashRecovery  ticket 32: CTR keystream reuse after crash truncation (recovery truncates the unrecorded tail and the next write reuses the file's key/IV at the same offsets)
-ReplicationSourceMatchesStatementsExactlyOrByPrefix  ticket 31: since PBS-30's regexes ('\b' also matches at the end and before any non-word character) 'SET @slave_uuid', 'SET @replica_uuid', 'SET NAMES' with nothing or anything after them are answered OK (network_service.cpp, handshake_query_patterns.hpp)
+MisalignedDumpPositionNeverStreamsGarbage  tickets 7/39 (PBS-73/PBS-112): since the PBS-112 fix a misaligned position no longer terminates, but bytes from inside an event whose header looks valid are streamed as an event (from position 20, 16 bytes into the FORMAT_DESCRIPTION) instead of the dump being refused (ER 1236 on MySQL)
+StorageQueryingLeavesItUnchanged  ticket 28 (PBS-100): querying_only open rewrites metadata.json when the config adds encryption (storage_core.cpp:174-178)
+StorageQueryingLeavesItUnchangedOnS3  ticket 28 (PBS-100): querying_only open rewrites metadata.json when the config adds encryption (S3 backend variant)
+StorageClosingMidTransactionDropsIt  ticket 6 (PBS-72): closing a binlog mid-transaction keeps the dropped events' timestamps (assert at storage.cpp:138)
+StorageConcurrentQueriesSucceed  ticket 29 (PBS-101): a query next to a writer fails stat()ing a .tmp file the writer renamed away
+StorageNeverReusesKeystreamAfterCrashRecovery  ticket 32 (PBS-104): CTR keystream reuse after crash truncation (recovery truncates the unrecorded tail and the next write reuses the file's key/IV at the same offsets)
+ReplicationSourceMatchesStatementsExactlyOrByPrefix  ticket 31 (PBS-103): since PBS-30's regexes ('\b' also matches at the end and before any non-word character) 'SET @slave_uuid', 'SET @replica_uuid', 'SET NAMES' with nothing or anything after them are answered OK (network_service.cpp, handshake_query_patterns.hpp)
 # Release build (release_gcc14, assertions compiled out): how a known bug
 # fails differently there. '<build>:<test case>' lines win for that build.
-release_gcc14:StorageClosingMidTransactionDropsIt  ticket 6 (release): no assert, the binlog record keeps the dropped events' timestamps ('timestamps do not match the events on disk'), debug aborts at storage.cpp:138
-EmptyStorageIsPolledUntilTheBinlogArrives  ticket 38: since PBS-29 a dump naming a binlog on an empty storage is refused instead of polled, which reopens the PBS-91 startup race
+release_gcc14:StorageClosingMidTransactionDropsIt  ticket 6 (PBS-72) (release): no assert, the binlog record keeps the dropped events' timestamps ('timestamps do not match the events on disk'), debug aborts at storage.cpp:138
+EmptyStorageIsPolledUntilTheBinlogArrives  ticket 38 (PBS-111): since PBS-29 a dump naming a binlog on an empty storage is refused instead of polled, which reopens the PBS-91 startup race
 IdleHeartbeatReportsTheReplicaCoordinates  ticket 40 (PBS-113): no heartbeat while a caught-up reader waits in a new binlog that holds only the magic (PBS-30 generate_heartbeat() before the preamble), which lasts until the next checkpoint or rotation
 ReplicationSourceLogsDisconnectsAsRoutine  ticket 42 (PBS-115): a client's orderly close is logged at error level ('system error caught in session ...: asio.misc:2 End of file'): handle_exception looks for boost::asio::error::eof in the system category, Asio reports it in asio.misc
 StorageDetectsTamperingWithEncryptedBinlogData  ticket 53 (PBS-126): encrypted binlog data has no integrity protection (AES-CTR, no MAC) and the sender does not verify event CRC32 in position mode: a byte changed in the ciphertext is streamed as a changed event, and with the CRC32 footer patched (CRC32 is affine) the forged event passes a replica's checksum check
 StorageNeverServesABinlogStrippedOfEncryption  ticket 53 (PBS-126): binlog metadata is not authenticated either: a binlog of an encrypted storage replaced with plaintext events, its metadata's encryption record removed, is served as plaintext without an error
-StorageStartedWithoutEncryptionKeepsEncrypting  ticket 54: an encrypted storage started with a configuration that keeps the keyring but has no 'encryption' section writes its next binlogs in plaintext without an error or warning (validate_metadata compares formats only when both are set)
+StorageStartedWithoutEncryptionKeepsEncrypting  ticket 54 (PBS-127): an encrypted storage started with a configuration that keeps the keyring but has no 'encryption' section writes its next binlogs in plaintext without an error or warning (validate_metadata compares formats only when both are set)

@@ -54,7 +54,7 @@ Almost every harness takes the same core options and follows the same rules.
   directory the setup script populates (`~/ws/qa/pylib` by default). Tools that
   create S3 backends also want `AWS_EC2_METADATA_DISABLED=true` in the
   environment to avoid a multi-second EC2 metadata lookup at every start
-  (ticket 16); the setup and nightly scripts export it for you.
+  (ticket 16, PBS-84); the setup and nightly scripts export it for you.
 - **Exit code 0 means every check passed**, non-zero means at least one
   failed. The tools also print one JSON line per case to stdout, so a run can
   be scanned or collected.
@@ -115,13 +115,13 @@ JSON and exits non-zero on a failure.
 | Script | What it does | Found |
 | --- | --- | --- |
 | `fetch_crash_test.py` | randomized workload + crash/resume state machine (above) | — |
-| `concurrent_storage_test.py` | runs several `fetch` instances against **one** storage at once (a cron `fetch` overrunning into the next run); checks the storage is not corrupted and heals. Two writers on one storage are an unsupported scenario (ticket 24, closed as not a bug in PBS-87), so its failures document misuse, not defects | ticket 24 |
+| `concurrent_storage_test.py` | runs several `fetch` instances against **one** storage at once (a cron `fetch` overrunning into the next run); checks the storage is not corrupted and heals. Two writers on one storage are an unsupported scenario (ticket 24, closed as not a bug in PBS-87), so its failures document misuse, not defects | ticket 24 (PBS-87) |
 | `source_change_test.py` | changes the source under a running backup: `RESET BINARY LOGS`, a different server (failover), binlogs purged before fetch, a mid-stream restart | ticket 25 |
 | `event_variety_test.py` | drives less common event types — transaction compression, `binlog_row_image=MINIMAL`, partial JSON, XA, tagged GTIDs — through a full fetch and a kill/resume | — (no bug) |
 | `pull_replica_fault_test.py` | network faults (Toxiproxy) between `pull` and a MySQL replica — resets, cuts at 1 KB / 100 KB / inside an 8 MB event / during the login, a stall past `replica_net_timeout`, refused connections, 1-byte pieces, latency, low bandwidth — while the source writes; the replica must reconnect and end with the source's data | — (no bug) |
 | `pull_restart_test.py` | a MySQL replica of `pull` (auto-positioning in GTID mode) across restarts of `pull` — SIGTERM or SIGKILL while idle, while the source writes, inside an 8 MB event, while the source rotates into binlogs without transactions, while a lagging replica catches up, and five quick kill/restart cycles; the replica must reconnect to the new `pull` and end with the source's data | — (no bug) |
 | `pull_variety_test.py` | a MySQL replica of `pull` must end with the source's data for a broad workload — every column type, row images, partial JSON, compression, statement format, DDL with routines and triggers, XA, an 8 MB row, savepoints, charsets, tagged GTIDs, empty transactions, VECTOR columns and Percona Server 9.7 vector indexes — live and replayed from the storage | — (no bug) |
-| `query_race_test.py` | runs `binlog_server list` `--runs` times (default 500) next to a `pull` writing a filesystem storage with `checkpoint_size` `"1K"` while the source gets small inserts and a `FLUSH BINARY LOGS` every 20 of them; reports the failed `list` runs and each distinct error message | ticket 29 |
+| `query_race_test.py` | runs `binlog_server list` `--runs` times (default 500) next to a `pull` writing a filesystem storage with `checkpoint_size` `"1K"` while the source gets small inserts and a `FLUSH BINARY LOGS` every 20 of them; reports the failed `list` runs and each distinct error message | ticket 29 (PBS-101) |
 | `large_binlog_test.py` | binlogs and transactions past 4 GiB, where positions no longer fit the protocol's 32-bit fields. Case `binlog_over_4gib`: about 1 GB of 1 MiB transactions and one of about 3.5 GB leave a 4.5 GB binlog; `fetch` must store it byte for byte, a second `fetch` reopen the storage, `list` report its size, and `mysqlbinlog --raw` through `pull` copy it exactly (passes). Case `transaction_over_4gib`: one transaction of about 4.7 GB. Needs about 20 GB of disk; `--keep` keeps the data, `--cases` picks the cases. With `--storage s3 --s3-bucket-dir <dir>` the storage is in the S3 bucket, behind a counting `s3_fault_proxy.py` the harness starts (`--s3-proxy-port`), and a further check `s3_put_size` requires that no request uploads more than 5 GiB, the AWS limit for a single PUT, which local S3 servers do not enforce (only `binlog_over_4gib` by default; about 30 GB of disk). First run (2026-10-28, debug build): passes; the 4.5 GB binlog goes up as a multipart upload of 8 MiB parts (largest request 8 MiB), and `pull` streams it back from S3 byte for byte. Versity S3 Gateway 1.8.0 takes about a minute to join the parts, and the AWS SDK's CRT client repeats the CompleteMultipartUpload after about 5 s, which the gateway confirms at once, before the object exists; the harness therefore waits up to 5 min for the objects (`s3_object_late_seconds`, 54 s) before comparing. AWS S3 confirms a completion only once the object exists | ticket 41 (PBS-114) |
 
 Examples:
@@ -137,7 +137,7 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/source_change_test.py \
   --mysql-basedir <dist> --binsrv <asan-binary> --workdir ~/ws/qa/source-change \
   --scenarios reset,identity,purge,restart
 
-# 'list' next to a writing 'pull' (ticket 29); keep --workdir short, the
+# 'list' next to a writing 'pull' (ticket 29, PBS-101); keep --workdir short, the
 # mysqld socket lives in it
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/query_race_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/qrace --runs 500
@@ -178,7 +178,7 @@ fails cleanly and the storage stays openable. Six recovery cases follow: a
 failed `binlog.index` save during a rotation leaves the new binlog's files
 behind, the next `fetch` (whose start removes them) fails to delete one of
 them (`op=unlink`, which covers `unlink`, `unlinkat` and `remove`), and a
-third `fetch` without a failure must still recover (ticket 37: it did not
+third `fetch` without a failure must still recover (ticket 37, PBS-110: it did not
 when the metadata file was the one left, until PBS-110, upstream `e2fdd50`). `s3_fault_sweep.py` ends with the
 same two cases on S3 (failing `binlog.index` uploads, then a `DELETE` of the
 metadata object failing for the whole start: the S3 CRT client retries a
@@ -379,10 +379,10 @@ see [the nightly run](#the-nightly-run).
 `pull`** (`CHANGE REPLICATION SOURCE TO ... ; START REPLICA`), in both position
 and GTID auto-position mode, and requires the replica's data to match the
 source's. When it does not, it reports the replica's I/O-thread error and the
-statements `pull` rejected. It is the end-to-end check behind tickets 20-22;
+statements `pull` rejected. It is the end-to-end check behind tickets 20-22 (PBS-120, PBS-86);
 tickets 21 (resuming from a position) and 22 (`mysqlbinlog --raw`) are fixed
 upstream in `a338dde` (PBS-42 part 5). Since PBS-29 part 2 (`7cd6e24`) a
-GTID auto-position replica replicates too, so both cases must pass. Ticket 20
+GTID auto-position replica replicates too, so both cases must pass. Ticket 20 (PBS-120)
 stays open for a replica that lacks GTIDs `pull` no longer holds (it gets
 EOF where MySQL answers ER 1236) and for TLS on the listener; heartbeats
 exist since PBS-30. The nightly runs it (see below).
@@ -499,14 +499,14 @@ finished report (`fault_rename`), the removal of expired reports
 its temporary file, which the history cleanup removes later; after the
 transient failure complete reports are written again. All six pass on
 2026-11-04. On 2026-11-03 four fail:
-`scrape_zero`, `scrape_huge` and `grace_huge` (ticket 49: intervals are not
+`scrape_zero`, `scrape_huge` and `grace_huge` (ticket 49, PBS-122: intervals are not
 validated; 0 writes 100-170 reports a second, more than ~292 years overflows
 the timer and expires at once) and `settings_in_storage` (ticket 50: the
 instance_id file makes a fresh storage directory "not empty but does not
 contain metadata"). A replaced damaged id is not logged. Since PBS-122
 (upstream `2e9648c`, 2026-11-05) `pull` clamps the intervals (grace
 20 s..2 d, scrape 10 s..7 d, history 60 s..7 d) and logs the values it uses,
-so ticket 49 is fixed: the cases now run `pull` for 25 to 60 s around those
+so ticket 49 (PBS-122) is fixed: the cases now run `pull` for 25 to 60 s around those
 minimums (reports at 20 s and then every 10 s), check the logged intervals
 of the out-of-range ones (`scrape_zero`: 20 s / 10 s, 3 reports in 45 s;
 `scrape_negative` and `scrape_huge`: 7 days, one report; `grace_huge`: 2
@@ -581,7 +581,7 @@ and, while the source keeps writing, stops and restarts `pull`:
 `kill_mid_big_event` (as soon as part of an 8 MB row is stored; the case
 fails if the kill missed the event), `down_with_rotations` (three FLUSH
 BINARY LOGS, rows and two more, so the source has binlogs without
-transactions: the GTID-mode resume of `pull` loses those, ticket 14, which
+transactions: the GTID-mode resume of `pull` loses those, ticket 14, PBS-80, which
 the replica must not notice), `kill_during_replica_catchup` (100 rows
 behind) and `flapping` (five SIGKILL / restart cycles a second apart). After
 each the replica must reconnect on its own (`SOURCE_CONNECT_RETRY`) and end
@@ -618,7 +618,7 @@ objects are removed when it passes) and, in GTID mode, `rewrite_takeover`
 case passes in both modes against `pbs-0.4.1`, and the release still lists a
 storage the current build wrote. `old_config` shows the upgrade is two failed starts
 long: `unable to extract "instance"`, then, with `instance` added, `unable
-to extract "replication_source"`, a section only `pull` uses (ticket 51).
+to extract "replication_source"`, a section only `pull` uses (ticket 51, PBS-123).
 The nightly runs it for both modes every night (`QA_PORT`+290, about 5 min
 each).
 
@@ -667,12 +667,12 @@ file descriptors and threads (`/proc`), its log size and the storage size
 (`samples.json`). Cases: `alive`; `memory`, `file_descriptors`, `threads`
 (the last quarter of the run against the second, after a quarter of
 warm-up); `log` (growth per hour at info level, and no error lines but the
-known ones of ticket 42); `copies`, `replica`, `still_serving` (exact data at
+known ones of ticket 42, PBS-115); `copies`, `replica`, `still_serving` (exact data at
 the end). The first 15-minute run (2026-10-29, debug build) was flat (about
 23 MB, 16 descriptors, 2 threads) and exact, but the log grew 67 MB per hour:
 at info level `pull` logs every event it streams, per client (89% of the
 lines; ticket 45, PBS-118), and a client that dies during a dump is logged as an
-error (EPIPE, part of ticket 42). A 15-minute run with TLS clients
+error (EPIPE, part of ticket 42, PBS-115). A 15-minute run with TLS clients
 (2026-11-02, upstream `6b0960f`: 36 of 65 connections over TLS) was flat and
 exact as well, and the TLS clients killed during a dump added no new error
 lines.
@@ -708,7 +708,7 @@ server rather than starting one.
      on MySQL 8.0.45, 8.4.8 and 9.7.2 (`MTR_DISTS`), one version after the
      other, each with `--parallel=4` (`MTR_PARALLEL`), a 10-minute limit per
      test (`--testcase-timeout=10`; the slowest passing test takes about 5,
-     and a hung one, such as `rs_heartbeat` on 9.7 for ticket 44, cost 30
+     and a hung one, such as `rs_heartbeat` on 9.7 for ticket 44, PBS-117, cost 30
      minutes with the default), `--build-thread=500`
      (`MTR_BUILD_THREAD`; the `rs_*` tests also use ports 1000 above the
      server's, so 500 keeps clear of the automatic build threads 300-399) and var directories `$WS/mtr-var-nightly-<series>`,
@@ -806,12 +806,12 @@ server rather than starting one.
      `RELEASE_QA_EXAMPLES`, port `QA_PORT`+50) uses the release binary. All of it is the build `release_gcc14`. It is a stage of its own
      because release behaviour differs exactly where known bugs live: an
      `assert` that aborts the debug build is compiled out, so the bug runs on
-     (ticket 7 runs away, ticket 6 keeps wrong timestamps). Property failures are
+     (ticket 7, PBS-73 runs away, ticket 6, PBS-72 keeps wrong timestamps). Property failures are
      compared against `known_failures.txt`; a line
      `release_gcc14:<test case>  ticket N: ...` takes precedence for that
      build and records how the release build fails differently. Found so
-     far: ticket 6 keeps the wrong timestamps instead of aborting at
-     `storage.cpp:138`. Before PBS-29, ticket 7 did not hang in release but
+     far: ticket 6 (PBS-72) keeps the wrong timestamps instead of aborting at
+     `storage.cpp:138`. Before PBS-29, ticket 7 (PBS-73) did not hang in release but
      never advanced past an event size of 0, so `indexed_event_block`'s
      index grew to 8+ GB until `std::bad_alloc` (hence the memory limit),
      and a misaligned dump position streamed an event cut out of the stored
@@ -857,7 +857,7 @@ server rather than starting one.
   build harnesses are skipped when the debug build fails, `fetch_crash_test`
   when the ASan build fails, the release `fetch_crash_test` when the release
   build fails. Tonight's whole run takes about 40-50 min for the
-  C++ stage plus 35-50 min of MTR (9-26 min per version) and 20-35 min of QA harnesses: about 11 min for `pull_replica_test`, `query_race_test` and `fetch_crash_test` on file storage, about 5 min for `pull_heartbeat_test`, about 7 min for `fetch_crash_test` on S3 (mostly Hypothesis shrinking the known ticket 14 failure in `gtid/s3`), plus the night's rotation (measured on MySQL 8.4.8: `s3_fault_sweep` 15 min per mode, 84 cases; `disk_fault_sweep` 3-6 min, 80 cases (plus 6 recovery cases, about 1.5 min); `network_fault_test` 4-5 min, 37 cases; `source_change_test` 3-4 min per mode, 4 cases; `large_binlog_test` about 20 min on the debug build, mostly MySQL writing the large transactions; `pull_load_test` about 6 min, 4 cases; `listener_fuzz_test` about 11 min per mode at 600 connections: about 1 s per connection since the listener always does full `caching_sha2_password` authentication (PBS-10), 2-3 min for 3000 before).
+  C++ stage plus 35-50 min of MTR (9-26 min per version) and 20-35 min of QA harnesses: about 11 min for `pull_replica_test`, `query_race_test` and `fetch_crash_test` on file storage, about 5 min for `pull_heartbeat_test`, about 7 min for `fetch_crash_test` on S3 (mostly Hypothesis shrinking the known ticket 14, PBS-80 failure in `gtid/s3`), plus the night's rotation (measured on MySQL 8.4.8: `s3_fault_sweep` 15 min per mode, 84 cases; `disk_fault_sweep` 3-6 min, 80 cases (plus 6 recovery cases, about 1.5 min); `network_fault_test` 4-5 min, 37 cases; `source_change_test` 3-4 min per mode, 4 cases; `large_binlog_test` about 20 min on the debug build, mostly MySQL writing the large transactions; `pull_load_test` about 6 min, 4 cases; `listener_fuzz_test` about 11 min per mode at 600 connections: about 1 s per connection since the listener always does full `caching_sha2_password` authentication (PBS-10), 2-3 min for 3000 before).
 
   To try a stage without touching the nightly's own results, select stages
   with `STAGES` (default `cpp mtr qa release fuzz mull`; without `cpp` the debug,
@@ -923,7 +923,7 @@ server rather than starting one.
   `<harness> <case>  ticket N: ...` (`<case>` may be `*` or a shell-style
   pattern such as `position/PUT-*/reset_after/*`; a name without `/` also
   covers every `<name>/...` case), e.g.
-  `query_race_test list_next_to_pull` (ticket 29),
+  `query_race_test list_next_to_pull` (ticket 29, PBS-101),
   `pull_heartbeat_test quiet_after_rotation` (ticket 40, PBS-113),
   `large_binlog_test position/transaction_over_4gib` (ticket 41, PBS-114),
   `pull_load_test position/shutdown` (ticket 43, PBS-116),
@@ -996,12 +996,12 @@ PREVIOUS_GTIDS generators), `search_helpers_property_test`,
 `purge_selection_property_test`, `sender_context_property_test` (the
 `pull` COM_BINLOG_DUMP streamer: the stream preamble, reading each stored byte
 once, partial events at EOF, polling an empty storage, the heartbeat an
-idle dump reports, ticket 40, and in a GTID-mode storage the auto-positioned
+idle dump reports, ticket 40, PBS-113, and in a GTID-mode storage the auto-positioned
 start at the first binlog holding a GTID the replica lacks, PBS-29 part 3) and `replication_source_property_test` (the
 real `pull` listener in-process with a test client: handshake statements,
 authentication, dump positions, heartbeat timing, and `COM_BINLOG_DUMP_GTID`,
 written ahead of PBS-29 part 2; it passes since PBS-120, which refuses a
-replica that lacks purged GTIDs with ER 1236, ticket 20).
+replica that lacks purged GTIDs with ER 1236, ticket 20, PBS-120).
 Since PBS-41 every configuration these tests write has an
 `instance.local_settings_path` (a directory in the test's scratch tree).
 `storage_property_test`'s concurrent property runs a second reader that

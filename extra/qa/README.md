@@ -333,7 +333,7 @@ stored). While they run, the test measures how long an ordinary `mysqlbinlog`
 takes to be served, and `pull`'s memory. On 2026-11-16, `many_dumps` (300
 open blocking dumps) and `stalled_readers` (20 dumps that never read) pass:
 the ordinary client is served in about 0.2 s. `huge_gtid_set` fails (ticket
-61): one COM_BINLOG_DUMP_GTID with 1,000,000 intervals takes about 12 s, no
+61, PBS-135): one COM_BINLOG_DUMP_GTID with 1,000,000 intervals takes about 12 s, no
 other client is served meanwhile, and about 100 MB stays resident;
 `huge_gtid_sets_parallel` shows 8 such requests answered one after another.
 

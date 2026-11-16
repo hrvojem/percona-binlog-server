@@ -11,7 +11,9 @@
 # secrets_exposure_test, upstream_tls_test, listener_replica_dos_test,
 # metadata_tamper_test, listener_login_test, listener_command_fuzz_test,
 # tls_config_test, replica_tamper_test, final_flush_test,
-# s3_upload_tamper_test, checkpoint_loss_test, rewrite_attack_test) run
+# s3_upload_tamper_test, checkpoint_loss_test, rewrite_attack_test,
+# hostile_source_pull_test, purge_search_tamper_test,
+# truncated_transaction_test, damaged_binlog_consumers_test) run
 # about once a week,
 # so their known failures show up on those nights only.
 # A sanitizer report is never covered by a pattern line (its reason names
@@ -95,3 +97,220 @@ rewrite_attack_test gtid/storage_tail_encryption_removed  ticket 62 (PBS-136): t
 rewrite_attack_test gtid/storage_tail_encryption_transplanted  ticket 63 (PBS-137): the encryption record of another binlog: appended data uses that binlog's keystream
 rewrite_attack_test gtid/storage_tail_iv_lowered  ticket 63 (PBS-137): the IV counter lowered by 64 blocks: appended data repeats the file's own keystream from 1024 bytes lower
 rewrite_attack_test gtid/crash_*  ticket 32: fetch killed with data past the size in the metadata writes those offsets again with the same key and IV; in rewrite mode the generated events carry a new timestamp, so two different plaintexts share a keystream range without any attacker
+purge_search_tamper_test gtid/purge_index_only_tail  ticket 53 (PBS-126): after an edit of binlog.index or of a binlog's 'size' / timestamps, purge_binlogs deletes or truncates what was not asked for
+purge_search_tamper_test gtid/purge_index_head_dropped_tail_target  ticket 53 (PBS-126): after an edit of binlog.index or of a binlog's 'size' / timestamps, purge_binlogs deletes or truncates what was not asked for
+purge_search_tamper_test gtid/purge_index_swapped_low  ticket 53 (PBS-126): after an edit of binlog.index or of a binlog's 'size' / timestamps, purge_binlogs deletes or truncates what was not asked for
+purge_search_tamper_test gtid/purge_index_tail_moved  ticket 53 (PBS-126): after an edit of binlog.index or of a binlog's 'size' / timestamps, purge_binlogs deletes or truncates what was not asked for
+purge_search_tamper_test gtid/purge_symlink_tail_size  ticket 57 (PBS-130): with the newest binlog a symlink and its 'size' lowered, a purge truncates the file outside the storage
+purge_search_tamper_test gtid/purge_size_tail_lowered  ticket 53 (PBS-126): after an edit of binlog.index or of a binlog's 'size' / timestamps, purge_binlogs deletes or truncates what was not asked for
+purge_search_tamper_test gtid/purge_size_tail_lowered_refused  ticket 53 (PBS-126): after an edit of binlog.index or of a binlog's 'size' / timestamps, purge_binlogs deletes or truncates what was not asked for
+purge_search_tamper_test gtid/purge_retention_max_lowered  ticket 53 (PBS-126): after an edit of binlog.index or of a binlog's 'size' / timestamps, purge_binlogs deletes or truncates what was not asked for
+purge_search_tamper_test gtid/search_min_timestamp_future  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
+purge_search_tamper_test gtid/search_min_timestamp_past  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
+purge_search_tamper_test gtid/search_min_timestamp_removed  ticket 80: a binlog whose metadata cannot be used, or that the index no longer lists, is left out of a search answered with success
+purge_search_tamper_test gtid/search_min_timestamp_number  ticket 80: a binlog whose metadata cannot be used, or that the index no longer lists, is left out of a search answered with success
+purge_search_tamper_test gtid/search_metadata_unparsable  ticket 80: a binlog whose metadata cannot be used, or that the index no longer lists, is left out of a search answered with success
+purge_search_tamper_test gtid/search_metadata_missing  ticket 80: a binlog whose metadata cannot be used, or that the index no longer lists, is left out of a search answered with success
+purge_search_tamper_test gtid/search_index_entry_dropped  ticket 80: a binlog whose metadata cannot be used, or that the index no longer lists, is left out of a search answered with success
+purge_search_tamper_test gtid/search_index_head_dropped  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
+purge_search_tamper_test gtid/search_index_swapped  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
+purge_search_tamper_test gtid/search_index_reversed  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
+purge_search_tamper_test gtid/search_added_gtids_superset  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
+purge_search_tamper_test gtid/search_added_gtids_shifted  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
+purge_search_tamper_test gtid/search_added_gtids_removed  ticket 80: a binlog whose metadata cannot be used, or that the index no longer lists, is left out of a search answered with success
+purge_search_tamper_test gtid/search_index_swapped_gtid_replay  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
+purge_search_tamper_test position/purge_index_only_tail  ticket 53 (PBS-126): after an edit of binlog.index or of a binlog's 'size' / timestamps, purge_binlogs deletes or truncates what was not asked for
+purge_search_tamper_test position/purge_index_head_dropped_tail_target  ticket 53 (PBS-126): after an edit of binlog.index or of a binlog's 'size' / timestamps, purge_binlogs deletes or truncates what was not asked for
+purge_search_tamper_test position/purge_index_swapped_low  ticket 53 (PBS-126): after an edit of binlog.index or of a binlog's 'size' / timestamps, purge_binlogs deletes or truncates what was not asked for
+purge_search_tamper_test position/purge_index_tail_moved  ticket 53 (PBS-126): after an edit of binlog.index or of a binlog's 'size' / timestamps, purge_binlogs deletes or truncates what was not asked for
+purge_search_tamper_test position/purge_symlink_tail_size  ticket 57 (PBS-130): with the newest binlog a symlink and its 'size' lowered, a purge truncates the file outside the storage
+purge_search_tamper_test position/purge_size_tail_lowered  ticket 53 (PBS-126): after an edit of binlog.index or of a binlog's 'size' / timestamps, purge_binlogs deletes or truncates what was not asked for
+purge_search_tamper_test position/purge_size_tail_lowered_refused  ticket 53 (PBS-126): after an edit of binlog.index or of a binlog's 'size' / timestamps, purge_binlogs deletes or truncates what was not asked for
+purge_search_tamper_test position/purge_retention_max_lowered  ticket 53 (PBS-126): after an edit of binlog.index or of a binlog's 'size' / timestamps, purge_binlogs deletes or truncates what was not asked for
+purge_search_tamper_test position/search_min_timestamp_future  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
+purge_search_tamper_test position/search_min_timestamp_past  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
+purge_search_tamper_test position/search_min_timestamp_removed  ticket 80: a binlog whose metadata cannot be used, or that the index no longer lists, is left out of a search answered with success
+purge_search_tamper_test position/search_min_timestamp_number  ticket 80: a binlog whose metadata cannot be used, or that the index no longer lists, is left out of a search answered with success
+purge_search_tamper_test position/search_metadata_unparsable  ticket 80: a binlog whose metadata cannot be used, or that the index no longer lists, is left out of a search answered with success
+purge_search_tamper_test position/search_metadata_missing  ticket 80: a binlog whose metadata cannot be used, or that the index no longer lists, is left out of a search answered with success
+purge_search_tamper_test position/search_index_entry_dropped  ticket 80: a binlog whose metadata cannot be used, or that the index no longer lists, is left out of a search answered with success
+purge_search_tamper_test position/search_index_head_dropped  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
+purge_search_tamper_test position/search_index_swapped  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
+purge_search_tamper_test position/search_index_reversed  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
+hostile_source_pull_test position/nul_existing_binlog  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
+hostile_source_pull_test position/nul_metadata  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
+hostile_source_pull_test position/nul_index  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
+hostile_source_pull_test position/newline  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
+hostile_source_pull_test position/dot_dot  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
+hostile_source_pull_test position/long_name  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
+hostile_source_pull_test position/reannounce  ticket 69 (PBS-144): pull appends a second preamble to the open binlog
+hostile_source_pull_test position/lower_sequence  ticket 70: a binlog with a lower sequence number is created and served; the next start fails
+hostile_source_pull_test position/length_smaller  ticket 82: a lowered transaction_length leaves a cut-off transaction in the storage
+hostile_source_pull_test gtid/nul_existing_binlog  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
+hostile_source_pull_test gtid/nul_metadata  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
+hostile_source_pull_test gtid/nul_index  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
+hostile_source_pull_test gtid/newline  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
+hostile_source_pull_test gtid/dot_dot  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
+hostile_source_pull_test gtid/long_name  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
+hostile_source_pull_test gtid/reannounce  ticket 69 (PBS-144): pull appends a second preamble to the open binlog
+hostile_source_pull_test gtid/lower_sequence  ticket 70: a binlog with a lower sequence number is created and served; the next start fails
+hostile_source_pull_test gtid/gtid_bloat  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
+hostile_source_pull_test gtid/reannounce_midstream  ticket 69 (PBS-144): pull appends a second preamble to the open binlog
+hostile_source_pull_test gtid/length_smaller  ticket 82: a lowered transaction_length leaves a cut-off transaction in the storage
+hostile_source_pull_test gtid/gtid_twice/rewrite  ticket 81: in rewrite mode a duplicated, swapped, foreign or replayed transaction is stored and served
+hostile_source_pull_test gtid/gtid_swapped/rewrite  ticket 81: in rewrite mode a duplicated, swapped, foreign or replayed transaction is stored and served
+hostile_source_pull_test gtid/gtid_other_uuid/rewrite  ticket 81: in rewrite mode a duplicated, swapped, foreign or replayed transaction is stored and served
+hostile_source_pull_test gtid/length_smaller/rewrite  ticket 82: a lowered transaction_length leaves a cut-off transaction in the storage
+hostile_source_pull_test gtid/replay_after_reconnect/rewrite  ticket 81: in rewrite mode a duplicated, swapped, foreign or replayed transaction is stored and served
+hostile_source_pull_test gtid/eof_mid_transaction/rewrite  ticket 83: an EOF after GTID + BEGIN leaves fragments in the rewritten binlog, which pull can then no longer serve
+truncated_transaction_test position/lie_after_gtid  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test position/lie_after_begin  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test position/lie_after_table_map  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test position/lie_after_first_rows  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test position/lie_multi_after_statement  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test position/lie_ddl_after_gtid  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test position/lie_compressed_after_gtid  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test position/lie_last_after_begin  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test position/lie_after_begin_eof  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test position/lie_after_gtid_eof  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test position/lie_after_begin_drop  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test position/lie_after_begin_rest_removed  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test position/pull_lie_after_begin  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test position/pull_lie_after_begin_drop  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/lie_after_gtid  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/lie_after_begin  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/lie_after_table_map  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/lie_after_first_rows  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/lie_multi_after_statement  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/lie_ddl_after_gtid  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/lie_compressed_after_gtid  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/lie_last_after_begin  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/lie_after_begin_eof  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/lie_after_gtid_eof  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/lie_after_begin_drop  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/lie_after_begin_rest_removed  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/pull_lie_after_begin  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/pull_lie_after_begin_drop  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
+truncated_transaction_test gtid/lie_after_gtid/rewrite  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and the next run exits 0 without the rows
+truncated_transaction_test gtid/lie_after_begin/rewrite  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and the next run exits 0 without the rows
+truncated_transaction_test gtid/lie_after_table_map/rewrite  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and the next run exits 0 without the rows
+truncated_transaction_test gtid/lie_after_first_rows/rewrite  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and the next run exits 0 without the rows
+truncated_transaction_test gtid/lie_multi_after_statement/rewrite  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and the next run exits 0 without the rows
+truncated_transaction_test gtid/lie_ddl_after_gtid/rewrite  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and the next run exits 0 without the rows
+truncated_transaction_test gtid/lie_compressed_after_gtid/rewrite  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and the next run exits 0 without the rows
+truncated_transaction_test gtid/lie_last_after_begin/rewrite  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and the next run exits 0 without the rows
+truncated_transaction_test gtid/lie_after_begin_eof/rewrite  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and the next run exits 0 without the rows
+truncated_transaction_test gtid/lie_after_gtid_eof/rewrite  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and the next run exits 0 without the rows
+truncated_transaction_test gtid/lie_after_begin_drop/rewrite  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and the next run exits 0 without the rows
+truncated_transaction_test gtid/lie_after_begin_rest_removed/rewrite  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and the next run exits 0 without the rows
+truncated_transaction_test gtid/pull_lie_after_begin/rewrite  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and the next run exits 0 without the rows
+truncated_transaction_test gtid/pull_lie_after_begin_drop/rewrite  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and the next run exits 0 without the rows
+damaged_binlog_consumers_test position/S1_reannounce/C1_one_binlog  ticket 69 (PBS-144): this consumer loses or misreads transactions of a binlog with a second preamble
+damaged_binlog_consumers_test position/S1_reannounce/C3_raw  ticket 69 (PBS-144): this consumer loses or misreads transactions of a binlog with a second preamble
+damaged_binlog_consumers_test position/S1_reannounce/C5_list  ticket 69 (PBS-144): this consumer loses or misreads transactions of a binlog with a second preamble
+damaged_binlog_consumers_test position/S4_forged_row/C1_files  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test position/S4_forged_row/C2_replay  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test position/S4_forged_row/C3_remote  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test position/S4_forged_row/C4_position_replica  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test position/S4_forged_row/C5_resume  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test position/S4_plaintext_swap/C1_files  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test position/S4_plaintext_swap/C2_replay  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test position/S4_plaintext_swap/C3_remote  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test position/S4_plaintext_swap/C4_position_replica  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test position/S4_plaintext_swap/C5_resume  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test position/S5_lower_sequence/C5_list  ticket 70 / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
+damaged_binlog_consumers_test position/S5_lower_sequence/C5_search_by_timestamp  ticket 70 / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
+damaged_binlog_consumers_test gtid/S1_midstream/C1_stop_position  ticket 69 (PBS-144): this consumer loses or misreads transactions of a binlog with a second preamble
+damaged_binlog_consumers_test gtid/S1_midstream/C2_replay_stop_position  ticket 69 (PBS-144): this consumer loses or misreads transactions of a binlog with a second preamble
+damaged_binlog_consumers_test gtid/S1_midstream/C3_raw  ticket 69 (PBS-144): this consumer loses or misreads transactions of a binlog with a second preamble
+damaged_binlog_consumers_test gtid/S1_midstream/C4_position_replica_source_position  ticket 69 (PBS-144): this consumer loses or misreads transactions of a binlog with a second preamble
+damaged_binlog_consumers_test gtid/S2_gtid_twice/C1_files  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_twice/C1_include_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_twice/C1_skip_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_twice/C3_remote  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_swapped/C1_files  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_swapped/C1_include_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_swapped/C1_skip_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_swapped/C2_replay  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_swapped/C2_replay_skip_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_swapped/C3_remote  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_swapped/C4_position_replica  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_swapped/C4_gtid_replica  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_swapped/C4_gtid_replica_partway  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_swapped/C4_single_worker_replica  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_swapped/C5_resume  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid/C1_files  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid/C1_include_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid/C1_exclude_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid/C1_skip_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid/C3_remote  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid/C5_list  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_twice_keyless/C1_files  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_twice_keyless/C1_include_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_twice_keyless/C1_skip_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_twice_keyless/C2_replay_skip_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_twice_keyless/C3_remote  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid_keyless/C1_files  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid_keyless/C1_include_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid_keyless/C1_exclude_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid_keyless/C1_skip_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid_keyless/C2_replay  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid_keyless/C2_replay_skip_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid_keyless/C3_remote  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid_keyless/C4_gtid_replica  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid_keyless/C5_list  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_gtid_other_uuid_keyless/C5_resume  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_emptied/C1_files  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_emptied/C1_include_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_emptied/C1_skip_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_emptied/C3_remote  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_emptied/C5_list  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_previous_emptied/C1_files  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_previous_emptied/C1_include_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_previous_emptied/C1_exclude_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_previous_emptied/C1_skip_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_previous_emptied/C3_remote  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_other_uuid/C1_files  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_other_uuid/C1_include_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_other_uuid/C1_skip_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_other_uuid/C3_remote  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_other_uuid/C5_list  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_extended/C1_files  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_extended/C1_exclude_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_extended/C1_skip_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_extended/C2_replay  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_extended/C2_replay_skip_gtids  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_extended/C3_remote  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_extended/C4_position_replica  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_extended/C4_gtid_replica  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_extended/C4_gtid_replica_partway  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_extended/C4_single_worker_replica  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_extended/C5_list  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_extended/C5_search_by_gtid_set  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S2_tail_added_extended/C5_resume  ticket 81: this consumer ends with other data than the source from a rewrite-mode storage with duplicated, swapped, foreign or missing GTIDs
+damaged_binlog_consumers_test gtid/S3_length_smaller/C1_files  ticket 82: this consumer drops the cut-off transaction silently or aborts
+damaged_binlog_consumers_test gtid/S3_length_smaller/C1_include_gtids  ticket 82: this consumer drops the cut-off transaction silently or aborts
+damaged_binlog_consumers_test gtid/S3_length_smaller/C1_skip_gtids  ticket 82: this consumer drops the cut-off transaction silently or aborts
+damaged_binlog_consumers_test gtid/S3_length_smaller/C2_replay_skip_gtids  ticket 82: this consumer drops the cut-off transaction silently or aborts
+damaged_binlog_consumers_test gtid/S3_length_smaller/C3_remote  ticket 82: this consumer drops the cut-off transaction silently or aborts
+damaged_binlog_consumers_test gtid/S3_length_smaller/C4_position_replica  ticket 82: this consumer drops the cut-off transaction silently or aborts
+damaged_binlog_consumers_test gtid/S4_forged_row/C1_files  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_forged_row/C1_include_gtids  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_forged_row/C1_skip_gtids  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_forged_row/C2_replay  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_forged_row/C2_replay_skip_gtids  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_forged_row/C3_remote  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_forged_row/C4_gtid_replica  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_forged_row/C5_resume  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_plaintext_swap/C1_files  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_plaintext_swap/C1_include_gtids  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_plaintext_swap/C1_skip_gtids  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_plaintext_swap/C2_replay  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_plaintext_swap/C2_replay_skip_gtids  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_plaintext_swap/C3_remote  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_plaintext_swap/C4_gtid_replica  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S4_plaintext_swap/C5_resume  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
+damaged_binlog_consumers_test gtid/S5_lower_sequence/C5_list  ticket 70 / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
+damaged_binlog_consumers_test gtid/S5_lower_sequence/C5_search_by_timestamp  ticket 70 / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
+damaged_binlog_consumers_test gtid/S[26]_*/C2_replay_stop_datetime  ticket 84: on a rewrite-mode storage the generated events carry the time of the fetch, so --stop-datetime can stop before the transactions; depends on timing except in the S6 states (and ticket 81 for S2_tail_added_extended)
+damaged_binlog_consumers_test gtid/S0_rewrite_control/C2_replay_stop_datetime  ticket 84: as the S2 states, depends on timing

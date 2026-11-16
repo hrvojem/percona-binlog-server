@@ -131,7 +131,7 @@ QA_S3_EXAMPLES=${QA_S3_EXAMPLES:-5}
 S3_BUCKET_DIR=${S3_BUCKET_DIR:-$WS/s3/data/pbs-mtr}
 # the rotation of the heavier QA harnesses: '<weekday>:<harness>/<mode>'
 # (weekday 1-7 is Monday-Sunday, date +%u); 4-15 min a night (README.md)
-QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 4:pull_versions/ps-8.4 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 6:pull_versions/ps-9.7 7:network_fault_test/gtid 7:pull_soak_test/position 2:listener_exhaustion_test/position 5:file_security_test/position 1:hostile_source_test/position 3:secrets_exposure_test/position 4:upstream_tls_test/position 6:listener_replica_dos_test/gtid 2:metadata_tamper_test/position 7:listener_login_test/position 3:listener_command_fuzz_test/position 1:tls_config_test/position 4:replica_tamper_test/position 6:final_flush_test/position 7:replica_tamper_test/gtid 1:hostile_source_test/gtid 5:s3_upload_tamper_test/position 5:listener_command_fuzz_test_tls/gtid 2:checkpoint_loss_test/position 3:rewrite_attack_test/gtid"}
+QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 4:pull_versions/ps-8.4 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 6:pull_versions/ps-9.7 7:network_fault_test/gtid 7:pull_soak_test/position 2:listener_exhaustion_test/position 5:file_security_test/position 1:hostile_source_test/position 3:secrets_exposure_test/position 4:upstream_tls_test/position 6:listener_replica_dos_test/gtid 2:metadata_tamper_test/position 7:listener_login_test/position 3:listener_command_fuzz_test/position 1:tls_config_test/position 4:replica_tamper_test/position 6:final_flush_test/position 7:replica_tamper_test/gtid 1:hostile_source_test/gtid 5:s3_upload_tamper_test/position 5:listener_command_fuzz_test_tls/gtid 2:checkpoint_loss_test/position 3:rewrite_attack_test/gtid 1:hostile_source_pull_test/position 4:hostile_source_pull_test/gtid 6:hostile_source_pull_test_rewrite/gtid 2:purge_search_tamper_test/gtid 3:truncated_transaction_test/position 5:truncated_transaction_test/gtid 7:truncated_transaction_test_rewrite/gtid 5:damaged_binlog_consumers_test/position 7:damaged_binlog_consumers_test/gtid"}
 QA_ROTATION_DAY=${QA_ROTATION_DAY:-$(date -u +%u)}
 # pull_versions on Percona Server: '<label>:<series>:<distribution under
 # $WS/dist>' (8.4 is the release tarball, 9.7 a build of the 9.7 branch,
@@ -771,7 +771,13 @@ if want qa || want rotation; then
         [ "$harness" = s3_upload_tamper_test ] ||
         [ "$harness" = listener_command_fuzz_test_tls ] ||
         [ "$harness" = checkpoint_loss_test ] ||
-        [ "$harness" = rewrite_attack_test ]; then
+        [ "$harness" = rewrite_attack_test ] ||
+        [ "$harness" = hostile_source_pull_test ] ||
+        [ "$harness" = hostile_source_pull_test_rewrite ] ||
+        [ "$harness" = purge_search_tamper_test ] ||
+        [ "$harness" = truncated_transaction_test ] ||
+        [ "$harness" = truncated_transaction_test_rewrite ] ||
+        [ "$harness" = damaged_binlog_consumers_test ]; then
       build=debug_gcc14
       binsrv=$debug_binsrv
     fi
@@ -989,6 +995,41 @@ if want qa || want rotation; then
         qa_run rewrite_attack_test "rewrite_attack_test ($mode)" \
           "${common[@]}" --workdir "$out/qa/rw-$mode" \
           --port $((QA_PORT + 800)) --timeout 1500 ;;
+      hostile_source_pull_test | hostile_source_pull_test_rewrite)
+        # the man-in-the-middle attacks against a running pull with a
+        # replica and a mysqlbinlog client connected; uses ports +0 to +22
+        # (5 min, 9 min with rewrite: cases '<mode>/<case>/rewrite')
+        rewrite_option=()
+        [ "$harness" = hostile_source_pull_test_rewrite ] &&
+          rewrite_option=(--rewrite)
+        qa_run hostile_source_pull_test "$harness ($mode)" \
+          "${common[@]}" --workdir "$out/qa/hp-$mode${rewrite_option:+-rw}" \
+          "${rewrite_option[@]}" \
+          --port $((QA_PORT + 820)) --timeout 1500 ;;
+      purge_search_tamper_test)
+        # purge_binlogs and the search commands after edits of the stored
+        # metadata and index, on a plain and an encrypted storage (2 min)
+        qa_run purge_search_tamper_test "purge_search_tamper_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/ps-$mode" \
+          --port $((QA_PORT + 860)) --timeout 900 ;;
+      truncated_transaction_test | truncated_transaction_test_rewrite)
+        # a transaction_length lowered on the way, ordinary faults in the
+        # middle of a transaction, and what the next run does (3 to 5 min;
+        # with rewrite: cases '<mode>/<case>/rewrite')
+        rewrite_option=()
+        [ "$harness" = truncated_transaction_test_rewrite ] &&
+          rewrite_option=(--rewrite)
+        qa_run truncated_transaction_test "$harness ($mode)" \
+          "${common[@]}" --workdir "$out/qa/tt-$mode${rewrite_option:+-rw}" \
+          "${rewrite_option[@]}" \
+          --port $((QA_PORT + 900)) --timeout 1500 ;;
+      damaged_binlog_consumers_test)
+        # mysqlbinlog, replays and replicas reading the binlogs the attack
+        # tests leave behind (3 min in position mode, 11 min in gtid mode)
+        qa_run damaged_binlog_consumers_test \
+          "damaged_binlog_consumers_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/dc-$mode" \
+          --port $((QA_PORT + 940)) --timeout 1700 ;;
       *) log "unknown QA_ROTATION harness $harness" ;;
     esac
     log "$harness ($mode) done in $(( ($(date +%s) - stage_started) / 60 )) min"

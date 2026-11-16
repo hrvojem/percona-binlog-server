@@ -621,6 +621,115 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/rewrite_attack_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/rewrite-attack
 ```
 
+### A hostile source against a running `pull` — `hostile_source_pull_test.py`
+
+`hostile_source_test.py` and `rewrite_attack_test.py` attack `fetch`. This
+one sends the same man-in-the-middle attacks to a long-running `pull` while
+a MySQL replica and a `mysqlbinlog --raw --stop-never` client are connected
+to its listener, in position mode, GTID mode and GTID mode with rewrite
+(`--rewrite`), and adds what only a long-running process meets: the source
+stalling in the middle of an event, dropping the connection in the middle
+of a transaction, replaying stored events after a reconnect, and ERR or EOF
+packets at odd points. A case passes when `pull` refuses cleanly and neither
+the storage nor the replica gets anything that is not the source's; a
+stored ROTATE with a name the source never used counts as a failure here.
+On 2026-11-16: 9 of 20 cases fail in position mode, 11 of 21 in GTID mode
+and 6 of 23 with rewrite, the same on the ASan build, with no exit by
+signal. The hostile names (tickets 59, 69, 70) do the same damage as with
+`fetch`, and `pull` keeps serving from the damaged storage: a binlog is
+truncated while a replica reads it, and the replica then stalls without an
+error in its status. In GTID mode `pull` also accepts the plain
+re-announcement that `fetch` refuses. With rewrite, an EOF after GTID +
+BEGIN leaves fragments in the stored binlog that `pull` can no longer serve
+(ticket 83), and duplicated, swapped or replayed transactions are stored
+(ticket 81). A lowered `transaction_length` leaves a stub in every mode
+(ticket 82). `pull` reconnects once a second without back-off; an ERR
+packet from the source ends it with exit 1.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/hostile_source_pull_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/hostile-pull \
+  --mode gtid --rewrite
+```
+
+### Purge and search after edited metadata — `purge_search_tamper_test.py`
+
+Builds a storage of six binlogs with three transactions each, one second
+apart, plain and encrypted, and checks `purge_binlogs`,
+`search_by_timestamp` and `search_by_gtid_set` against what the source's
+binlogs hold: first untampered at every boundary (all of those cases pass),
+then after one edit of the metadata or the index at a time. Where a search
+returns a wrong list, the test replays that list with `mysqlbinlog | mysql`
+into a scratch server and compares the rows. On 2026-11-16, 22 of 64 cases
+fail in GTID mode and 18 of 54 in position mode, all consequences of
+unauthenticated metadata (ticket 53): with the head of `binlog.index`
+removed, any purge, also a refused one, deletes the binlogs no longer
+listed; with a reordered index a purge removes the index prefix, the
+newest binlog included; a lowered `size` of the newest binlog makes any
+purge truncate it; edited timestamps, GTID sets or index order make the
+searches return lists that restore 3 or 6 rows of 11 with exit 0; and a
+binlog with unreadable metadata is left out of a "success" answer (ticket
+80).
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/purge_search_tamper_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/purge-search \
+  --mode gtid
+```
+
+### A transaction cut off by its declared length — `truncated_transaction_test.py`
+
+Follows up ticket 82 in position mode, GTID mode and GTID mode with rewrite
+(`--rewrite`), for `fetch` and a running `pull`. A proxy lowers
+`transaction_length` in one GTID event so the transaction seems to end
+after the GTID, after BEGIN, after TABLE_MAP or after the first ROWS event
+(also in a multi-statement, a DDL and a compressed transaction), or inside
+an event; other cases end or cut the stream after the false end. The test
+then looks at what is stored and at what the next run without the proxy
+does. It also covers what needs no attacker: connection drops and timeouts
+in the middle of a transaction, SIGTERM, SIGKILL, a killed source, and six
+kinds of damaged events. On 2026-11-16, 14 of 38 cases fail in each mode.
+Every lie that ends at an event boundary leaves a stub in the storage; in
+position and GTID mode every later run then exits 1, and with rewrite the
+next run exits 0 without the rows. None of the honest faults stores a
+partial transaction. `--replica-crash` adds two slow cases: replicas of
+several MySQL versions reading the stub (8.4 and 9.7 abort, 8.0 skips the
+transaction silently), and a reproducer of that abort with a hand-edited
+binlog on a MySQL source, without Percona Binlog Server.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/truncated_transaction_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/truncated-trx \
+  --mode gtid --rewrite
+```
+
+### Who can still read a damaged binlog — `damaged_binlog_consumers_test.py`
+
+Produces the malformed binlogs the attack tests leave in a storage (a
+second preamble, ticket 69; duplicated, swapped, foreign or missing
+GTIDs, ticket 81; a cut-off transaction, ticket 82; a forged row and a
+plaintext swap, tickets 53 and 62; a lower sequence number, ticket 70; the
+rewrite-mode layouts) and gives each to every consumer: `mysqlbinlog` on
+the files with position and GTID options, a replay into a scratch server,
+`mysqlbinlog --read-from-remote-server` through `pull`, position and GTID
+replicas from the start and from part way, and `list`, the searches and a
+new `fetch`. Cases are named `<state>/<consumer>`; a case passes when the
+consumer ends with the source's data or fails loudly. On 2026-11-16, 15 of
+90 cases fail in position mode and 98 of 344 in GTID mode. A second
+preamble is tolerated by a replica from the start, but a `--raw` copy
+through `pull` keeps only what follows it, and position-based starts and
+stops lose transactions. Swapped transactions give every consumer other
+row values without an error. In rewrite mode `--stop-datetime` can stop
+before any transaction, because the generated events carry the time of the
+fetch (ticket 84); that cell of the rewrite control state depends on
+timing. `--replica-basedirs` adds replicas of other MySQL versions.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/damaged_binlog_consumers_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/consumers \
+  --mode gtid
+```
+
 ### Secrets in output — `secrets_exposure_test.py`
 
 Runs `fetch`, `pull` (with right and wrong client logins), `list` and
@@ -1086,13 +1195,13 @@ server rather than starting one.
 
      | Day | Harness (mode) | Build |
      | --- | --- | --- |
-     | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position and gtid, about 1 min each) and `tls_config_test.py` (position, about 5 min) | ASan; debug |
-     | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 4 min) and `checkpoint_loss_test.py` (position, file storage, about 5 min) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
-     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min); `rewrite_attack_test.py` (gtid, about 7 min) | ASan; debug |
-     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) and `replica_tamper_test.py` (position, about 4 min) | ASan; debug |
-     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 7 min, with the local S3 server), `s3_upload_tamper_test.py` (position, about 1 min) and `listener_command_fuzz_test.py --tls` (gtid, about 5 min) | ASan; debug |
-     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min); `final_flush_test.py` (position, about 3 min) | debug / ASan; debug |
-     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) and `replica_tamper_test.py` (gtid, about 4 min) | ASan / debug; debug |
+     | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position and gtid, about 1 min each) and `tls_config_test.py` (position, about 5 min); `hostile_source_pull_test.py` (position, about 5 min) | ASan; debug |
+     | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 4 min) and `checkpoint_loss_test.py` (position, file storage, about 5 min); `purge_search_tamper_test.py` (gtid, about 2 min) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
+     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min); `rewrite_attack_test.py` (gtid, about 7 min) and `truncated_transaction_test.py` (position, about 3 min) | ASan; debug |
+     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) and `replica_tamper_test.py` (position, about 4 min); `hostile_source_pull_test.py` (gtid, about 5 min) | ASan; debug |
+     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 7 min, with the local S3 server), `s3_upload_tamper_test.py` (position, about 1 min) and `listener_command_fuzz_test.py --tls` (gtid, about 5 min); `truncated_transaction_test.py` (gtid, about 3 min) and `damaged_binlog_consumers_test.py` (position, about 3 min) | ASan; debug |
+     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min); `final_flush_test.py` (position, about 3 min); `hostile_source_pull_test.py --rewrite` (gtid, about 9 min) | debug / ASan; debug |
+     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) and `replica_tamper_test.py` (gtid, about 4 min); `truncated_transaction_test.py --rewrite` (gtid, about 5 min) and `damaged_binlog_consumers_test.py` (gtid, about 11 min) | ASan / debug; debug |
 
      `pull_versions/<series>` runs the replica harnesses of the nightly 8.4
      stage against another MySQL version of `MTR_DISTS`: `upgrade_test.py`,

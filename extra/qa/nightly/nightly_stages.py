@@ -352,6 +352,11 @@ def harness_command(args, workdir: Path) -> list:
             "--s3-bucket-dir", str(args.s3_bucket_dir)]
     if args.harness == "pull_soak_test":
         return script + common + mode + ["--duration", str(args.duration)]
+    if args.harness in ("hostile_source_pull_test",
+                        "truncated_transaction_test"):
+        # --rewrite (GTID mode): cases '<mode>/<case>/rewrite'
+        return script + common + mode + (
+            ["--rewrite"] if getattr(args, "rewrite", False) else [])
     if args.harness == "listener_command_fuzz_test":
         # --tls: the same cases over TLS, reported as '<mode>/<case>/tls'
         return script + common + mode + (["--tls"] if args.tls else [])
@@ -369,7 +374,9 @@ def harness_command(args, workdir: Path) -> list:
                         "listener_replica_dos_test", "metadata_tamper_test",
                         "listener_login_test",
                         "tls_config_test", "replica_tamper_test",
-                        "checkpoint_loss_test", "rewrite_attack_test"):
+                        "checkpoint_loss_test", "rewrite_attack_test",
+                        "purge_search_tamper_test",
+                        "damaged_binlog_consumers_test"):
         return script + common + mode
     raise SystemExit(f"unknown harness {args.harness}")
 
@@ -393,7 +400,11 @@ def harness_cases(args, returncode: int, output: str, lines: list,
                         "listener_login_test", "listener_command_fuzz_test",
                         "tls_config_test", "replica_tamper_test",
                         "final_flush_test", "s3_upload_tamper_test",
-                        "checkpoint_loss_test", "rewrite_attack_test"):
+                        "checkpoint_loss_test", "rewrite_attack_test",
+                        "hostile_source_pull_test",
+                        "purge_search_tamper_test",
+                        "truncated_transaction_test",
+                        "damaged_binlog_consumers_test"):
         cases = []
         for result, _ in objects:
             if "case" not in result:
@@ -411,7 +422,10 @@ def harness_cases(args, returncode: int, output: str, lines: list,
                     ("encrypted", getattr(args, "encrypted", False)),
                     ("s3", args.storage == "s3"),
                     ("rewrite", getattr(args, "rewrite", False)))
-                if used and args.harness == "pull_variety_test")
+                if used and (args.harness == "pull_variety_test" or (
+                    name == "rewrite" and args.harness in (
+                        "hostile_source_pull_test",
+                        "truncated_transaction_test"))))
             suffix = f"/{variant}" if variant else ""
             if result.get("tls"):
                 # listener_command_fuzz_test --tls

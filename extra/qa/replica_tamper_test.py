@@ -37,10 +37,24 @@ by someone who holds no key, and its data is compared with the source's.
   closed, made with the renaming proxy of hostile_source_test.py), served to
   a replica while the source is down. The replica's data is compared with
   the source's and its errors are recorded; the case does not fail on the
-  outcome.
+  outcome. In GTID mode that rename is refused by 'fetch', so there the
+  storage is made with the proxy's 'reannounce_midstream' (a second preamble
+  in the middle of the open binlog); if that leaves no doubled preamble
+  either, the case is reported as skipped.
+- 'plaintext_swap': an encrypted storage again (the read side of ticket
+  62). The data file of the stored binlog is replaced with plaintext events
+  (the source's own binlog with the row's value changed and that event's
+  CRC32 recomputed, which needs no key), and the 'encryption' member is
+  deleted from the binlog's metadata, with 'size' set to the new file's
+  size. The replica must not end up with the new value: 'pull' has to
+  refuse a binlog without an encryption record in an encrypted storage, or
+  the replica has to stop with an error.
 
-A JSON line per case, then a summary; exit 1 if any case failed. Position
-mode only (the replica starts at the first binlog, position 4). Example:
+A JSON line per case, then a summary; exit 1 if any case failed. In
+position mode (the default) the replica starts at the binlog, position 4;
+with --mode gtid the source, 'pull' and the replica run in GTID mode and the
+replica uses SOURCE_AUTO_POSITION=1 (the results then carry "mode": "gtid").
+Example:
 
   PYTHONPATH=~/ws/qa/pylib python3 replica_tamper_test.py \\
     --mysql-basedir ~/ws/dist/mysql-8.4.8-linux-glibc2.28-x86_64-minimal \\
@@ -196,6 +210,114 @@ def pull_errors(binsrv) -> list:
             "did not reach EOF" not in line][-3:]
 
 
+def gtid_mode(args) -> bool:
+    return getattr(args, "mode", "position") == "gtid"
+
+
+def starting_point(args, binlog: str) -> str:
+    """Where the replica starts: CHANGE REPLICATION SOURCE TO options."""
+    return ("SOURCE_AUTO_POSITION=1" if gtid_mode(args) else
+            f"SOURCE_LOG_FILE='{binlog}', SOURCE_LOG_POS=4")
+
+
+def labelled(args, result: dict) -> dict:
+    if gtid_mode(args):
+        result["mode"] = "gtid"
+    return result
+
+
+def row_event_with_the_value(plain: bytes) -> tuple:
+    """(offset, size) of the one WRITE_ROWS event that holds OLD_VALUE:
+    what an attacker who knows the table's layout and the binlog's event
+    sizes can work out."""
+    events = [(offset, size) for offset, code, size in
+              harness.parse_events(plain)
+              if code == WRITE_ROWS_EVENT and
+              OLD_VALUE in plain[offset:offset + size]]
+    if len(events) != 1:
+        raise harness.Failure("expected one WRITE_ROWS event with the value")
+    return events[0]
+
+
+def case_plaintext_swap(args, source, replica) -> dict:
+    binsrv = harness.BINSRV
+    source.reset()
+    binsrv.reset()
+    source.sql(f"INSERT INTO qa.t (payload) VALUES ('{OLD_VALUE.decode()}')")
+    config = configure(binsrv, encrypted=True)
+    fetch(binsrv, config)
+    binlog = binsrv.indexed_binlogs()[-1]
+    plain = source.binlog_as_sent(binlog)
+    stored_path = binsrv.storage / binlog
+    metadata_path = binsrv.storage / (binlog + ".json")
+    stored = stored_path.read_bytes()
+    metadata = json.loads(metadata_path.read_text())
+    if OLD_VALUE in stored or "encryption" not in metadata:
+        raise harness.Failure(f"{binlog} is not stored encrypted, so the "
+                              "case cannot run")
+    # the attacker's binlog: plaintext, so any event can be written with a
+    # correct checksum; here the source's events with another row value
+    offset, size = row_event_with_the_value(plain)
+    forged_binlog = bytearray(plain)
+    value_at = plain.index(OLD_VALUE, offset)
+    forged_binlog[value_at:value_at + len(OLD_VALUE)] = NEW_VALUE
+    forged_binlog[offset + size - 4:offset + size] = zlib.crc32(
+        bytes(forged_binlog[offset:offset + size - 4])).to_bytes(4, "little")
+    stored_path.write_bytes(bytes(forged_binlog))
+    members_before = sorted(metadata)
+    size_before = metadata["size"]
+    del metadata["encryption"]
+    metadata["size"] = len(forged_binlog)
+    metadata_path.write_text(json.dumps(metadata, separators=(",", ":")))
+
+    source_rows = [line for line in source.sql(
+        "SELECT payload FROM qa.t ORDER BY id").splitlines() if line]
+    pull = None
+    refused_to_start = ""
+    state = {"rows": [], "row_count": 0}
+    try:
+        try:
+            pull = start_pull(binsrv, configure(binsrv, True, args.port + 2),
+                              args.port + 2)
+        except harness.Failure as failure:
+            # refusing the storage at start-up is a refusal of the binlog
+            refused_to_start = harness.describe_failure(failure, 400)
+        if pull is not None:
+            replication.replicate_from_pull(
+                replica, args.port + 2, gtid_mode(args),
+                starting_point(args, binlog))
+            state = wait_for_replica(replica, lambda s: s["row_count"] >= 1)
+    finally:
+        if pull is not None:
+            replica.sql("STOP REPLICA")
+        stop_pull(pull)
+    forged = any(row.startswith(NEW_VALUE[:17].decode())
+                 for row in state["rows"])
+    result = {"case": "plaintext_swap", "binlog": binlog,
+              "event_offset_and_size": [offset, size],
+              "metadata_members_before": members_before,
+              "metadata_members_after": sorted(metadata),
+              "metadata_size_before_and_after": [size_before,
+                                                 metadata["size"]],
+              "data_file_is_plaintext": True,
+              "storage_metadata": json.loads(
+                  (binsrv.storage / "metadata.json").read_text()),
+              "source_rows": [row[:40] for row in source_rows],
+              "replica": state, "pull_errors": pull_errors(binsrv),
+              "pull_refused_to_start": refused_to_start,
+              "pull_refused_the_binlog": bool(refused_to_start or
+                                              pull_errors(binsrv)),
+              "replica_has_the_forged_value": forged, "ok": not forged}
+    if forged:
+        result["why"] = (
+            "the replica applied a row from a plaintext binlog put into the "
+            "encrypted storage without the key, after the binlog's "
+            "'encryption' metadata was deleted ('%s...' for the source's "
+            "'%s...'); pull served it as if it were its own" %
+            (NEW_VALUE[:17].decode(), OLD_VALUE[:17].decode()))
+    return labelled(args, result)
+
+
 def case_forged_row(args, source, replica, patch_checksum: bool) -> dict:
     name = "forged_row" if patch_checksum else "forged_row_bad_checksum"
     binsrv = harness.BINSRV
@@ -211,15 +333,8 @@ def case_forged_row(args, source, replica, patch_checksum: bool) -> dict:
     if OLD_VALUE in bytes(stored) or len(stored) != len(plain):
         raise harness.Failure(f"{binlog} is not stored encrypted with the "
                               "source's size, so the case cannot run")
-    # where the row's value lies: what an attacker who knows the table's
-    # layout and the binlog's event sizes can work out
-    events = [(offset, size) for offset, code, size in
-              harness.parse_events(plain)
-              if code == WRITE_ROWS_EVENT and
-              OLD_VALUE in plain[offset:offset + size]]
-    if len(events) != 1:
-        raise harness.Failure("expected one WRITE_ROWS event with the value")
-    offset, size = events[0]
+    # where the row's value lies
+    offset, size = row_event_with_the_value(plain)
     value_at = plain.index(OLD_VALUE, offset)
     delta = bytearray(size - 4)
     for index, (old, new) in enumerate(zip(OLD_VALUE, NEW_VALUE)):
@@ -240,8 +355,8 @@ def case_forged_row(args, source, replica, patch_checksum: bool) -> dict:
         pull = start_pull(binsrv, configure(binsrv, True, args.port + 2),
                           args.port + 2)
         replication.replicate_from_pull(
-            replica, args.port + 2, False,
-            f"SOURCE_LOG_FILE='{binlog}', SOURCE_LOG_POS=4")
+            replica, args.port + 2, gtid_mode(args),
+            starting_point(args, binlog))
         state = wait_for_replica(replica, lambda s: s["row_count"] >= 1)
     finally:
         replica.sql("STOP REPLICA")
@@ -262,7 +377,7 @@ def case_forged_row(args, source, replica, patch_checksum: bool) -> dict:
             "encrypted storage without the key ('%s...' for the source's "
             "'%s...'); neither pull nor the replica reported an error" %
             (NEW_VALUE[:17].decode(), OLD_VALUE[:17].decode()))
-    return result
+    return labelled(args, result)
 
 
 def case_doubled_preamble(args, source, replica) -> dict:
@@ -270,13 +385,24 @@ def case_doubled_preamble(args, source, replica) -> dict:
     hostile_args = SimpleNamespace(
         mysql_basedir=args.mysql_basedir, port=args.port, storage="file",
         case_insensitive_dir=None)
-    made = hostile.run_case("reannounce", hostile_args, args.port + 3)
+    # in GTID mode fetch refuses the rename of 'reannounce'; the current
+    # binlog announced again in the middle of the stream is what gets a
+    # second preamble stored there
+    attack = "reannounce_midstream" if gtid_mode(args) else "reannounce"
+    made = hostile.run_case(attack, hostile_args, args.port + 3)
     doubled = made.get("second_preamble_appended") or []
     if not doubled:
-        return {"case": "doubled_preamble", "ok": True,
-                "skipped": "the hostile source's rename left no doubled "
-                           "preamble (ticket 69 fixed?)",
-                "storage": made.get("storage_entries")}
+        return labelled(args, {
+            "case": "doubled_preamble", "ok": True,
+            "skipped": "the hostile source's rename left no doubled "
+                       "preamble (ticket 69 fixed?)" if attack == "reannounce"
+                       else "in GTID mode fetch refuses the hostile rename, "
+                       "and the current binlog announced again in the "
+                       "middle of the stream ('reannounce_midstream') left "
+                       "no doubled preamble either: " +
+                       "; ".join(made.get("proxied_fetch_errors") or
+                                 [str(made.get("why", ""))])[-300:],
+            "storage": made.get("storage_entries")})
     binlog = doubled[0]
     expected = replication.checksum(source)
     # the source is down while the replica reads: pull cannot resume from it
@@ -287,8 +413,8 @@ def case_doubled_preamble(args, source, replica) -> dict:
         pull = start_pull(binsrv, configure(binsrv, False, args.port + 2),
                           args.port + 2)
         replication.replicate_from_pull(
-            replica, args.port + 2, False,
-            f"SOURCE_LOG_FILE='{binlog}', SOURCE_LOG_POS=4")
+            replica, args.port + 2, gtid_mode(args),
+            starting_point(args, binlog))
         deadline = time.monotonic() + CATCH_UP_SECONDS
         actual = replication.checksum(replica)
         while actual != expected and time.monotonic() < deadline:
@@ -299,16 +425,21 @@ def case_doubled_preamble(args, source, replica) -> dict:
         replica.sql("STOP REPLICA")
         stop_pull(pull)
         source.start()
-    return {"case": "doubled_preamble", "binlog": binlog,
-            "stored_bytes": (binsrv.storage / binlog).stat().st_size,
-            "source_count_and_checksum": expected,
-            "replica_count_and_checksum": actual,
-            "replica_matches_the_source": actual == expected,
-            "replica_receiver": state["receiver"],
-            "replica_applier": state["applier"],
-            "pull_errors": pull_errors(binsrv),
-            # recorded, not judged: the stored binlog is malformed either way
-            "ok": True}
+    result = {"case": "doubled_preamble", "binlog": binlog,
+              "stored_bytes": (binsrv.storage / binlog).stat().st_size,
+              "source_count_and_checksum": expected,
+              "replica_count_and_checksum": actual,
+              "replica_matches_the_source": actual == expected,
+              "replica_receiver": state["receiver"],
+              "replica_applier": state["applier"],
+              "pull_errors": pull_errors(binsrv),
+              # recorded, not judged: the stored binlog is malformed either
+              # way
+              "ok": True}
+    if gtid_mode(args):
+        result["made_with"] = attack
+        result["format_descriptions_at"] = made.get("format_descriptions_at")
+    return labelled(args, result)
 
 
 def main():
@@ -317,28 +448,32 @@ def main():
     parser.add_argument("--binsrv", type=Path, required=True)
     parser.add_argument("--workdir", type=Path, required=True)
     parser.add_argument("--port", type=int, default=23700)
-    parser.add_argument("--mode", choices=["position"], default="position")
+    parser.add_argument("--mode", choices=["position", "gtid"],
+                        default="position")
     parser.add_argument("--cases", nargs="*",
                         default=["forged_row", "forged_row_bad_checksum",
-                                 "doubled_preamble"])
+                                 "doubled_preamble", "plaintext_swap"])
     args = parser.parse_args()
     args.mysql_basedir = args.mysql_basedir.expanduser()
     args.workdir.mkdir(parents=True, exist_ok=True)
+    gtid = gtid_mode(args)
     source = harness.MySQLServer(args.mysql_basedir, args.workdir / "source",
-                                 args.port, False, server_id=1)
+                                 args.port, gtid, server_id=1)
     replica = harness.MySQLServer(args.mysql_basedir,
                                   args.workdir / "replica", args.port + 1,
-                                  False, server_id=2)
+                                  gtid, server_id=2)
     harness.SERVER = source
     harness.BINSRV = harness.BinlogServer(args.binsrv.expanduser(),
                                           args.workdir / "binsrv", args.port,
-                                          False)
+                                          gtid)
     cases = {
         "forged_row": lambda: case_forged_row(args, source, replica, True),
         "forged_row_bad_checksum":
             lambda: case_forged_row(args, source, replica, False),
         "doubled_preamble":
             lambda: case_doubled_preamble(args, source, replica),
+        "plaintext_swap":
+            lambda: case_plaintext_swap(args, source, replica),
     }
     results = []
     source.start()
@@ -349,8 +484,9 @@ def main():
                 result = cases[name]()
             except (harness.Failure, RuntimeError,
                     subprocess.SubprocessError, OSError) as failure:
-                result = {"case": name, "ok": False,
-                          "why": harness.describe_failure(failure, 600)}
+                result = labelled(args, {
+                    "case": name, "ok": False,
+                    "why": harness.describe_failure(failure, 600)})
             print(json.dumps(result), flush=True)
             results.append(result)
     finally:

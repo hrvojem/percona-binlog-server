@@ -265,6 +265,21 @@ with `--s3-bucket-dir`): without `fs_buffer_directory` the backend's local
 buffer under `$TMPDIR` is a 0755 directory with a 0644 file under umask 022,
 and an existing `fs_buffer_directory` of mode 0777 is accepted (ticket 65).
 
+`s3_buffer_swap` (2026-11-16, also only with `--s3-bucket-dir`) does what
+that directory allows. The backend downloads the binlog object into the
+buffer file and then opens the file again by path; a watcher renames a file
+or a symlink of its own over the buffer file as soon as it appears (the test
+runs as the same account, standing in for another one that can write the
+directory; it only lists the directory and renames its own entry into it).
+Each variant is tried five times and the swap won every time: a regular file
+is uploaded as the binlog object with the new events appended; a symlink to
+a canary file outside the directory gets the events appended, or is
+truncated when the swap hits the start-up resize, and its content is
+uploaded to the bucket. In the debug build the plain `symlink` variant ends
+in an assertion (`s3_storage_backend.cpp:366`, the size of the path against
+the downloaded length), which release builds do not have. The case fails
+(ticket 65).
+
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/file_security_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/file-security \
@@ -330,6 +345,15 @@ verification is the only check; `pull` serves the event either way. In
 to a replica: the replica ends with exactly the source's data, so that
 malformed binlog does not corrupt a replica (recorded, not judged).
 
+`plaintext_swap` (2026-11-16) is the read side of ticket 62: the data file
+of an encrypted binlog is replaced with plaintext events (the source's own
+binlog with one row value changed and the CRC32 recomputed) and the
+`encryption` member is deleted from its metadata. `pull` serves it and the
+replica applies the attacker's row, with no error anywhere. `--mode gtid`
+runs the same cases with a replica in auto-position mode: `forged_row` and
+`plaintext_swap` fail the same way, and `doubled_preamble` is then produced
+with `reannounce_midstream` of `hostile_source_test.py`.
+
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/replica_tamper_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/replica-tamper
@@ -349,6 +373,25 @@ and disconnected" and exits 0 while the new data is not recorded (ticket
 73). The next `fetch` without a fault stores it, as long as the source still
 has it. Faults that hit a flush at a rotation are reported (the existing
 sweeps cover those).
+
+More cases (2026-11-16) show the same dropped error elsewhere. `pull`
+stopped by SIGTERM or SIGINT with a fault on its last flush logs
+"successfully shut down after receiving a termination signal" and exits 0
+with nothing recorded (`pull_sigterm/*`, `pull_sigint/*`). With
+`checkpoint_size` or `checkpoint_interval` a fault at a checkpoint is
+reported, but the flush at exit still is not, so the tail after the last
+checkpoint is lost silently (`checkpoint/*/final_flush/*`); the same when
+only one write of the final flush fails once (`partial/*`). All of these
+are ticket 73. Reported correctly: a failing flush at a rotation or after a
+read timeout in a running `pull`, every fault while a first `fetch` creates
+the storage, `purge_binlogs` (status "warning" when a binlog cannot be
+deleted, "error" when the index cannot be rewritten), and a log file that
+cannot be created. One more defect is separate: `list` and
+`search_by_timestamp` leave out a binlog whose metadata cannot be parsed and
+still answer "success" (`query/*`, ticket 80). 23 of 44 cases fail on file
+storage and 15 of 33 with `--s3-fault-proxy` (cases `.../on_s3`; the
+`s3_buffer/write` case needs `--fsfault-lib` as well). `--cases` selects
+cases by substring.
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/final_flush_test.py \
@@ -404,6 +447,15 @@ failures are new: one COM_QUERY of 16 MB keeps every client waiting for 25 s
 (ticket 75). The other nine are ticket 72 again, with other statements: any
 run of 40,000 or more characters that one of the handshake patterns matches
 ends `pull`; they run last (`--no-long-runs` leaves them out).
+
+With `--tls` (2026-11-16) `pull` gets the MTR certificate and every login
+and command goes inside TLS; five cases are added: MySQL frames split
+across TLS records down to one byte, plain data after the TLS handshake, a
+close_notify in the middle of a command, TLS 1.3 key updates and a TLS 1.2
+renegotiation request during a dump (the last two call libssl through
+`ctypes` and report `skipped` where that does not work). 36 of 48 cases
+pass on the debug, ASan and UBSan builds in both modes; the 12 failures are
+the ones above. The nightly reports these cases as `<mode>/<case>/tls`.
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/listener_command_fuzz_test.py \
@@ -475,9 +527,98 @@ ignores case (a vfat loop mount, for example), where the storage is then
 placed: the stored `binlog.000001` is replaced (ticket 71). The nightly has
 no such mount, so it does not run this case.
 
+`reannounce_midstream` (2026-11-16, GTID mode only) is the variant of
+ticket 69 that GTID mode does not refuse: after a complete transaction the
+proxy injects an artificial ROTATE that names the open binlog at position 4
+and copies of its FORMAT_DESCRIPTION and PREVIOUS_GTIDS_LOG, and lowers the
+log_pos of what follows. `fetch` exits 0 and the stored binlog has a second
+preamble in the middle (2330 bytes for the source's 2176). In position mode
+the same sequence is refused ("unexpected binlog position in artificial
+rotate event"; `--midstream-in-position-mode` runs it there).
+
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/hostile_source_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/hostile-source
+```
+
+### S3 uploads changed on the way — `s3_upload_tamper_test.py`
+
+With an `http://` S3 endpoint the uploads carry `x-amz-content-sha256:
+UNSIGNED-PAYLOAD` and no checksum header, so the request signature does not
+cover the body. The test puts its own proxy between `fetch` and the local S3
+server and changes bodies without touching anything signed. On 2026-11-16
+three cases fail (ticket 78). `put_body_changed`: a row value in the PUT of
+the binlog is replaced (event CRC32 recomputed); the server answers 200,
+`fetch` exits 0 and the object keeps the attacker's bytes. `put_metadata_changed`:
+the `size` in the PUT of the binlog's metadata is changed; set to the start
+of the last transaction, the next `fetch` in GTID mode truncates the object
+and exits 0 without that transaction, while in position mode it fetches it
+again. `get_body_changed`: a changed GET response is taken by the resumed
+`fetch`, appended to and uploaded again. Two cases are informational:
+`server_checks_signed_hash` (the gateway refuses a body that does not match
+a signed hash, so the gap is the client's choice) and `https_endpoint` (from
+the code: certificate verification is left at the SDK default, on).
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/s3_upload_tamper_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/s3-tamper \
+  --s3-bucket-dir ~/ws/s3/data/pbs-mtr
+```
+
+### What a kill loses at each checkpoint setting — `checkpoint_loss_test.py`
+
+Runs `pull` and `fetch` against a source committing about 2 MB/s in
+transactions of 10 to 100 KB, with no checkpointing, `checkpoint_size` 64K,
+1M and 16M, and `checkpoint_interval` 1s; kills them with SIGKILL at a
+random moment (five times per setting) and once with SIGTERM, and compares
+what the source had committed with what the storage recorded. A setting
+passes when the loss stays under its bound (the checkpoint size plus the
+largest transaction plus one second of workload, or the interval plus one
+second of workload) and the next start ends as an exact copy; without
+checkpointing the loss is recorded only. On 2026-11-16 all 20 cases pass on
+file storage (median loss after a kill: 7 MB without checkpoints, 12 KB at
+64K, 150 KB at 1M, 0.9 MB at 1s). With `--storage s3` two fail: at 64K
+`pull` cannot keep up, because every checkpoint uploads the whole binlog
+again (ticket 17; 375 MB uploaded for an 8.5 MB binlog), and a kill or even
+SIGTERM loses 3 to 7 MB. The numbers depend on the host's load. With
+`--no-s3-proxy` some kills at 64K leave the local gateway with a cut-off
+object shorter than its metadata says, which the next start refuses; that is
+how this gateway treats an interrupted PUT, and was not checked on AWS.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/checkpoint_loss_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/checkpoint-loss
+```
+
+### Rewrite mode under attack — `rewrite_attack_test.py`
+
+GTID mode with `replication.rewrite`, where the stored files are not copies
+of the source's, so the cases are judged by the stored stream of GTIDs,
+`list` / `search_by_gtid_set`, and a MySQL replica of `pull` in
+auto-position mode. 31 of 49 cases pass on 2026-11-16 (the same on the
+ASan and UBSan builds, without sanitizer reports). The hostile binlog names
+of `hostile_source_test.py` have no effect here: the source's ROTATE events
+are dropped. What fails:
+
+- nothing compares a GTID from the source with what is stored: sent twice
+  it is stored twice, two swapped transactions are stored swapped, and
+  edits of `added_gtids` / `previous_gtids` in the last binlog's metadata
+  make `fetch` skip transactions for good or store them again, with exit 0
+  (ticket 81; without rewrite a position check refuses these);
+- a `transaction_length` lowered on the way: `fetch` exits 1, but GTID and
+  BEGIN are stored and the GTID recorded; the next `fetch` exits 0 without
+  the rows, and a MySQL 8.4 replica of `pull` aborts (ticket 82);
+- the encryption-record and `size` edits of tickets 62 and 63 behave as
+  without rewrite;
+- after a kill the bytes past the recorded size are written again with the
+  same key and IV, and because the generated events carry a new timestamp
+  the two plaintexts differ (ticket 32, here without any attacker).
+
+`--random-kills` sets the number of kills of the last case (default 10).
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/rewrite_attack_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/rewrite-attack
 ```
 
 ### Secrets in output — `secrets_exposure_test.py`
@@ -945,13 +1086,13 @@ server rather than starting one.
 
      | Day | Harness (mode) | Build |
      | --- | --- | --- |
-     | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position, about 3 min) and `tls_config_test.py` (position, about 5 min) | ASan; debug |
-     | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 4 min) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
-     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min) | ASan; debug |
-     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) and `replica_tamper_test.py` (position, about 2 min) | ASan; debug |
-     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 4 min, with the local S3 server) | ASan; debug |
-     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min); `final_flush_test.py` (position, about 1 min) | debug / ASan; debug |
-     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) | ASan / debug; debug |
+     | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position and gtid, about 1 min each) and `tls_config_test.py` (position, about 5 min) | ASan; debug |
+     | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 4 min) and `checkpoint_loss_test.py` (position, file storage, about 5 min) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
+     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min); `rewrite_attack_test.py` (gtid, about 7 min) | ASan; debug |
+     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) and `replica_tamper_test.py` (position, about 4 min) | ASan; debug |
+     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 7 min, with the local S3 server), `s3_upload_tamper_test.py` (position, about 1 min) and `listener_command_fuzz_test.py --tls` (gtid, about 5 min) | ASan; debug |
+     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min); `final_flush_test.py` (position, about 3 min) | debug / ASan; debug |
+     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) and `replica_tamper_test.py` (gtid, about 4 min) | ASan / debug; debug |
 
      `pull_versions/<series>` runs the replica harnesses of the nightly 8.4
      stage against another MySQL version of `MTR_DISTS`: `upgrade_test.py`,

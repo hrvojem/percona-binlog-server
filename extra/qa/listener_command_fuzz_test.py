@@ -96,6 +96,35 @@ an acceptable answer to any of the inputs. Three groups of cases:
    (std::regex recurses once per character and overflows the stack); their
    lines carry "known": "ticket 72".
 
+With --tls 'pull' gets an 'ssl' section (the test certificate of the MTR
+suite) and every login of the cases above is made inside TLS (the SSL
+request, the TLS handshake, then the greeting; the first login of a 'pull'
+is a full authentication with the password in plain inside TLS), so all
+their commands and answers pass through the TLS stream of the listener. The
+names of the cases are the same; their lines and the summary carry
+"tls": true. These cases run with --tls only, after the deterministic ones:
+
+- 'tls_record_split': commands whose TLS records end in odd places: the
+  frame header in two records (at once and with a pause), a statement and a
+  dump with one byte per record, a record sent one byte per TCP segment,
+  both, and 1,000 records of one ping each in one segment. The answers must
+  be those of the unsplit commands.
+- 'tls_close_notify_mid_command': a close_notify after half a frame (the
+  rest of the frame then follows in plain), with a whole command and in
+  front of a dump. Nothing sent after the close_notify may be answered.
+- 'tls_plain_after_tls': after the login in TLS a ping, the checksum
+  declaration and a dump, a forged application data record and a frame of
+  0xFFFFFF bytes are sent in plain on the same connection, and a greeting in
+  plain after the TLS handshake. None may be answered or log in.
+- 'tls_key_update_during_dump', 'tls_renegotiation_during_dump': TLS 1.3
+  key updates (one that asks for the peer's, one that does not, 100 in a
+  row) and a TLS 1.2 renegotiation, requested while a dump is being
+  streamed and while a blocking dump idles. 'pull' must survive; whether
+  the session goes on is recorded. Python has no call for either, so the
+  functions of the OpenSSL library it has loaded are called on its
+  connection object in a child process; if that is not possible the case
+  passes with "skipped".
+
 A JSON line per case, then a summary; exit 1 if any case failed. When 'pull'
 ends in a case, what its last client sent after the login is written to
 '<workdir>/crash-<case>.bin' (and 'crash.bin') and the standard error of
@@ -105,10 +134,11 @@ catch memory errors. Example:
   PYTHONPATH=~/ws/qa/pylib python3 listener_command_fuzz_test.py \\
     --mysql-basedir ~/ws/dist/mysql-8.4.8-linux-glibc2.28-x86_64-minimal \\
     --binsrv ~/ws/percona-binlog-server-build-asan_gcc14/binlog_server \\
-    --workdir ~/ws/qa/listener-command-fuzz --mode gtid
+    --workdir ~/ws/qa/listener-command-fuzz --mode gtid [--tls]
 """
 
 import argparse
+import ctypes
 import json
 import os
 import random
@@ -116,11 +146,13 @@ import re
 import select
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
 import threading
 import time
+import warnings
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -145,6 +177,7 @@ COM_BINLOG_DUMP_GTID = listener.COM_BINLOG_DUMP_GTID
 COM_RESET_CONNECTION = 0x1f
 
 CLIENT_CONNECT_ATTRS = 0x100000
+CLIENT_SSL = listener.CLIENT_SSL
 
 NON_BLOCKING = 0x01          # BINLOG_DUMP_NON_BLOCK
 HEARTBEAT_EVENTS = (27, 41)  # HEARTBEAT_LOG_EVENT, HEARTBEAT_LOG_EVENT_V2
@@ -371,6 +404,7 @@ class Context:
         self.args = args
         self.binsrv = binsrv
         self.port = args.port + 2
+        self.tls = args.tls
         self.pull = None
         self.stderr = bytearray()
         self.stderr_reader = None
@@ -387,7 +421,8 @@ class Context:
     def ensure_pull(self):
         if self.pull is not None and self.pull.poll() is None:
             return
-        self.pull = login.start_pull(self.binsrv, self.port)
+        self.pull = login.start_pull(self.binsrv, self.port,
+                                     listener.SSL if self.tls else None)
         # the standard error of pull is read all the time: a sanitizer
         # report is longer than a pipe holds, and pull would block on it
         self.stderr = collected = bytearray()
@@ -401,7 +436,7 @@ class Context:
         self.stderr_reader.start()
         # the first login does the full authentication and puts the user
         # into the authentication cache: later logins are answered at once
-        if not login.logs_in(self.port):
+        if self.login_seconds(10.0) is None:
             raise harness.Failure("no login possible on a fresh pull\n" +
                                   self.binsrv.log_tail())
         self.baseline_rss = self.rss()
@@ -439,7 +474,9 @@ class Context:
         @source_binlog_checksum, as a dump needs."""
         previous = self.last_client
         client = self.connect(timeout)
-        if capabilities is None:
+        if self.tls:
+            logged_in = tls_handshake_with(client, capabilities)
+        elif capabilities is None:
             logged_in = client.handshake()
         else:
             logged_in = handshake_with(client, capabilities)
@@ -485,8 +522,9 @@ class Context:
         except OSError:
             return None
         try:
-            return (round(time.monotonic() - started, 3)
-                    if client.handshake() else None)
+            logged_in = (tls_handshake_with(client) if self.tls
+                         else client.handshake())
+            return round(time.monotonic() - started, 3) if logged_in else None
         finally:
             client.close()
 
@@ -508,8 +546,13 @@ def handshake_with(client: Listener, capabilities: int) -> bool:
     """A login with other capabilities than those of Listener.handshake():
     the fast authentication only, so a client must have logged in before."""
     salt = client.server_salt()
-    if salt is None:
-        return False
+    return salt is not None and greet(client, salt, 1, capabilities)
+
+
+def greet(client: Listener, salt: bytes, sequence: int, capabilities: int,
+          in_tls: bool = False) -> bool:
+    """The client greeting and what follows it up to the OK. Inside TLS a
+    full authentication is answered with the password in plain."""
     payload = greeting_payload(
         capabilities, listener.PULL_USER.encode(),
         listener.scramble(listener.PULL_PASSWORD, salt),
@@ -517,14 +560,41 @@ def handshake_with(client: Listener, capabilities: int) -> bool:
     if capabilities & CLIENT_CONNECT_ATTRS:
         attributes = b"\x04_pid\x0212"
         payload += listener.lenenc(len(attributes)) + attributes
-    client.send(frame(1, payload))
+    client.send(frame(sequence, payload))
     for _ in range(3):
         read = client.read_frame()
         if read is None or read[1][:1] == b"\xff":
             return False
         if read[1][:1] == b"\x00":
             return True
+        if in_tls and read[1] == b"\x01\x04":
+            client.send(frame(read[0] + 1,
+                              listener.PULL_PASSWORD.encode() + b"\x00"))
     return False
+
+
+def tls_handshake_with(client: Listener, capabilities: "int | None" = None,
+                       wrap=None) -> bool:
+    """A login inside TLS (--tls): the SSL request, the TLS handshake, then
+    the greeting with 'capabilities' (by default those of
+    Listener.handshake()) and CLIENT_SSL. 'wrap' makes the TLS end of the
+    connected socket; by default it is an ssl.SSLSocket."""
+    salt = client.server_salt()
+    if salt is None:
+        return False
+    if wrap is None:
+        if not client.upgrade_to_tls():
+            return False
+    else:
+        client.send(frame(1, listener.ssl_request_payload(
+            listener.BASE_CAPABILITIES | CLIENT_SSL)))
+        try:
+            client.sock = wrap(client.sock)
+        except OSError:
+            return False
+    return greet(client, salt, 2, (listener.BASE_CAPABILITIES
+                                   if capabilities is None else capabilities)
+                 | CLIENT_SSL, in_tls=True)
 
 
 def write_crash(ctx: Context, name: str):
@@ -540,6 +610,8 @@ def run_case(ctx: Context, name: str, function, known: "str | None" = None
              ) -> dict:
     """Runs one case and the checks that follow every case."""
     result = {"case": name}
+    if ctx.tls:
+        result["tls"] = True
     if known:
         result["known"] = known
     problems = []
@@ -725,7 +797,9 @@ def max_frame_case(ctx: Context, payload: bytes) -> dict:
         while waited is not None and time.monotonic() - started < 300:
             login_time = ctx.login_seconds(300.0)
             waited = None if login_time is None else max(waited, login_time)
-            if select.select([client.sock], [], [], 0)[0]:
+            # an answer that arrived, or one the TLS socket has decrypted
+            if getattr(client.sock, "pending", lambda: 0)() or \
+                    select.select([client.sock], [], [], 0)[0]:
                 break
         first = kind(read_frame(client, 300.0))
         answered = round(time.monotonic() - started, 2)
@@ -1410,6 +1484,601 @@ def command_bytes_case(with_body: bool):
 
 
 # ---------------------------------------------------------------------------
+# --tls only: what a client can do with the TLS layer itself
+# ---------------------------------------------------------------------------
+
+class RecordSocket:
+    """The TLS end of a connected socket, in place of an ssl.SSLSocket, for
+    a client that decides where its TLS records end and how they reach the
+    socket: 'plain_chunk' is the number of bytes of a sendall() that go into
+    one record (None: as many as fit), 'segment' the number of bytes of the
+    records written to the socket at once (None: all)."""
+
+    def __init__(self, raw: socket.socket,
+                 maximum_version: "ssl.TLSVersion | None" = None):
+        self.raw = raw
+        self.plain_chunk = None
+        self.segment = None
+        self.end = None     # how the server ended the TLS session
+        self.incoming, self.outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+        context = listener.tls_context()
+        if maximum_version is not None:
+            context.maximum_version = maximum_version
+        self.tls = context.wrap_bio(self.incoming, self.outgoing)
+        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._drive(self.tls.do_handshake)
+
+    def transmit(self, data: bytes):
+        """Writes bytes to the socket as they are (TLS records, or not)."""
+        step = self.segment or max(len(data), 1)
+        for start in range(0, len(data), step):
+            self.raw.sendall(data[start:start + step])
+
+    def flush(self):
+        data = self.outgoing.read()
+        if data:
+            self.transmit(data)
+
+    def _drive(self, call):
+        """Calls into the TLS object until it has what it needs."""
+        while True:
+            try:
+                result = call()
+            except ssl.SSLWantReadError:
+                self.flush()
+                piece = self.raw.recv(65536)
+                if piece:
+                    self.incoming.write(piece)
+                else:
+                    self.incoming.write_eof()
+                continue
+            self.flush()
+            return result
+
+    def settimeout(self, timeout: float):
+        self.raw.settimeout(timeout)
+
+    def pending(self) -> int:
+        return self.tls.pending()
+
+    def recv(self, count: int) -> bytes:
+        try:
+            return self._drive(lambda: self.tls.read(count))
+        except ssl.SSLZeroReturnError:
+            self.end = self.end or "close_notify"
+            return b""
+        except socket.timeout:
+            raise
+        except OSError as error:
+            self.end = self.end or (
+                "the connection was closed without a close_notify"
+                if isinstance(error, ssl.SSLEOFError) else
+                f"{type(error).__name__}: {getattr(error, 'reason', error)}")
+            raise
+
+    def records(self, data: bytes) -> bytes:
+        """The TLS records of 'data', not sent."""
+        step = self.plain_chunk or 16384
+        for start in range(0, len(data), step):
+            self.tls.write(data[start:start + step])
+        return self.outgoing.read()
+
+    def sendall(self, data: bytes):
+        self.transmit(self.records(data))
+
+    def close_notify(self) -> bytes:
+        """The close_notify alert of this end, not sent."""
+        try:
+            self.tls.unwrap()
+        except (ssl.SSLWantReadError, ssl.SSLSyscallError):
+            pass
+        return self.outgoing.read()
+
+    def close(self):
+        self.raw.close()
+
+
+def record_session(ctx: Context, checksum: bool = False,
+                   maximum_version: "ssl.TLSVersion | None" = None,
+                   timeout: float = 5.0) -> Listener:
+    """A client logged in inside TLS whose 'sock' is a RecordSocket."""
+    client = ctx.connect(timeout)
+    if not tls_handshake_with(client, wrap=lambda raw: RecordSocket(
+            raw, maximum_version)) or \
+            not isinstance(client.sock, RecordSocket):
+        client.close()
+        raise harness.Failure("could not log in with a TLS client of its own")
+    client.sent.clear()
+    if checksum and command(client, com_query(CHECKSUM_ON)) != "OK":
+        client.close()
+        raise harness.Failure("the checksum declaration was refused")
+    return client
+
+
+def case_tls_record_split(ctx: Context) -> dict:
+    ping = frame(0, bytes([COM_PING]))
+    query = frame(0, com_query(b"SELECT VERSION()"))
+    dump = frame(0, com_binlog_dump(4, NON_BLOCKING, 5, ctx.binlogs[-1][0]))
+    answers = {}
+    problems = []
+
+    def expect(label: str, answer, expected):
+        answers[label] = answer
+        if answer != expected:
+            problems.append(f"{label}: answered with {answer}, as one "
+                            f"record with {expected}")
+        ctx.check(label)
+
+    def answer_to(data: bytes, plain_chunk=None, segment=None,
+                  pieces=None, pause: float = 0.0, checksum: bool = False):
+        """The answer to 'data' sent with these record and segment sizes,
+        or as the 'pieces', one record each."""
+        client = record_session(ctx, checksum)
+        tls = client.sock
+        try:
+            tls.plain_chunk, tls.segment = plain_chunk, segment
+            if pieces is None:
+                client.send(data)
+            else:
+                client.sent += data
+                made = [tls.records(piece) for piece in pieces]
+                if pause:
+                    for piece in made:
+                        tls.transmit(piece)
+                        time.sleep(pause)
+                else:
+                    tls.transmit(b"".join(made))
+            tls.plain_chunk = tls.segment = None
+            if checksum:
+                return read_stream(client, 3.0, quiet=1.0)
+            read = read_frame(client, 5.0)
+            answer = kind(read)
+            if answer.startswith("bytes "):
+                # the rest of the result set, up to its second EOF
+                ends = 0
+                while ends < 2:
+                    read = read_frame(client, 5.0)
+                    if isinstance(read, str) or read[1][:1] == b"\xff":
+                        return "resultset cut short: " + kind(read)
+                    ends += is_eof(read[1])
+                return "resultset"
+            return answer
+        finally:
+            client.close()
+
+    whole = answer_to(dump, checksum=True)
+    if not served_events(whole):
+        problems.append("a dump sent as one record was not served")
+    expect("a ping, its header in two records (2 + 3 bytes), one segment",
+           answer_to(ping, pieces=[ping[:2], ping[2:]]), "OK")
+    expect("a ping, its header in two records, 0.2 s apart",
+           answer_to(ping, pieces=[ping[:2], ping[2:]], pause=0.2), "OK")
+    expect("a ping, header and command byte in separate records, 0.2 s "
+           "apart", answer_to(ping, pieces=[ping[:4], ping[4:]], pause=0.2),
+           "OK")
+    expect("a ping, one byte per record", answer_to(ping, plain_chunk=1),
+           "OK")
+    expect("a statement, one byte per record",
+           answer_to(query, plain_chunk=1), "resultset")
+    expect("a statement, one record, one byte per TCP segment",
+           answer_to(query, segment=1), "resultset")
+    expect("a ping, one byte per record and per TCP segment",
+           answer_to(ping, plain_chunk=1, segment=1), "OK")
+    expect("a statement, 7 bytes per record, 3 per TCP segment",
+           answer_to(query, plain_chunk=7, segment=3), "resultset")
+    split = answer_to(dump, plain_chunk=1, checksum=True)
+    expect("a dump, one byte per record: events and end",
+           [split["events"], split["end"]], [whole["events"], whole["end"]])
+    # 1,000 records of one ping each in one segment
+    client = record_session(ctx)
+    try:
+        client.sock.plain_chunk = len(ping)
+        client.send(ping * 1000)
+        answered = 0
+        for _ in range(1000):
+            if kind(read_frame(client, 5.0)) != "OK":
+                break
+            answered += 1
+    finally:
+        client.close()
+    expect("1,000 records of one ping each, sent at once: pings answered",
+           answered, 1000)
+    return {"answers": answers, "problems": problems}
+
+
+def after_the_end(client: Listener, seconds: float = 12.0) -> str:
+    """What the server sends inside TLS when it should send nothing more:
+    the frames (a problem), then how the session ended. The read timeout of
+    pull is 10 s, so a server that waits for the rest of a record gives up
+    within 'seconds'."""
+    frames = []
+    started = time.monotonic()
+    while len(frames) < 8:
+        read = read_frame(client, max(0.1, seconds -
+                                      (time.monotonic() - started)))
+        if isinstance(read, str):
+            end = read if read == "timeout" else (client.sock.end or read)
+            return ", ".join(frames + [end])
+        frames.append("answered: " + kind(read))
+    return ", ".join(frames)
+
+
+def case_tls_close_notify_mid_command(ctx: Context) -> dict:
+    query = frame(0, com_query(b"SELECT VERSION()"))
+    ping = frame(0, bytes([COM_PING]))
+    answers = {}
+    problems = []
+
+    def note(label: str, answer: str):
+        answers[label] = answer
+        if "answered: " in answer:
+            problems.append(f"{label}: {answer}")
+        if answer.endswith("timeout"):
+            problems.append(f"{label}: the session was still open after "
+                            "12 s")
+        ctx.check(label)
+
+    # half a frame, the close_notify, the rest of the frame in plain
+    for label, cut in (("after 2 bytes of the frame header", 2),
+                       ("after the frame header", 4),
+                       ("in the statement", 10)):
+        client = record_session(ctx)
+        tls = client.sock
+        try:
+            client.send(query[:cut])
+            alert = tls.close_notify()
+            client.sent += alert + query[cut:]
+            tls.transmit(alert)
+            time.sleep(0.2)
+            try:
+                tls.transmit(query[cut:])
+            except OSError:
+                pass
+            note(f"a close_notify {label}, then the rest in plain",
+                 after_the_end(client))
+        finally:
+            client.close()
+    # half a frame and the close_notify in one segment, nothing after it
+    client = record_session(ctx)
+    tls = client.sock
+    try:
+        client.sent += query[:10]
+        tls.transmit(tls.records(query[:10]) + tls.close_notify())
+        note("half a statement and a close_notify in one segment",
+             after_the_end(client))
+    finally:
+        client.close()
+    # a whole command, the close_notify, a command in plain: the first one
+    # may be answered, the plain one must not
+    client = record_session(ctx)
+    tls = client.sock
+    try:
+        client.sent += ping * 2
+        tls.transmit(tls.records(ping) + tls.close_notify() + ping)
+        first = kind(read_frame(client, 5.0))
+        rest = "-" if first in ("closed", "timeout") else \
+            after_the_end(client)
+        note("a ping, a close_notify, a ping in plain: after the first "
+             "answer", rest)
+        answers["a ping, a close_notify, a ping in plain: first answer"] = \
+            first
+    finally:
+        client.close()
+    # the close_notify behind a dump: the events may still be sent
+    client = record_session(ctx, checksum=True)
+    tls = client.sock
+    try:
+        dump = frame(0, com_binlog_dump(4, NON_BLOCKING, 5,
+                                        ctx.binlogs[-1][0]))
+        client.sent += dump
+        tls.transmit(tls.records(dump) + tls.close_notify())
+        counts = read_stream(client, 5.0, quiet=1.5)
+        answers["a dump and a close_notify in one segment"] = (
+            f"{counts['events']} events, {counts['end']}, "
+            f"{tls.end or 'open'}")
+    finally:
+        client.close()
+    ctx.check("a dump and a close_notify in one segment")
+    # a blocking dump that idles, then the close_notify
+    client = record_session(ctx, checksum=True)
+    tls = client.sock
+    try:
+        client.send(frame(0, com_binlog_dump(4, 0, 5, ctx.binlogs[-1][0])))
+        counts = read_stream(client, 1.0)
+        tls.transmit(tls.close_notify())
+        rest = read_stream(client, 2.0)
+        answers["a close_notify while a blocking dump idles"] = (
+            f"{counts['events']} events before it, then {rest['end']}, "
+            f"{tls.end or 'open'}")
+    finally:
+        client.close()
+    ctx.settle("a close_notify while a blocking dump idles")
+    return {"answers": answers, "problems": problems}
+
+
+def case_tls_plain_after_tls(ctx: Context) -> dict:
+    ping = frame(0, bytes([COM_PING]))
+    dump = frame(0, com_query(CHECKSUM_ON)) + frame(0, com_binlog_dump(
+        4, NON_BLOCKING, 5, ctx.binlogs[-1][0]))
+    inputs = {
+        "a ping": ping,
+        "1,000 pings": ping * 1000,
+        "the checksum declaration and a dump": dump,
+        "a quit": frame(0, bytes([COM_QUIT])),
+        # the header of an application data record of TLS 1.2 and 1.3, then
+        # as many bytes as it announces: a ping and filler
+        "a forged application data record that holds a ping":
+            b"\x17\x03\x03\x00\x20" + ping + b"\x00" * 27,
+        "a forged record of 16,384 bytes of pings":
+            b"\x17\x03\x03\x40\x00" + (ping * 3277)[:16384],
+        "a frame header of 0xFFFFFF bytes": b"\xff\xff\xff\x00" + b"q" * 99,
+        "a client greeting": frame(0, greeting_payload(
+            listener.BASE_CAPABILITIES, listener.PULL_USER.encode(),
+            b"\x11" * 32, b"caching_sha2_password"))}
+    answers = {}
+    problems = []
+    for label, data in inputs.items():
+        for first in (False, True):
+            name = label + (", after a ping inside TLS" if first else "")
+            client = record_session(ctx)
+            tls = client.sock
+            try:
+                if first and command(client, bytes([COM_PING])) != "OK":
+                    problems.append(f"{name}: the ping inside TLS was not "
+                                    "answered")
+                client.sent += data
+                try:
+                    tls.transmit(data)
+                except OSError:
+                    pass
+                answer = after_the_end(client)
+                # what the server sends outside TLS is no answer either
+                answers[name] = answer
+                if "answered: " in answer:
+                    problems.append(f"{name}, sent in plain after the login "
+                                    f"in TLS: {answer}")
+                if answer.endswith("timeout"):
+                    problems.append(f"{name}: the session was still open "
+                                    "after 12 s")
+            finally:
+                client.close()
+            ctx.check(name + ", in plain after the login in TLS")
+    # the TLS handshake, then the greeting in plain: no login
+    client = ctx.connect()
+    try:
+        salt = client.server_salt()
+        client.send(frame(1, listener.ssl_request_payload(
+            listener.BASE_CAPABILITIES | CLIENT_SSL)))
+        client.sock = tls = RecordSocket(client.sock)
+        greeting = frame(2, greeting_payload(
+            listener.BASE_CAPABILITIES | CLIENT_SSL,
+            listener.PULL_USER.encode(),
+            listener.scramble(listener.PULL_PASSWORD, salt or b""),
+            b"caching_sha2_password"))
+        client.sent += greeting
+        tls.transmit(greeting)
+        answer = after_the_end(client)
+        answers["the greeting in plain after the TLS handshake"] = answer
+        if "answered: " in answer:
+            problems.append("the greeting in plain after the TLS handshake "
+                            f"was answered inside TLS: {answer}")
+    finally:
+        client.close()
+    ctx.settle("the greeting in plain after the TLS handshake")
+    return {"answers": answers, "problems": problems}
+
+
+class OpenSSL:
+    """The functions of the OpenSSL library this Python has loaded, called
+    on the SSL object of an ssl.SSLObject: Python has no call for a key
+    update or a renegotiation. The SSL pointer is the second field of the
+    _ssl._SSLSocket object (PyObject_HEAD, the socket, the SSL pointer);
+    whether that is so here is checked by asking the library for the
+    protocol version of the pointer. That may crash on another Python, so
+    this is used in a child process only (in_child())."""
+
+    KEY_UPDATE_NOT_REQUESTED = 0
+    KEY_UPDATE_REQUESTED = 1
+
+    def __init__(self, tls: ssl.SSLObject):
+        path = next(line.split()[-1]
+                    for line in Path("/proc/self/maps").read_text(
+                        ).splitlines() if "/libssl" in line)
+        self.library = ctypes.CDLL(path)
+        pointer = ctypes.c_void_p.from_address(
+            id(tls._sslobj) +  # pylint: disable=protected-access
+            object.__basicsize__ + ctypes.sizeof(ctypes.c_void_p)).value
+        if not pointer:
+            raise ValueError("no SSL pointer")
+        self.pointer = ctypes.c_void_p(pointer)
+        for name in ("SSL_get_version", "SSL_key_update", "SSL_renegotiate",
+                     "SSL_do_handshake"):
+            getattr(self.library, name).argtypes = [ctypes.c_void_p] + (
+                [ctypes.c_int] if name == "SSL_key_update" else [])
+        self.library.SSL_get_version.restype = ctypes.c_char_p
+        if self.library.SSL_get_version(self.pointer) != \
+                (tls.version() or "").encode():
+            raise ValueError("the SSL pointer was not found")
+
+    def key_update(self, kind_of_update: int) -> bool:
+        """Queues a KeyUpdate message and writes it to the outgoing BIO."""
+        if self.library.SSL_key_update(self.pointer, kind_of_update) != 1:
+            return False
+        self.library.SSL_do_handshake(self.pointer)
+        return True
+
+    def renegotiate(self) -> bool:
+        """Starts a renegotiation: the ClientHello goes to the outgoing
+        BIO."""
+        if self.library.SSL_renegotiate(self.pointer) != 1:
+            return False
+        self.library.SSL_do_handshake(self.pointer)
+        return True
+
+
+def in_child(function) -> dict:
+    """The dictionary 'function()' returns in a child process, or
+    {'skipped': why} if the child ended without one."""
+    reader, writer = os.pipe()
+    with warnings.catch_warnings():
+        # the other thread of this process only reads the standard error
+        # of pull, and the child does not touch it
+        warnings.simplefilter("ignore", DeprecationWarning)
+        child = os.fork()
+    if child == 0:
+        code = 1
+        try:
+            os.close(reader)
+            try:
+                result = function()
+            except (OSError, ValueError, StopIteration, AttributeError,
+                    harness.Failure) as error:
+                result = {"skipped": f"{type(error).__name__}: {error}"}
+            os.write(writer, json.dumps(result).encode())
+            code = 0
+        finally:
+            os._exit(code)  # pylint: disable=protected-access
+    os.close(writer)
+    data = bytearray()
+    deadline = time.monotonic() + 120
+    with os.fdopen(reader, "rb", buffering=0) as stream:
+        while time.monotonic() < deadline:
+            if not select.select([stream], [], [], 1.0)[0]:
+                continue
+            piece = stream.read(65536)
+            if not piece:
+                break
+            data += piece
+        else:
+            os.kill(child, signal.SIGKILL)
+    _, status = os.waitpid(child, 0)
+    try:
+        return json.loads(data)
+    except ValueError:
+        return {"skipped": "the child process ended with wait status "
+                           f"{status} and no result"}
+
+
+def tls_handshake_messages_during_dump(ctx: Context, what: str,
+                                       maximum_version, trigger) -> dict:
+    """'trigger(OpenSSL)' sends TLS handshake messages (a key update, a
+    renegotiation) at three moments: while the events of a non-blocking dump
+    are streamed (the commands after the dump show whether the session goes
+    on), while a blocking dump idles, and between two commands. In a child
+    process: see OpenSSL."""
+    name = ctx.binlogs[1 if len(ctx.binlogs) > 1 else 0][0]
+
+    def run() -> dict:
+        outcome = {}
+        # 1: during a non-blocking dump, then a ping
+        client = record_session(ctx, checksum=True, timeout=10.0,
+                                maximum_version=maximum_version)
+        tls = client.sock
+        try:
+            outcome["protocol"] = tls.tls.version()
+            openssl = OpenSSL(tls.tls)
+            client.send(frame(0, com_binlog_dump(4, NON_BLOCKING, 5, name)))
+            first = read_frame(client, 5.0)
+            sent = trigger(openssl)
+            tls.flush()
+            counts = read_stream(client, 20.0, quiet=3.0)
+            after = (command(client, bytes([COM_PING]))
+                     if counts["end"] == "EOF" else "-")
+            outcome["during_a_non_blocking_dump"] = {
+                "sent": sent, "first_frame": kind(first),
+                "events_after_it": counts["events"], "end": counts["end"],
+                "tls_end": tls.end, "then_ping": after,
+                "protocol_afterwards": tls.tls.version()}
+        finally:
+            client.close()
+        # 2: while a blocking dump idles
+        client = record_session(ctx, checksum=True, timeout=10.0,
+                                maximum_version=maximum_version)
+        tls = client.sock
+        try:
+            openssl = OpenSSL(tls.tls)
+            client.send(frame(0, com_query(
+                b"SET @source_heartbeat_period = 500000000")))
+            read_frame(client, 5.0)
+            client.send(frame(0, com_binlog_dump(4, 0, 5, ctx.binlogs[-1][0])))
+            counts = read_stream(client, 1.5)
+            sent = trigger(openssl)
+            tls.flush()
+            rest = read_stream(client, 3.0)
+            outcome["while_a_blocking_dump_idles"] = {
+                "sent": sent, "events_before_it": counts["events"],
+                "heartbeats_after_it": rest["heartbeats"],
+                "end": rest["end"], "tls_end": tls.end}
+        finally:
+            client.close()
+        # 3: between two commands
+        client = record_session(ctx, timeout=10.0,
+                                maximum_version=maximum_version)
+        tls = client.sock
+        try:
+            openssl = OpenSSL(tls.tls)
+            before = command(client, bytes([COM_PING]))
+            sent = trigger(openssl)
+            tls.flush()
+            time.sleep(0.3)
+            outcome["between_two_pings"] = {
+                "sent": sent, "ping_before": before,
+                "ping_after": command(client, bytes([COM_PING])),
+                "second_ping_after": command(client, bytes([COM_PING])),
+                "tls_end": tls.end}
+        finally:
+            client.close()
+        return outcome
+
+    outcome = in_child(run)
+    ctx.settle(what + " during a dump")
+    return outcome
+
+
+def case_tls_key_update_during_dump(ctx: Context) -> dict:
+    result = {"problems": []}
+    for label, kind_of_update, count in (
+            ("update_requested", OpenSSL.KEY_UPDATE_REQUESTED, 1),
+            ("update_not_requested", OpenSSL.KEY_UPDATE_NOT_REQUESTED, 1),
+            ("100_updates_requested", OpenSSL.KEY_UPDATE_REQUESTED, 100)):
+        def trigger(openssl, kind_of_update=kind_of_update, count=count):
+            return sum(openssl.key_update(kind_of_update)
+                       for _ in range(count))
+        result[label] = outcome = tls_handshake_messages_during_dump(
+            ctx, f"a TLS key update ({label})", None, trigger)
+        if "skipped" in outcome:
+            result["skipped"] = outcome["skipped"]
+            break
+        # one key update is what any TLS 1.3 client may send: the session
+        # must go on
+        if count == 1:
+            dump = outcome["during_a_non_blocking_dump"]
+            pings = outcome["between_two_pings"]
+            # (the listener ends the session after a dump: the ping after
+            # it is only recorded)
+            if dump["end"] != "EOF":
+                result["problems"].append(
+                    f"{label} during a dump: the dump ended with "
+                    f"{dump['end']}")
+            if pings["ping_after"] != "OK" or \
+                    pings["second_ping_after"] != "OK":
+                result["problems"].append(
+                    f"{label} between two pings: the pings after it were "
+                    f"answered with {pings['ping_after']} and "
+                    f"{pings['second_ping_after']}")
+    return result
+
+
+def case_tls_renegotiation_during_dump(ctx: Context) -> dict:
+    # refusing a renegotiation is fine (OpenSSL 3 does by default): only
+    # pull has to survive, which the checks after every case see
+    outcome = tls_handshake_messages_during_dump(
+        ctx, "a TLS 1.2 renegotiation", ssl.TLSVersion.TLSv1_2,
+        lambda openssl: int(openssl.renegotiate()))
+    return outcome
+
+
+# ---------------------------------------------------------------------------
 # the fuzz phase
 # ---------------------------------------------------------------------------
 
@@ -1581,7 +2250,7 @@ def case_fuzz(ctx: Context) -> dict:
             break
     if not problems:
         ctx.settle(f"the last fuzz connections (seed {ctx.args.seed})")
-        if not listener.streams_binlogs("127.0.0.1", ctx.port):
+        if not listener.streams_binlogs("127.0.0.1", ctx.port, ctx.tls):
             problems.append("mysqlbinlog is not served after the fuzz phase")
     return {"seed": ctx.args.seed, "connections": done, "commands": commands,
             "answers": answers, "events_received": events,
@@ -1666,6 +2335,15 @@ def all_cases(args) -> list:
         ("commands_during_dump", case_commands_during_dump),
         ("command_bytes", command_bytes_case(False)),
         ("command_bytes_with_body", command_bytes_case(True))]
+    if args.tls:
+        cases += [
+            ("tls_record_split", case_tls_record_split),
+            ("tls_close_notify_mid_command",
+             case_tls_close_notify_mid_command),
+            ("tls_plain_after_tls", case_tls_plain_after_tls),
+            ("tls_key_update_during_dump", case_tls_key_update_during_dump),
+            ("tls_renegotiation_during_dump",
+             case_tls_renegotiation_during_dump)]
     cases = [(name, function, None) for name, function in cases]
     if args.connections > 0:
         cases.append(("fuzz", case_fuzz, None))
@@ -1698,6 +2376,10 @@ def main():
                         help="the share of one CPU an idle dump may use")
     parser.add_argument("--no-long-runs", action="store_true",
                         help="without the cases of ticket 72, which end pull")
+    parser.add_argument("--tls", action="store_true",
+                        help="pull with an 'ssl' section; every case logs "
+                             "in and sends its commands inside TLS, and the "
+                             "tls_* cases run")
     parser.add_argument("--only", action="append", metavar="CASE",
                         help="run this case only (can be repeated)")
     args = parser.parse_args()
@@ -1745,6 +2427,7 @@ def main():
     print(json.dumps({"cases": len(results), "failures": len(failures),
                       "failed": [result["case"] for result in failures],
                       "mode": args.mode,
+                      **({"tls": True} if args.tls else {}),
                       "seconds": round(time.monotonic() - started),
                       "passed": not failures}), flush=True)
     (args.workdir / "result.json").write_text(json.dumps(results, indent=2))

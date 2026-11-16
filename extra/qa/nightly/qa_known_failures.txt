@@ -10,7 +10,8 @@
 # listener_exhaustion_test, file_security_test, hostile_source_test,
 # secrets_exposure_test, upstream_tls_test, listener_replica_dos_test,
 # metadata_tamper_test, listener_login_test, listener_command_fuzz_test,
-# tls_config_test, replica_tamper_test, final_flush_test) run
+# tls_config_test, replica_tamper_test, final_flush_test,
+# s3_upload_tamper_test, checkpoint_loss_test, rewrite_attack_test) run
 # about once a week,
 # so their known failures show up on those nights only.
 # A sanitizer report is never covered by a pattern line (its reason names
@@ -30,8 +31,8 @@ telemetry_test position/settings_in_storage  ticket 50: with instance.local_sett
 listener_exhaustion_test position/idle_flood  ticket 55 (PBS-128): idle connections past pull's RLIMIT_NOFILE make accept() fail with EMFILE, handle_exception("listener") ends the accept loop and pull stays up without a listener for good
 file_security_test position/modes/*  ticket 56 (PBS-129): storage files take their mode from the umask (binlog data and metadata 0644 under umask 022, everything 0666 under umask 000; MySQL creates binlogs 0640)
 file_security_test position/symlinks  ticket 57 (PBS-130): symlinks planted in the storage directory under the next binlog, its metadata's .tmp and binlog.index.tmp are written through into files outside the storage
-hostile_source_test position/nul_*  ticket 59 (PBS-131): a binlog name from the source's ROTATE with a NUL byte ('binlog.000001\0.000002', 'metadata.json\0...', 'binlog.index\0...') passes composite_binlog_name::parse and is opened truncated at the NUL: a stored binlog loses its data, metadata.json or binlog.index is overwritten, and fetch exits 0
-hostile_source_test position/newline  ticket 59 (PBS-131): a newline in a binlog name from the source's ROTATE is written into binlog.index, which then no longer opens
+hostile_source_test */nul_*  ticket 59 (PBS-131): a binlog name from the source's ROTATE with a NUL byte ('binlog.000001\0.000002', 'metadata.json\0...', 'binlog.index\0...') passes composite_binlog_name::parse and is opened truncated at the NUL: a stored binlog loses its data, metadata.json or binlog.index is overwritten, and fetch exits 0
+hostile_source_test */newline  ticket 59 (PBS-131): a newline in a binlog name from the source's ROTATE is written into binlog.index, which then no longer opens
 listener_replica_dos_test gtid/huge_gtid_set*  ticket 61 (PBS-135): a logged-in replica's COM_BINLOG_DUMP_GTID with a 1,000,000-interval GTID set (16 MB) occupies the listener for about 12 s, during which no other client is served, and leaves about 100 MB of resident memory behind
 metadata_tamper_test position/strip_encryption  ticket 62: with the 'encryption' record removed from the last binlog's metadata, the next fetch appends plaintext to the encrypted storage and exits 0 (validate_binlog_encryption_record checks a record only when it is present)
 metadata_tamper_test position/transplant_encryption  ticket 63: an 'encryption' record copied from another binlog's metadata is accepted (the wrapped file key is not bound to its binlog), so the appended data reuses that binlog's AES-CTR keystream
@@ -40,7 +41,7 @@ file_security_test position/s3_buffer  ticket 65: the S3 backend's local buffer 
 file_security_test position/telemetry_symlinks  ticket 66: a symlink planted under the next telemetry report's temporary name ('<unix seconds>-<tag>.tmp', both predictable) is written through, and the target's mode becomes 0644
 listener_login_test position/user_name_probe  ticket 67: once a client has logged in, a wrong scramble gets ERR 1045 at once for the configured user name and 'perform full authentication' for any other name
 hostile_source_test position/reannounce  ticket 69: an artificial ROTATE that names the binlog just closed, at position 4, reopens it for append: a second FORMAT_DESCRIPTION and the next binlog's events follow its ROTATE, and fetch exits 0
-hostile_source_test position/lower_sequence  ticket 70: a binlog with a lower sequence number than the first stored one is created and indexed, and the next start takes it for the leftover of an interrupted purge ('binlog index contains a reference to a non-existing object')
+hostile_source_test */lower_sequence  ticket 70: a binlog with a lower sequence number than the first stored one is created and indexed, and the next start takes it for the leftover of an interrupted purge ('binlog index contains a reference to a non-existing object')
 hostile_source_test position/case_variant  ticket 71: on a file system that ignores case (--case-insensitive-dir), 'BINLOG.000001' is new to binlog.index and is opened with truncation, which replaces the stored 'binlog.000001'
 listener_login_test position/long_statement  ticket 72: a COM_QUERY of 'SET' and 100,000 spaces from a logged-in client is matched with std::regex, which recurses per character: pull ends with SIGSEGV (debug and release builds)
 metadata_tamper_test */encryption_null  ticket 62: 'encryption': null in the last binlog's metadata is taken as no record, like a removed one: fetch appends plaintext and exits 0
@@ -67,4 +68,30 @@ listener_command_fuzz_test */heartbeat_1*ns_blocking_dump  ticket 75: a heartbea
 listener_command_fuzz_test */regex_run_*  ticket 72: other statements with a run of 40,000 or more characters matched by one of the handshake patterns (digits after the heartbeat period, white space in any SET statement) end pull the same way
 final_flush_test */disk/*  ticket 73: ENOSPC or EIO on the write or fsync of the binlog data, or on saving the binlog metadata, in the flush fetch runs at exit: the storage destructor drops the error, fetch logs 'successfully fetched everything' and exits 0, and the new data is not recorded
 final_flush_test */s3/*  ticket 73: the same with every PUT of the binlog object or of its metadata failing (needs --s3-fault-proxy; not run by the nightly)
-replica_tamper_test position/forged_row  ticket 53 (PBS-126): a row value changed in the encrypted storage without the key (ciphertext XOR, CRC32 footer patched) is served by pull and applied by a MySQL replica, with no error on either side
+replica_tamper_test */forged_row  ticket 53 (PBS-126): a row value changed in the encrypted storage without the key (ciphertext XOR, CRC32 footer patched) is served by pull and applied by a MySQL replica, with no error on either side
+replica_tamper_test */plaintext_swap  ticket 62 (PBS-136): the data file of an encrypted binlog replaced with plaintext events (a row value of the attacker's choice, correct CRC32) and the 'encryption' member deleted from its metadata: pull serves it and a MySQL replica applies the row, with no error on either side
+hostile_source_test gtid/reannounce_midstream  ticket 69: in GTID mode an artificial ROTATE naming the open binlog at position 4, sent after a complete transaction and followed by a FORMAT_DESCRIPTION and PREVIOUS_GTIDS_LOG, is accepted: the second preamble and the later transactions are appended in the middle of the binlog and fetch exits 0
+file_security_test position/s3_buffer_swap  ticket 65: the S3 buffer file is opened again by path after the download: a file or symlink renamed over it by someone who can write an existing 0777 fs_buffer_directory is uploaded as the binlog object, and the symlink's target is appended to or truncated
+s3_upload_tamper_test */put_*_changed  ticket 78: with an http:// endpoint the uploads are sent with UNSIGNED-PAYLOAD and no checksum: a proxy on the path changes the body of a binlog or metadata PUT, the server answers 200 and fetch exits 0
+s3_upload_tamper_test */get_body_changed  ticket 78: the body of a GET of the binlog object changed on the way is taken by the resumed fetch, appended to and uploaded again
+listener_command_fuzz_test */query_max_frame/tls  ticket 74: as without TLS
+listener_command_fuzz_test */heartbeat_1*ns_blocking_dump/tls  ticket 75: as without TLS
+listener_command_fuzz_test */regex_run_*/tls  ticket 72: as without TLS
+final_flush_test */pull_sig*/data*  ticket 73: pull stopped by SIGTERM or SIGINT with a fault on the flush it runs at exit logs 'successfully shut down after receiving a termination signal' and exits 0 while the new data is not recorded
+final_flush_test */pull_sig*/metadata*  ticket 73: the same with the fault on saving the binlog metadata
+final_flush_test */checkpoint/*/final_flush/*  ticket 73: with checkpoint_size or checkpoint_interval the checkpoint flushes report a fault, but the flush at exit (fetch at EOF, pull on SIGTERM) still drops it: exit 0, the tail after the last checkpoint is not recorded
+final_flush_test */partial/fetch/final_flush/*  ticket 73: only one write of the final flush fails once: the data is written, its metadata is not, fetch exits 0
+final_flush_test */s3_buffer/write/on_s3  ticket 73: a failing write to the S3 backend's local buffer file in the final flush (needs --s3-fault-proxy and --fsfault-lib; not run by the nightly)
+final_flush_test */query/*  ticket 80: list and search_by_timestamp leave out a binlog whose metadata cannot be parsed and answer with status "success" and exit 0
+rewrite_attack_test gtid/source_gtid_twice  ticket 81: in rewrite mode nothing compares a GTID from the source with what is stored: a GTID sent twice is stored twice, two swapped transactions are stored in that order, a GTID under another UUID is stored (fetch exits 0)
+rewrite_attack_test gtid/source_gtid_swapped  ticket 81: as source_gtid_twice, two transactions swapped on the way are stored in that order
+rewrite_attack_test gtid/source_gtid_other_uuid  ticket 81: as source_gtid_twice, a transaction under another server UUID is stored
+rewrite_attack_test gtid/storage_tail_added_*  ticket 81: 'added_gtids' of the last binlog's metadata edited without the key: transactions listed but not stored are never fetched (extended), or stored ones are fetched and stored again (emptied, truncated, another UUID); fetch exits 0
+rewrite_attack_test gtid/storage_tail_previous_*  ticket 81: the same through 'previous_gtids' of the last binlog's metadata
+rewrite_attack_test gtid/storage_older_added_emptied  ticket 81: 'added_gtids' of an older binlog emptied: a replica that already has the binlogs before it is served from the one after it and silently misses that binlog's transactions
+rewrite_attack_test gtid/source_length_smaller  ticket 82: a transaction_length lowered on the way so the transaction seems to end after BEGIN: fetch exits 1, but the storage destructor has stored GTID + BEGIN and recorded the GTID; the next fetch exits 0 without the transaction's rows, and a MySQL 8.4 replica of pull aborts
+rewrite_attack_test gtid/storage_tail_size_lowered  ticket 63 (PBS-137): 'size' of the last binlog's metadata lowered: the file is truncated and new transactions are encrypted over the same offsets with the same key and IV; the cut-off transaction is never fetched again
+rewrite_attack_test gtid/storage_tail_encryption_removed  ticket 62 (PBS-136): the encryption record removed from the last binlog's metadata: what fetch appends is plaintext
+rewrite_attack_test gtid/storage_tail_encryption_transplanted  ticket 63 (PBS-137): the encryption record of another binlog: appended data uses that binlog's keystream
+rewrite_attack_test gtid/storage_tail_iv_lowered  ticket 63 (PBS-137): the IV counter lowered by 64 blocks: appended data repeats the file's own keystream from 1024 bytes lower
+rewrite_attack_test gtid/crash_*  ticket 32: fetch killed with data past the size in the metadata writes those offsets again with the same key and IV; in rewrite mode the generated events carry a new timestamp, so two different plaintexts share a keystream range without any attacker

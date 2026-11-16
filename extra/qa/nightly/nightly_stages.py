@@ -352,8 +352,11 @@ def harness_command(args, workdir: Path) -> list:
             "--s3-bucket-dir", str(args.s3_bucket_dir)]
     if args.harness == "pull_soak_test":
         return script + common + mode + ["--duration", str(args.duration)]
-    if args.harness == "file_security_test":
-        # its 's3_buffer' case runs against the local S3 server
+    if args.harness == "listener_command_fuzz_test":
+        # --tls: the same cases over TLS, reported as '<mode>/<case>/tls'
+        return script + common + mode + (["--tls"] if args.tls else [])
+    if args.harness in ("file_security_test", "s3_upload_tamper_test"):
+        # the 's3_buffer*' cases and the upload proxy use the local S3 server
         command = script + common + mode
         if args.s3_bucket_dir:
             command += ["--s3-endpoint", args.s3_endpoint,
@@ -364,8 +367,9 @@ def harness_command(args, workdir: Path) -> list:
                         "hostile_source_test",
                         "secrets_exposure_test", "upstream_tls_test",
                         "listener_replica_dos_test", "metadata_tamper_test",
-                        "listener_login_test", "listener_command_fuzz_test",
-                        "tls_config_test", "replica_tamper_test"):
+                        "listener_login_test",
+                        "tls_config_test", "replica_tamper_test",
+                        "checkpoint_loss_test", "rewrite_attack_test"):
         return script + common + mode
     raise SystemExit(f"unknown harness {args.harness}")
 
@@ -388,7 +392,8 @@ def harness_cases(args, returncode: int, output: str, lines: list,
                         "listener_replica_dos_test", "metadata_tamper_test",
                         "listener_login_test", "listener_command_fuzz_test",
                         "tls_config_test", "replica_tamper_test",
-                        "final_flush_test"):
+                        "final_flush_test", "s3_upload_tamper_test",
+                        "checkpoint_loss_test", "rewrite_attack_test"):
         cases = []
         for result, _ in objects:
             if "case" not in result:
@@ -408,6 +413,9 @@ def harness_cases(args, returncode: int, output: str, lines: list,
                     ("rewrite", getattr(args, "rewrite", False)))
                 if used and args.harness == "pull_variety_test")
             suffix = f"/{variant}" if variant else ""
+            if result.get("tls"):
+                # listener_command_fuzz_test --tls
+                suffix += "/tls"
             cases.append((f"{mode}/{result['case']}{suffix}",
                           not result.get("ok"), reason[:240], None, None,
                           None))
@@ -1004,6 +1012,8 @@ def main():
     parser.add_argument("--fsfault-lib", type=Path,
                         help="disk_fault_sweep's LD_PRELOAD library")
     parser.add_argument("--toxiproxy-api", default="http://127.0.0.1:8474")
+    parser.add_argument("--tls", action="store_true",
+                        help="listener_command_fuzz_test: log in over TLS")
     parser.add_argument("--connections", type=int, default=3000,
                         help="listener_fuzz_test connections")
     parser.add_argument("--seed", type=int, default=1,

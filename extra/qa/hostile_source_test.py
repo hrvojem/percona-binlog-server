@@ -72,6 +72,19 @@ match; for these the peak memory and the duration of the proxied 'fetch' are
 recorded as well (at most 2 GiB and 120 s). --mode gtid runs every case in
 GTID mode, and --storage s3 against the local S3 server.
 
+One attack on the stream itself, 'reannounce_midstream' (ticket 69 in GTID
+mode, where 'reannounce' is refused): the source does not rotate, so the
+proxied 'fetch' resumes in the binlog it has stored; after the first
+complete transaction the proxy inserts an artificial ROTATE that names that
+same binlog at position 4, and copies of the binlog's FORMAT_DESCRIPTION and
+PREVIOUS_GTIDS_LOG, and from then on counts the positions of the events from
+the end of that second preamble. The stored binlog must not get the second
+preamble (and the transactions after it) in its middle. GTID mode only: in
+position mode the artificial ROTATE's position is compared with the
+storage's and the stream is refused, so there the case is not in the default
+list and is reported as skipped (--midstream-in-position-mode runs it
+anyway, to show the refusal).
+
 The binlog dump is read without TLS, so 'fetch' authenticates as the
 caching_sha2_password user with the server's cached hash (a mysql client
 login with --get-server-public-key first), as in the MTR test
@@ -136,6 +149,14 @@ GTID_BLOAT_INTERVALS = 900_000
 FORMAT_DESCRIPTION_EVENT = 15
 PREVIOUS_GTIDS_LOG_EVENT = 35
 ARTIFICIAL_FLAG = 0x20
+# attacks on the event stream of the binlog being stored (no rename):
+# 'reannounce_midstream' announces the current binlog again, at position 4
+# and with a second preamble, after a complete transaction (GTID mode)
+STREAM_CASES = ["reannounce_midstream"]
+HEARTBEAT_EVENTS = (27, 41)
+IGNORABLE_FLAG = 0x80
+# the transactions the proxy lets through before it re-announces the binlog
+MIDSTREAM_AFTER_TRANSACTIONS = 1
 
 
 class RenamingProxy:
@@ -154,6 +175,15 @@ class RenamingProxy:
         self.in_next_binlog = False
         # bytes added to the next binlog so far (gtid_bloat)
         self.shift = 0
+        # reannounce_midstream: the preamble events the source sent (without
+        # their footers), the transactions started since, the end position
+        # of the last event, and after the injection: where it was made and
+        # by how much the later positions are lowered
+        self.preamble = {}
+        self.transactions = 0
+        self.last_log_pos = 0
+        self.injected_at = None
+        self.rewind = 0
         self.dumping = threading.Event()
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -294,7 +324,85 @@ class RenamingProxy:
             return b"\x00" + bytes(event_with_lie)
         return payload
 
+    def _midstream(self, payload: bytes) -> list:
+        """The packets to send for this one (reannounce_midstream): before
+        the event that starts transaction MIDSTREAM_AFTER_TRANSACTIONS + 1,
+        an artificial ROTATE naming the binlog being sent at position 4, its
+        FORMAT_DESCRIPTION and its PREVIOUS_GTIDS_LOG; every event after
+        them with its log_pos counted from the end of that preamble (the
+        reader restarts at position 4 on an artificial ROTATE)."""
+        if len(payload) < 1 + HEADER_SIZE or payload[0] != 0:
+            return [payload]
+        event = payload[1:]
+        code = event[4]
+        if code in HEARTBEAT_EVENTS:
+            return [payload]
+        flags = struct.unpack_from("<H", event, 17)[0]
+        log_pos = struct.unpack_from("<I", event, 13)[0]
+        has_crc = (len(event) >= HEADER_SIZE + 4 and
+                   zlib.crc32(event[:-4]) == struct.unpack("<I",
+                                                           event[-4:])[0])
+        body_end = len(event) - (4 if has_crc else 0)
+        footer = 4 if has_crc else 0
+        if self.injected_at is not None:
+            if log_pos == 0:
+                return [payload]
+            moved = bytearray(event[:body_end])
+            struct.pack_into("<I", moved, 13, log_pos - self.rewind)
+            return [self._finish(moved, has_crc)]
+        if code == ROTATE_EVENT and flags & ARTIFICIAL_FLAG:
+            self.old_name = self.new_name = bytes(
+                event[HEADER_SIZE + ROTATE_POST_HEADER_SIZE:body_end])
+            self.preamble = {}
+            self.transactions = 0
+            return [payload]
+        if code in (FORMAT_DESCRIPTION_EVENT, PREVIOUS_GTIDS_LOG_EVENT):
+            self.preamble[code] = bytes(event[:body_end])
+            return [payload]
+        if code in harness.TRANSACTION_START_EVENTS:
+            self.transactions += 1
+        if code not in harness.TRANSACTION_START_EVENTS or \
+                self.transactions <= MIDSTREAM_AFTER_TRANSACTIONS or \
+                FORMAT_DESCRIPTION_EVENT not in self.preamble or \
+                self.last_log_pos == 0:
+            if log_pos != 0:
+                self.last_log_pos = log_pos
+            return [payload]
+        # the previous event ended a transaction at 'last_log_pos', which is
+        # where this event lies in the source's binlog
+        description = bytearray(self.preamble[FORMAT_DESCRIPTION_EVENT])
+        server_id = description[5:9]
+        # as in the file: a resume in position mode sends it with log_pos 0
+        position = 4 + len(description) + footer
+        struct.pack_into("<I", description, 13, position)
+        if PREVIOUS_GTIDS_LOG_EVENT in self.preamble:
+            previous = bytearray(self.preamble[PREVIOUS_GTIDS_LOG_EVENT])
+        else:
+            # not sent on a resume in position mode: an empty set
+            previous = bytearray(
+                description[:4] + bytes([PREVIOUS_GTIDS_LOG_EVENT]) +
+                server_id + struct.pack("<IIH", 0, 0, IGNORABLE_FLAG) +
+                struct.pack("<Q", 0))
+        position += len(previous) + footer
+        struct.pack_into("<I", previous, 13, position)
+        rotate = bytearray(
+            struct.pack("<IB", 0, ROTATE_EVENT) + server_id +
+            struct.pack("<IIH", 0, 0, ARTIFICIAL_FLAG) +
+            struct.pack("<Q", 4) + self.old_name)
+        self.injected_at = self.last_log_pos
+        self.rewind = self.last_log_pos - position
+        self.rewritten += 1
+        moved = bytearray(event[:body_end])
+        struct.pack_into("<I", moved, 13, log_pos - self.rewind)
+        return [self._finish(rotate, has_crc),
+                self._finish(description, has_crc),
+                self._finish(previous, has_crc),
+                self._finish(moved, has_crc)]
+
     def _server_to_client(self, server, client):
+        # packets inserted into this connection so far: the sequence numbers
+        # of the packets after them move up by as many
+        inserted = 0
         try:
             while True:
                 header = self._read_exactly(server, 4)
@@ -304,10 +412,17 @@ class RenamingProxy:
                 payload = self._read_exactly(server, length) if length else b""
                 if payload is None:
                     break
+                payloads = [payload]
                 if self.dumping.is_set() and length < 0xFFFFFF:
-                    payload = self._rewrite(payload)
-                client.sendall(struct.pack("<I", len(payload))[:3] +
-                               header[3:4] + payload)
+                    if self.attack == "reannounce_midstream":
+                        payloads = self._midstream(payload)
+                    else:
+                        payloads = [self._rewrite(payload)]
+                for index, payload in enumerate(payloads):
+                    inserted += 1 if index else 0
+                    client.sendall(
+                        struct.pack("<I", len(payload))[:3] +
+                        bytes([(header[3] + inserted) & 0xFF]) + payload)
         finally:
             for sock in (client, server):
                 try:
@@ -384,7 +499,33 @@ def format_descriptions(data: bytes) -> int:
         return -1
 
 
+def format_description_offsets(data: bytes) -> list:
+    """Where the FORMAT_DESCRIPTION events of a stored binlog start."""
+    try:
+        return [offset for offset, code, _ in harness.parse_events(data)
+                if code == FORMAT_DESCRIPTION_EVENT]
+    except Exception:  # pylint: disable=broad-except
+        return []
+
+
+def logged_errors(binsrv, limit: int = 3) -> list:
+    if not binsrv.log_path.exists():
+        return []
+    return [line.strip()[-220:] for line in
+            binsrv.log_path.read_text(errors="replace").splitlines()
+            if "[  error]" in line or "exception caught" in line][-limit:]
+
+
 def run_case(name: str, args, proxy_port: int) -> dict:
+    if name in STREAM_CASES and not harness.BINSRV.gtid_mode and \
+            not getattr(args, "midstream_in_position_mode", False):
+        return {"case": name, "ok": True,
+                "skipped": "GTID mode only: in position mode the position "
+                           "of an artificial ROTATE that names the open "
+                           "binlog is compared with the storage's, and the "
+                           "stream is refused ('unexpected binlog position "
+                           "in artificial rotate event'; "
+                           "--midstream-in-position-mode runs it anyway)"}
     if name == "case_variant":
         if args.case_insensitive_dir is None or args.storage != "file":
             return {"case": name, "ok": True,
@@ -422,7 +563,12 @@ def run_case_on_storage(name: str, args, proxy_port: int) -> dict:
     old_name = b"binlog.%06d" % upcoming
     attack = "rename" if name in CASES else name
     new_name = CASES[name](upcoming) if attack == "rename" else old_name
-    harness.SERVER.sql("FLUSH BINARY LOGS")
+    if name in STREAM_CASES:
+        # no rotation: the proxied fetch resumes in the last stored binlog,
+        # and that is the binlog the proxy announces again
+        old_name = new_name = b"binlog.%06d" % stored[-1]
+    else:
+        harness.SERVER.sql("FLUSH BINARY LOGS")
     machine.run_workload(WORKLOAD)
 
     # the proxied configuration: through the proxy, without TLS
@@ -439,6 +585,7 @@ def run_case_on_storage(name: str, args, proxy_port: int) -> dict:
     finally:
         proxy.close()
     proxied_exit, proxied_stderr = proxied["exit"], proxied["stderr"]
+    proxied_errors = logged_errors(binsrv)
     after = snapshot(binsrv.storage)
     # a stored binlog may only grow (the ROTATE at its end is appended) and
     # its metadata follows it, so binlog data must keep its old bytes as a
@@ -464,10 +611,7 @@ def run_case_on_storage(name: str, args, proxy_port: int) -> dict:
     except subprocess.TimeoutExpired:
         list_exit, list_output = -1, "timeout"
     direct_exit, direct_stderr = run_fetch(binsrv, binsrv.config_path)
-    errors = [line.strip()[-220:] for line in
-              binsrv.log_path.read_text(errors="replace").splitlines()
-              if "[  error]" in line or "exception caught" in line][-3:] \
-        if binsrv.log_path.exists() else []
+    errors = logged_errors(binsrv)
     result = {
         "case": name, "attack": attack,
         "hostile_name": repr(new_name)[:120],
@@ -482,6 +626,20 @@ def run_case_on_storage(name: str, args, proxy_port: int) -> dict:
         "direct_fetch_exit": direct_exit,
         "last_errors": errors,
     }
+    if name in STREAM_CASES:
+        current = old_name.decode()
+        result.update(
+            injected_at_source_position=proxy.injected_at,
+            positions_lowered_by=proxy.rewind,
+            proxied_fetch_errors=proxied_errors,
+            proxied_fetch_stderr=proxied_stderr[-300:],
+            binlog=current,
+            binlog_bytes_before_and_after=[
+                len(before.get(current, b"")), len(after.get(current, b""))],
+            source_binlog_bytes=len(
+                harness.SERVER.binlog_as_sent(current)),
+            format_descriptions_at=format_description_offsets(
+                after.get(current, b"")))
     if proxy.rewritten == 0:
         result["ok"] = False
         result["why"] = ("the proxy changed nothing in the next binlog "
@@ -535,7 +693,11 @@ def main():
     parser.add_argument("--s3-access-key", default="pbsaccesskey")
     parser.add_argument("--s3-secret-key", default="pbs/secret+key=1")
     parser.add_argument("--cases", nargs="*",
-                        choices=list(CASES) + RESOURCE_CASES)
+                        choices=list(CASES) + RESOURCE_CASES + STREAM_CASES)
+    parser.add_argument("--midstream-in-position-mode", action="store_true",
+                        help="run 'reannounce_midstream' in position mode "
+                             "too (it is skipped there: the stream is "
+                             "refused)")
     parser.add_argument("--case-insensitive-dir", type=Path,
                         help="a directory on a file system that ignores "
                              "case; 'case_variant' runs only with it")
@@ -548,7 +710,8 @@ def main():
             name for name in CASES if name != "case_variant" or
             args.case_insensitive_dir is not None] + [
             name for name in RESOURCE_CASES
-            if name != "gtid_bloat" or gtid_mode]
+            if name != "gtid_bloat" or gtid_mode] + (
+                STREAM_CASES if gtid_mode else [])
     s3 = None
     if args.storage == "s3":
         if args.s3_bucket_dir is None:

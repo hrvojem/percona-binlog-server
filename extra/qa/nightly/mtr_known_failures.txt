@@ -14,7 +14,7 @@
 * gtid_resume_after_rotation  ticket 14: GTID-mode resume after a rotation misses the closing ROTATE and empty binlogs
 * rs_source_killed_after_rotation  ticket 6: closing a binlog mid-transaction keeps the dropped events' timestamps (pull aborts at storage.cpp:138 after the source is killed right after a rotation)
 * rs_position_based_replica_gtid_source  ticket 30 (PBS-102): a position-mode PBS of a GTID source reports GTID_MODE = OFF, so no replica can follow it
-* fetch_ssl_disabled_caching_sha2  ticket 23: fetch cannot authenticate without SSL as a caching_sha2_password user (no MYSQL_OPT_GET_SERVER_PUBLIC_KEY)
+* fetch_ssl_disabled_caching_sha2  ticket 23 (PBS-133): fetch cannot authenticate without SSL as a caching_sha2_password user (no MYSQL_OPT_GET_SERVER_PUBLIC_KEY)
 # the test leaves SOURCE_SSL at its default, which a 9.7 replica takes as
 # 'SSL required'; the replica never connects to pull's (TLS-less) listener,
 # and the SOURCE_POS_WAIT that follows hangs until the 30-minute test case

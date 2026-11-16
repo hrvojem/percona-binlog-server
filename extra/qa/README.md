@@ -254,7 +254,7 @@ are 0644 (MySQL makes its binlogs 0640); under umask 000, the binlogs, their
 metadata, the index, `metadata.json` and the log are 0666 (ticket 56, PBS-129). Every
 planted symlink is written through into the file outside the storage, and the
 rename that follows leaves `binlog.index` and the binlog metadata as
-permanent symlinks (ticket 57).
+permanent symlinks (ticket 57, PBS-130).
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/file_security_test.py \
@@ -270,7 +270,7 @@ or an attacker on a connection without TLS verification could. `fetch`
 reads the dump without TLS (the server's cached password hash, as in
 `fetch_ssl_disabled_caching_sha2`). After each case every stored binlog must
 keep its data, `metadata.json` must be unchanged and the storage must still
-open (`list`). On 2026-11-16 four of six names fail (ticket 59). With
+open (`list`). On 2026-11-16 four of six names fail (ticket 59, PBS-131). With
 `binlog.000001\0.000002`, `binlog.000001` loses its data. With
 `metadata.json\0...`, `metadata.json` is overwritten ("unable to extract
 mode"). With `binlog.index\0...` and a name containing a newline,
@@ -318,7 +318,7 @@ HTTPS S3 endpoint with a self-signed certificate is refused before any
 request. Without an `ssl` section, and with `preferred` or `required`, the man
 in the middle is accepted and captures the replication password in clear;
 without a section, or with `preferred`, a stripped greeting is accepted too
-(ticket 60). Those cases pass, as this is the MySQL client's design, and the
+(ticket 60, PBS-134). Those cases pass, as this is the MySQL client's design, and the
 summary lists them.
 
 ```sh

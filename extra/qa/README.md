@@ -244,7 +244,7 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/listener_exhaustion_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/listener-exhaustion
 ```
 
-### Storage file modes and symlinks — `file_security_test.py`
+### Storage file modes, symlinks and the S3 buffer — `file_security_test.py`
 
 Records the modes of everything `fetch` creates under umask 022 and 000, and
 plants symlinks in the storage directory, while `pull` runs, under the names
@@ -256,9 +256,53 @@ planted symlink is written through into the file outside the storage, and the
 rename that follows leaves `binlog.index` and the binlog metadata as
 permanent symlinks (ticket 57, PBS-130).
 
+Two more cases were added on 2026-11-16, and both fail. `telemetry_symlinks`
+reads the tag from the name of `pull`'s first telemetry report and plants
+symlinks under the temporary names of the next ones: the file they point at,
+mode 0600 and outside the telemetry directory, ends up holding a report with
+mode 0644 (ticket 66). `s3_buffer` runs `pull` on the local S3 server (only
+with `--s3-bucket-dir`): without `fs_buffer_directory` the backend's local
+buffer under `$TMPDIR` is a 0755 directory with a 0644 file under umask 022,
+and an existing `fs_buffer_directory` of mode 0777 is accepted (ticket 65).
+
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/file_security_test.py \
-  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/file-security
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/file-security \
+  --s3-bucket-dir ~/ws/s3/data/pbs-mtr
+```
+
+### Edited binlog metadata of an encrypted storage — `metadata_tamper_test.py`
+
+Between two `fetch` runs, someone who can write to the storage but has no
+keyring edits the metadata of the last stored binlog; the configuration and
+the keyring stay as they are. On 2026-11-16 both cases fail. With the
+`encryption` record removed (`strip_encryption`), the next `fetch` exits 0
+and appends plaintext to the encrypted storage (ticket 62). With the record
+replaced by the previous binlog's (`transplant_encryption`), the appended
+data is encrypted with that binlog's AES-CTR keystream: XORed with the
+keystream the previous binlog's known plaintext gives, every appended byte
+decrypts (ticket 63). A `fetch` that refuses the edited metadata passes
+either case.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/metadata_tamper_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/metadata-tamper
+```
+
+### Listener logins and long statements — `listener_login_test.py`
+
+Talks to the `pull` listener with the raw client of `listener_fuzz_test.py`.
+`user_name_probe` sends a client greeting with a random scramble, once with
+the configured user name and once with another: after one successful login
+the configured name gets ERR 1045 at once and any other name "perform full
+authentication", so the first reply tells whether a name is the replication
+user (ticket 67). `long_statement` logs in and sends `SET` followed by 1,000
+to 1,000,000 spaces: at 100,000 `pull` ends with a segmentation fault, in the
+debug and the release build (ticket 72). Both fail on 2026-11-16.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/listener_login_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/listener-login
 ```
 
 ### Hostile source binlog names — `hostile_source_test.py`
@@ -283,6 +327,19 @@ almost 4 GB is refused at once) and `gtid_bloat` (a PREVIOUS_GTIDS_LOG of
 900,000 intervals is stored in 0.9 s with 32 MB; what it later costs is not
 measured).
 
+Three more names were added on 2026-11-16, and all fail in position mode.
+`reannounce` renames the next binlog to the current one: `fetch` exits 0 and
+the stored binlog gets a second FORMAT_DESCRIPTION and the next binlog's
+events after its ROTATE (ticket 69; in GTID mode `fetch` refuses it).
+`lower_sequence` uses `binlog.000002` on a storage that starts at
+`binlog.000004`: `fetch` exits 0, and every later start fails with "binlog
+index contains a reference to a non-existing object" (ticket 70, also in
+GTID mode). `case_variant` uses `BINLOG.000001` and runs only with
+`--case-insensitive-dir <directory>`, a directory on a file system that
+ignores case (a vfat loop mount, for example), where the storage is then
+placed: the stored `binlog.000001` is replaced (ticket 71). The nightly has
+no such mount, so it does not run this case.
+
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/hostile_source_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/hostile-source
@@ -296,7 +353,11 @@ source password (and a wrong one), the listener password, a wrong client
 password, KEK bytes, the bytes of a malformed keyring record, and S3
 credentials in the storage URI, against an unreachable and a refusing S3
 endpoint. Then it searches the log, stdout / stderr and telemetry for each
-secret. On 2026-11-16 nothing was found in 7 runs.
+secret. On 2026-11-16 nothing was found in 7 runs. Three runs added later
+that day (`s3_unencoded_*`) use a storage URI whose S3 secret key holds a `/`
+that is not percent-encoded: such a URI parses without user info, and the
+"binlog storage backend URI (masked)" log line carries the secret in all
+three shapes (ticket 64).
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/secrets_exposure_test.py \
@@ -750,12 +811,12 @@ server rather than starting one.
      | Day | Harness (mode) | Build |
      | --- | --- | --- |
      | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position, about 2 min) | ASan; debug |
-     | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0 | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
+     | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 1 min) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
      | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) | ASan; debug |
      | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) | ASan; debug |
-     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 2 min) | ASan; debug |
+     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 4 min, with the local S3 server) | ASan; debug |
      | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min) | debug / ASan; debug |
-     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default) | ASan / debug |
+     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 1 min) | ASan / debug; debug |
 
      `pull_versions/<series>` runs the replica harnesses of the nightly 8.4
      stage against another MySQL version of `MTR_DISTS`: `upgrade_test.py`,

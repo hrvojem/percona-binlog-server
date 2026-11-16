@@ -39,6 +39,12 @@ Runs (each a JSON line with the secrets it found, by place):
                         connections, credentials in the URI
   s3_wrong_credentials  fetch to the local S3 server (if one listens on
                         --s3-endpoint) with wrong credentials in the URI
+  s3_unencoded_*        fetch with a storage URI whose secret key holds a
+                        '/' that is not percent-encoded, in three shapes
+                        (the secret starts with '/', only digits come before
+                        the '/', the endpoint form); such a URI parses
+                        without user info, and the "masked" URI in the log
+                        then carries the secret (ticket 64)
 
 Exit 1 if any secret was found. Example:
 
@@ -73,6 +79,8 @@ SECRETS = {
     "wrong client password": "ClientWrong-8Hc1-Pl03",
     "S3 access key": "AKIASECRET77XQ",
     "S3 secret key": "S3Secret-6Tg2-Mn48",
+    # the part after the '/' of a secret key that is not percent-encoded
+    "unencoded S3 secret key": "RawS3Key-7Vd4-Hx90",
 }
 KEK_HEX = "5EC7E75EC7E7A11CE0B0B5EC7E75EC7E"
 # 31 bytes (62 hex digits) for a 32-byte cipher: a malformed record
@@ -320,6 +328,27 @@ def main():
             storage = {"backend": "s3",
                        "uri": f"http://{credentials}@{endpoint}/pbs-mtr/"
                               "secrets-test",
+                       "fs_buffer_directory": str(runner.binsrv.workdir /
+                                                  "s3-buffer")}
+            code, output = runner.run(["fetch"], runner.config(
+                storage=storage), timeout=180)
+            record(runner.outputs(name, code, output))
+
+        # a secret key with a '/' that is not percent-encoded (the README
+        # asks for %2F, nothing enforces it): the URI parses as host, port
+        # and path, without user info
+        access = SECRETS["S3 access key"]
+        raw = SECRETS["unencoded S3 secret key"]
+        for name, uri in (
+                ("s3_unencoded_slash_first",
+                 f"s3://{access}:/{raw}@bucket.us-east-1/vault"),
+                ("s3_unencoded_digits_then_slash",
+                 f"s3://{access}:123/{raw}@bucket.us-east-1/vault"),
+                ("s3_unencoded_endpoint",
+                 f"http://{access}:/{raw}@127.0.0.1:1/pbs-mtr/"
+                 "secrets-test")):
+            runner.fresh()
+            storage = {"backend": "s3", "uri": uri,
                        "fs_buffer_directory": str(runner.binsrv.workdir /
                                                   "s3-buffer")}
             code, output = runner.run(["fetch"], runner.config(

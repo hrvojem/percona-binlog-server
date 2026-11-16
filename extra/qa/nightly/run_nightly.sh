@@ -122,7 +122,7 @@ QA_S3_EXAMPLES=${QA_S3_EXAMPLES:-5}
 S3_BUCKET_DIR=${S3_BUCKET_DIR:-$WS/s3/data/pbs-mtr}
 # the rotation of the heavier QA harnesses: '<weekday>:<harness>/<mode>'
 # (weekday 1-7 is Monday-Sunday, date +%u); 4-15 min a night (README.md)
-QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 4:pull_versions/ps-8.4 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 6:pull_versions/ps-9.7 7:network_fault_test/gtid 7:pull_soak_test/position 2:listener_exhaustion_test/position 5:file_security_test/position 1:hostile_source_test/position 3:secrets_exposure_test/position 4:upstream_tls_test/position 6:listener_replica_dos_test/gtid"}
+QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 4:pull_versions/ps-8.4 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 6:pull_versions/ps-9.7 7:network_fault_test/gtid 7:pull_soak_test/position 2:listener_exhaustion_test/position 5:file_security_test/position 1:hostile_source_test/position 3:secrets_exposure_test/position 4:upstream_tls_test/position 6:listener_replica_dos_test/gtid 2:metadata_tamper_test/position 7:listener_login_test/position"}
 QA_ROTATION_DAY=${QA_ROTATION_DAY:-$(date -u +%u)}
 # pull_versions on Percona Server: '<label>:<series>:<distribution under
 # $WS/dist>' (8.4 is the release tarball, 9.7 a build of the 9.7 branch,
@@ -690,7 +690,9 @@ if want qa || want rotation; then
         [ "$harness" = hostile_source_test ] ||
         [ "$harness" = secrets_exposure_test ] ||
         [ "$harness" = upstream_tls_test ] ||
-        [ "$harness" = listener_replica_dos_test ]; then
+        [ "$harness" = listener_replica_dos_test ] ||
+        [ "$harness" = metadata_tamper_test ] ||
+        [ "$harness" = listener_login_test ]; then
       build=debug_gcc14
       binsrv=$debug_binsrv
     fi
@@ -807,14 +809,17 @@ if want qa || want rotation; then
           "${common[@]}" --workdir "$out/qa/lx-$mode" \
           --port $((QA_PORT + 450)) --timeout 900 ;;
       file_security_test)
-        # storage file modes under umask 022 / 000 and symlinks planted in
-        # the storage directory (about 2 min)
+        # storage file modes under umask 022 / 000, symlinks planted in
+        # the storage and the telemetry directory, and the S3 backend's
+        # local buffer (about 4 min)
         qa_run file_security_test "file_security_test ($mode)" \
           "${common[@]}" --workdir "$out/qa/fs-$mode" \
+          --s3-bucket-dir "$S3_BUCKET_DIR" \
           --port $((QA_PORT + 470)) --timeout 900 ;;
       hostile_source_test)
         # a proxy renames the next binlog in the source's ROTATE events
-        # (NUL byte, newline, '..', oversized); uses ports +3 to +8
+        # (NUL byte, newline, '..', oversized, the current name, a lower
+        # sequence number); uses ports +3 to +13
         qa_run hostile_source_test "hostile_source_test ($mode)" \
           "${common[@]}" --workdir "$out/qa/hs-$mode" \
           --port $((QA_PORT + 490)) --timeout 900 ;;
@@ -836,6 +841,19 @@ if want qa || want rotation; then
         qa_run listener_replica_dos_test "listener_replica_dos_test ($mode)" \
           "${common[@]}" --workdir "$out/qa/rd-$mode" \
           --port $((QA_PORT + 570)) --timeout 1500 ;;
+      metadata_tamper_test)
+        # the last binlog's metadata of an encrypted storage edited between
+        # two fetch runs: its encryption record removed, or replaced by
+        # another binlog's (about 1 min)
+        qa_run metadata_tamper_test "metadata_tamper_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/mt-$mode" \
+          --port $((QA_PORT + 590)) --timeout 900 ;;
+      listener_login_test)
+        # the listener's first reply to a wrong scramble by user name, and
+        # very long SET statements from a logged-in client (about 1 min)
+        qa_run listener_login_test "listener_login_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/ll-$mode" \
+          --port $((QA_PORT + 610)) --timeout 900 ;;
       *) log "unknown QA_ROTATION harness $harness" ;;
     esac
     log "$harness ($mode) done in $(( ($(date +%s) - stage_started) / 60 )) min"

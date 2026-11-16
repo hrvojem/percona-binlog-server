@@ -352,11 +352,19 @@ def harness_command(args, workdir: Path) -> list:
             "--s3-bucket-dir", str(args.s3_bucket_dir)]
     if args.harness == "pull_soak_test":
         return script + common + mode + ["--duration", str(args.duration)]
+    if args.harness == "file_security_test":
+        # its 's3_buffer' case runs against the local S3 server
+        command = script + common + mode
+        if args.s3_bucket_dir:
+            command += ["--s3-endpoint", args.s3_endpoint,
+                        "--s3-bucket-dir", str(args.s3_bucket_dir)]
+        return command
     if args.harness in ("source_change_test", "large_binlog_test",
                         "pull_load_test", "listener_exhaustion_test",
-                        "file_security_test", "hostile_source_test",
+                        "hostile_source_test",
                         "secrets_exposure_test", "upstream_tls_test",
-                        "listener_replica_dos_test"):
+                        "listener_replica_dos_test", "metadata_tamper_test",
+                        "listener_login_test"):
         return script + common + mode
     raise SystemExit(f"unknown harness {args.harness}")
 
@@ -376,7 +384,8 @@ def harness_cases(args, returncode: int, output: str, lines: list,
                         "pull_restart_test", "listener_exhaustion_test",
                         "file_security_test", "hostile_source_test",
                         "secrets_exposure_test", "upstream_tls_test",
-                        "listener_replica_dos_test"):
+                        "listener_replica_dos_test", "metadata_tamper_test",
+                        "listener_login_test"):
         cases = []
         for result, _ in objects:
             if "case" not in result:

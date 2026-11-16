@@ -14,7 +14,8 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 
-"""File permissions and symlink handling of the filesystem storage.
+"""File permissions and symlink handling of the storage, the S3 backend's
+local buffer and the telemetry directory.
 
 The storage holds a copy of every change made on the source (binlog data,
 encrypted or not, and its metadata). The filesystem backend creates its files
@@ -35,6 +36,19 @@ Cases:
   and the index's temporary file, each pointing at a file outside the
   storage. The source then rotates its binlog and writes. The targets must be
   left unchanged: PBS must not write through a symlink it did not create.
+- 'telemetry_symlinks': 'pull' writes a telemetry report every 10 s as
+  '<unix seconds>-<tag>.tmp', renamed to '.json'. The tag is in the name of
+  every finished report, so someone who can write the telemetry directory
+  (by design a directory another component reads and cleans) plants
+  symlinks under the next reports' temporary names, pointing at a file of
+  mode 0600 outside it. That file must keep its content and its mode
+  (ticket 66).
+- 's3_buffer' (with --s3-bucket-dir, against the local S3 server): the S3
+  backend keeps the binlog it writes in a local file. Without
+  'fs_buffer_directory' that file is created under $TMPDIR; under umask 022
+  neither it nor its directory may be accessible to other users, and an
+  existing 'fs_buffer_directory' that anyone can write to must be refused
+  (ticket 65).
 
 A JSON line per case, then a summary; exit 1 if any case failed. Example:
 
@@ -48,6 +62,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -202,6 +217,176 @@ def case_symlinks(workdir: Path, pull_port: int) -> dict:
     return result
 
 
+def start_pull(binsrv, pull_port: int, edit=None,
+               environment: "dict | None" = None) -> subprocess.Popen:
+    """'pull' with its listener on 'pull_port'; 'edit' changes the
+    configuration before it is written."""
+    binsrv.write_config()
+    config = json.loads(binsrv.config_path.read_text())
+    config["replication_source"]["port"] = pull_port
+    if edit is not None:
+        edit(config)
+    binsrv.config_path.write_text(json.dumps(config, indent=2))
+    return subprocess.Popen(
+        [str(binsrv.binary), "pull", str(binsrv.config_path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, AWS_EC2_METADATA_DISABLED="true",
+                 **(environment or {})))
+
+
+def stop_pull(pull: subprocess.Popen):
+    if pull.poll() is None:
+        pull.send_signal(signal.SIGTERM)
+        try:
+            pull.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pull.kill()
+            pull.wait()
+
+
+def case_telemetry_symlinks(workdir: Path, pull_port: int) -> dict:
+    machine = harness.FetchCrashMachine()
+    machine.start_from_scratch()
+    machine.run_workload(WORKLOAD)
+    machine.fetch_to_the_end()
+    binsrv = harness.BINSRV
+    shutil.rmtree(binsrv.telemetry, ignore_errors=True)
+    victim = workdir / "outside-the-telemetry-directory.victim"
+    victim.write_bytes(VICTIM_CONTENT)
+    victim.chmod(0o600)
+
+    def smallest_intervals(config):
+        # clamped to the smallest ones: a first report after 20 s, then
+        # one every 10 s (PBS-122)
+        config["telemetry"].update({"grace_interval": "0",
+                                    "scrape_interval": "0"})
+
+    result = {"case": "telemetry_symlinks"}
+    pull = start_pull(binsrv, pull_port, smallest_intervals)
+    try:
+        reports = []
+        deadline = time.monotonic() + 60
+        while not reports and time.monotonic() < deadline:
+            reports = sorted(binsrv.telemetry.glob("*.json")) \
+                if binsrv.telemetry.exists() else []
+            time.sleep(0.5)
+        if not reports:
+            raise harness.Failure("pull wrote no telemetry report in 60 s\n" +
+                                  binsrv.log_tail())
+        # what the finished report's name gives away: the time of the next
+        # ones and the tag in their names
+        stamp, tag = reports[-1].stem.split("-", 1)
+        planted = 0
+        for second in range(int(stamp) + 1, int(stamp) + 31):
+            link = binsrv.telemetry / f"{second}-{tag}.tmp"
+            if not link.exists() and not link.is_symlink():
+                link.symlink_to(victim)
+                planted += 1
+        time.sleep(25)
+        content = victim.read_bytes()
+        problems = []
+        if content != VICTIM_CONTENT:
+            problems.append("PBS wrote a telemetry report through a planted "
+                            "symlink into a file outside the telemetry "
+                            f"directory ({len(content)} bytes)")
+        if mode_of(victim) != "0o600":
+            problems.append("the file outside the telemetry directory "
+                            f"went from mode 0o600 to {mode_of(victim)}")
+        result.update({
+            "first_report": reports[-1].name, "symlinks_planted": planted,
+            "victim_changed": content != VICTIM_CONTENT,
+            "victim_mode": mode_of(victim),
+            "reports_that_are_symlinks": sorted(
+                path.name for path in binsrv.telemetry.glob("*.json")
+                if path.is_symlink()),
+            "pull_alive": pull.poll() is None, "ok": not problems})
+        if problems:
+            result["why"] = "; ".join(problems)
+    finally:
+        stop_pull(pull)
+    return result
+
+
+def case_s3_buffer(args, workdir: Path, pull_port: int) -> dict:
+    if args.s3_bucket_dir is None:
+        return {"case": "s3_buffer", "ok": True,
+                "skipped": "no --s3-bucket-dir"}
+    machine = harness.FetchCrashMachine()
+    machine.start_from_scratch()
+    machine.run_workload(WORKLOAD)
+    s3 = harness.S3Storage(args.s3_endpoint, args.s3_bucket,
+                           args.s3_bucket_dir.expanduser(),
+                           args.s3_access_key, args.s3_secret_key,
+                           f"file-security-{os.getpid()}")
+    binsrv = harness.BinlogServer(harness.BINSRV.binary,
+                                  workdir / "binsrv-s3", harness.BINSRV.port,
+                                  harness.BINSRV.gtid_mode, s3)
+    result = {"case": "s3_buffer"}
+    problems = []
+    previous_umask = os.umask(0o022)
+    try:
+        # 1. no fs_buffer_directory: the buffer is created under $TMPDIR
+        binsrv.reset()
+        tmpdir = workdir / "tmpdir-of-pull"
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        tmpdir.mkdir(parents=True)
+
+        def default_buffer(config):
+            del config["storage"]["fs_buffer_directory"]
+
+        pull = start_pull(binsrv, pull_port, default_buffer,
+                          {"TMPDIR": str(tmpdir)})
+        try:
+            time.sleep(8)
+            if pull.poll() is not None:
+                raise harness.Failure("pull did not start on the S3 "
+                                      "storage\n" + binsrv.log_tail())
+            entries = [{"path": path.relative_to(tmpdir).as_posix(),
+                        "dir": path.is_dir(), "mode": mode_of(path)}
+                       for path in sorted(tmpdir.rglob("*"))]
+        finally:
+            stop_pull(pull)
+        if not entries:
+            raise harness.Failure("pull created no buffer under $TMPDIR")
+        for entry in entries:
+            if int(entry["mode"], 8) & (stat.S_IRWXG | stat.S_IRWXO):
+                problems.append(
+                    f"the buffer {'directory' if entry['dir'] else 'file'} "
+                    f"under $TMPDIR is {entry['mode']} under umask 022")
+        result["default_buffer"] = entries[:6]
+
+        # 2. an existing fs_buffer_directory that anyone can write to
+        binsrv.reset()
+        shared = workdir / "buffer-anyone-can-write"
+        shutil.rmtree(shared, ignore_errors=True)
+        shared.mkdir(parents=True)
+        shared.chmod(0o777)
+
+        def shared_buffer(config):
+            config["storage"]["fs_buffer_directory"] = str(shared)
+
+        pull = start_pull(binsrv, pull_port, shared_buffer)
+        try:
+            time.sleep(8)
+            accepted = pull.poll() is None
+            used = sorted(path.name for path in shared.iterdir())
+        finally:
+            stop_pull(pull)
+        result["world_writable_buffer_directory"] = {
+            "accepted": accepted, "files_created": len(used)}
+        if accepted or used:
+            problems.append("an existing fs_buffer_directory of mode 0777 "
+                            "was accepted and used")
+    finally:
+        os.umask(previous_umask)
+        shutil.rmtree(binsrv.storage, ignore_errors=True)
+    result["problems"] = problems
+    result["ok"] = not problems
+    if problems:
+        result["why"] = "; ".join(problems)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--mysql-basedir", type=Path, required=True)
@@ -210,6 +395,13 @@ def main():
     parser.add_argument("--port", type=int, default=23560)
     parser.add_argument("--mode", choices=["gtid", "position"],
                         default="position")
+    parser.add_argument("--s3-endpoint", default="127.0.0.1:9000")
+    parser.add_argument("--s3-bucket", default="pbs-mtr")
+    parser.add_argument("--s3-bucket-dir", type=Path,
+                        help="the bucket's directory on the local S3 "
+                             "server; without it 's3_buffer' is skipped")
+    parser.add_argument("--s3-access-key", default="pbsaccesskey")
+    parser.add_argument("--s3-secret-key", default="pbs/secret+key=1")
     args = parser.parse_args()
     args.workdir.mkdir(parents=True, exist_ok=True)
     gtid_mode = args.mode == "gtid"
@@ -230,13 +422,22 @@ def main():
                           "why": str(failure)[:500]}
             print(json.dumps(result), flush=True)
             results.append(result)
-        try:
-            result = case_symlinks(args.workdir, args.port + 2)
-        except harness.Failure as failure:
-            result = {"case": "symlinks", "ok": False,
-                      "why": str(failure)[:500]}
-        print(json.dumps(result), flush=True)
-        results.append(result)
+        for name, case in (
+                ("symlinks",
+                 lambda: case_symlinks(args.workdir, args.port + 2)),
+                ("telemetry_symlinks",
+                 lambda: case_telemetry_symlinks(args.workdir,
+                                                 args.port + 3)),
+                ("s3_buffer",
+                 lambda: case_s3_buffer(args, args.workdir,
+                                        args.port + 4))):
+            try:
+                result = case()
+            except (harness.Failure, OSError) as failure:
+                result = {"case": name, "ok": False,
+                          "why": str(failure)[:500]}
+            print(json.dumps(result), flush=True)
+            results.append(result)
     finally:
         harness.SERVER.stop()
     failures = [result for result in results if not result.get("ok")]

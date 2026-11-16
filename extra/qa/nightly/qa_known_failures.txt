@@ -8,7 +8,8 @@
 # (s3_fault_sweep, disk_fault_sweep, network_fault_test, listener_fuzz_test,
 # source_change_test, large_binlog_test, pull_load_test,
 # listener_exhaustion_test, file_security_test, hostile_source_test,
-# secrets_exposure_test, upstream_tls_test, listener_replica_dos_test) run
+# secrets_exposure_test, upstream_tls_test, listener_replica_dos_test,
+# metadata_tamper_test, listener_login_test) run
 # about once a week,
 # so their known failures show up on those nights only.
 # A sanitizer report is never covered by a pattern line (its reason names
@@ -31,3 +32,13 @@ file_security_test position/symlinks  ticket 57 (PBS-130): symlinks planted in t
 hostile_source_test position/nul_*  ticket 59 (PBS-131): a binlog name from the source's ROTATE with a NUL byte ('binlog.000001\0.000002', 'metadata.json\0...', 'binlog.index\0...') passes composite_binlog_name::parse and is opened truncated at the NUL: a stored binlog loses its data, metadata.json or binlog.index is overwritten, and fetch exits 0
 hostile_source_test position/newline  ticket 59 (PBS-131): a newline in a binlog name from the source's ROTATE is written into binlog.index, which then no longer opens
 listener_replica_dos_test gtid/huge_gtid_set*  ticket 61 (PBS-135): a logged-in replica's COM_BINLOG_DUMP_GTID with a 1,000,000-interval GTID set (16 MB) occupies the listener for about 12 s, during which no other client is served, and leaves about 100 MB of resident memory behind
+metadata_tamper_test position/strip_encryption  ticket 62: with the 'encryption' record removed from the last binlog's metadata, the next fetch appends plaintext to the encrypted storage and exits 0 (validate_binlog_encryption_record checks a record only when it is present)
+metadata_tamper_test position/transplant_encryption  ticket 63: an 'encryption' record copied from another binlog's metadata is accepted (the wrapped file key is not bound to its binlog), so the appended data reuses that binlog's AES-CTR keystream
+secrets_exposure_test position/s3_unencoded_*  ticket 64: a storage URI whose S3 secret key holds a '/' that is not percent-encoded parses without user info, so the 'binlog storage backend URI (masked)' log line carries the secret
+file_security_test position/s3_buffer  ticket 65: the S3 backend's local buffer under $TMPDIR is created 0755 / 0644 under umask 022, and an existing fs_buffer_directory of mode 0777 is accepted
+file_security_test position/telemetry_symlinks  ticket 66: a symlink planted under the next telemetry report's temporary name ('<unix seconds>-<tag>.tmp', both predictable) is written through, and the target's mode becomes 0644
+listener_login_test position/user_name_probe  ticket 67: once a client has logged in, a wrong scramble gets ERR 1045 at once for the configured user name and 'perform full authentication' for any other name
+hostile_source_test position/reannounce  ticket 69: an artificial ROTATE that names the binlog just closed, at position 4, reopens it for append: a second FORMAT_DESCRIPTION and the next binlog's events follow its ROTATE, and fetch exits 0
+hostile_source_test position/lower_sequence  ticket 70: a binlog with a lower sequence number than the first stored one is created and indexed, and the next start takes it for the leftover of an interrupted purge ('binlog index contains a reference to a non-existing object')
+hostile_source_test position/case_variant  ticket 71: on a file system that ignores case (--case-insensitive-dir), 'BINLOG.000001' is new to binlog.index and is opened with truncation, which replaces the stored 'binlog.000001'
+listener_login_test position/long_statement  ticket 72: a COM_QUERY of 'SET' and 100,000 spaces from a logged-in client is matched with std::regex, which recurses per character: pull ends with SIGSEGV (debug and release builds)

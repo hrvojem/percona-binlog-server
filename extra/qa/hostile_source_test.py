@@ -50,6 +50,19 @@ The names (the sequence number is the real next one, N):
                        becomes two
   dot_dot              '...N' (base name '..'): stays in the storage
   long_name            a 3000-byte base name: the file system refuses it
+  reannounce           the current binlog's own name: after its closing
+                       ROTATE the source announces the same binlog again at
+                       position 4; the stored binlog must not get a second
+                       FORMAT_DESCRIPTION appended (ticket 69)
+  lower_sequence       'binlog.000002' for a storage that starts at
+                       'binlog.000004' (the source purged its first binlogs
+                       before the first fetch); the storage must still open
+                       for the next fetch (ticket 70: the start-up recovery
+                       takes the new binlog for the leftover of a purge)
+  case_variant         'BINLOG.000001', with the storage on a file system
+                       that ignores case (--case-insensitive-dir, e.g. a
+                       vfat mount; not run without it): the stored
+                       'binlog.000001' must keep its data (ticket 71)
 
 Two attacks on resources run in the same way: 'size_lie' makes the first
 ordinary event of the next binlog claim 0xFFFFFF00 bytes (its CRC32 kept
@@ -75,6 +88,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -103,7 +117,15 @@ CASES = {
     "newline": lambda n: b"binlog.000077\nbinlog" + b".%06d" % n,
     "dot_dot": lambda n: b".." + b".%06d" % n,
     "long_name": lambda n: b"b" * 3000 + b".%06d" % n,
+    "reannounce": lambda n: b"binlog.%06d" % (n - 1),
+    "lower_sequence": lambda n: b"binlog.000002",
+    "case_variant": lambda n: b"BINLOG.000001",
 }
+# the binlogs the source purges before the first fetch of 'lower_sequence'
+PURGED_BINLOGS = 3
+# what a start for writing logs when 'binlog.index' names a binlog the
+# start-up recovery does not accept
+STORAGE_REFUSED = "binlog index contains a reference to a non-existing object"
 # attacks on resources rather than names: 'size_lie' makes the first
 # ordinary event of the next binlog claim 0xFFFFFF00 bytes (CRC32 kept
 # valid); 'gtid_bloat' (GTID mode) replaces the next binlog's
@@ -352,9 +374,43 @@ def cache_password_hash(basedir: Path, port: int):
         capture_output=True, timeout=30, check=True)
 
 
+def format_descriptions(data: bytes) -> int:
+    """The number of FORMAT_DESCRIPTION events in a stored binlog (1 in a
+    well-formed one), or -1 if its events cannot be walked."""
+    try:
+        return sum(1 for _, code, _ in harness.parse_events(data)
+                   if code == FORMAT_DESCRIPTION_EVENT)
+    except Exception:  # pylint: disable=broad-except
+        return -1
+
+
 def run_case(name: str, args, proxy_port: int) -> dict:
+    if name == "case_variant":
+        if args.case_insensitive_dir is None or args.storage != "file":
+            return {"case": name, "ok": True,
+                    "skipped": "needs --case-insensitive-dir and a file "
+                               "storage"}
+        ordinary_storage = harness.BINSRV.storage
+        harness.BINSRV.storage = \
+            args.case_insensitive_dir.expanduser() / "storage"
+        try:
+            return run_case_on_storage(name, args, proxy_port)
+        finally:
+            shutil.rmtree(harness.BINSRV.storage, ignore_errors=True)
+            harness.BINSRV.storage = ordinary_storage
+    return run_case_on_storage(name, args, proxy_port)
+
+
+def run_case_on_storage(name: str, args, proxy_port: int) -> dict:
     machine = harness.FetchCrashMachine()
     machine.start_from_scratch()
+    if name == "lower_sequence":
+        # the storage's first binlog is then not binlog.000001, as after a
+        # purge on either side
+        for _ in range(PURGED_BINLOGS):
+            harness.SERVER.sql("FLUSH BINARY LOGS")
+        harness.SERVER.sql("PURGE BINARY LOGS TO 'binlog.%06d'" %
+                           (PURGED_BINLOGS + 1))
     machine.run_workload(WORKLOAD)
     machine.fetch_to_the_end()
     binsrv = harness.BINSRV
@@ -441,6 +497,19 @@ def run_case(name: str, args, proxy_port: int) -> dict:
     if list_exit != 0:
         problems.append("the storage no longer opens ('list' exit "
                         f"{list_exit}: {list_output.strip()[-200:]})")
+    # a binlog stored before the attack has one FORMAT_DESCRIPTION event
+    twice = sorted(
+        object_name for object_name, content in before.items()
+        if BINLOG_NAME.match(object_name) and
+        format_descriptions(content) == 1 and
+        format_descriptions(after.get(object_name, b"")) > 1)
+    result["second_preamble_appended"] = twice
+    if twice:
+        problems.append("a second FORMAT_DESCRIPTION and what follows it "
+                        "were appended to " + ", ".join(twice))
+    if list_exit == 0 and any(STORAGE_REFUSED in line for line in errors):
+        problems.append("the storage no longer opens for writing (the next "
+                        f"fetch: '{STORAGE_REFUSED}')")
     if proxied["peak_rss_mib"] > 2048:
         problems.append(f"fetch used {proxied['peak_rss_mib']} MiB")
     if proxied["seconds"] > 120:
@@ -467,12 +536,17 @@ def main():
     parser.add_argument("--s3-secret-key", default="pbs/secret+key=1")
     parser.add_argument("--cases", nargs="*",
                         choices=list(CASES) + RESOURCE_CASES)
+    parser.add_argument("--case-insensitive-dir", type=Path,
+                        help="a directory on a file system that ignores "
+                             "case; 'case_variant' runs only with it")
     args = parser.parse_args()
     args.mysql_basedir = args.mysql_basedir.expanduser()
     args.workdir.mkdir(parents=True, exist_ok=True)
     gtid_mode = args.mode == "gtid"
     if args.cases is None:
-        args.cases = list(CASES) + [
+        args.cases = [
+            name for name in CASES if name != "case_variant" or
+            args.case_insensitive_dir is not None] + [
             name for name in RESOURCE_CASES
             if name != "gtid_bloat" or gtid_mode]
     s3 = None

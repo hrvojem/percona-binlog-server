@@ -10,7 +10,7 @@
 # listener_exhaustion_test, file_security_test, hostile_source_test,
 # secrets_exposure_test, upstream_tls_test, listener_replica_dos_test,
 # metadata_tamper_test, listener_login_test, listener_command_fuzz_test,
-# tls_config_test) run
+# tls_config_test, replica_tamper_test, final_flush_test) run
 # about once a week,
 # so their known failures show up on those nights only.
 # A sanitizer report is never covered by a pattern line (its reason names
@@ -65,3 +65,6 @@ listener_login_test position/plain_password_without_tls  ticket 76: a line feed 
 listener_command_fuzz_test */query_max_frame  ticket 74: one COM_QUERY of 16 MB is run through four std::regex searches on the listener's only thread: no client is served for 25 s (debug build; 3 s on a release build)
 listener_command_fuzz_test */heartbeat_1*ns_blocking_dump  ticket 75: a heartbeat period of 1 ns or 1,000 ns is accepted, and an idle blocking dump then sends and logs thousands of heartbeats a second: one core busy and megabytes of log every second
 listener_command_fuzz_test */regex_run_*  ticket 72: other statements with a run of 40,000 or more characters matched by one of the handshake patterns (digits after the heartbeat period, white space in any SET statement) end pull the same way
+final_flush_test */disk/*  ticket 73: ENOSPC or EIO on the write or fsync of the binlog data, or on saving the binlog metadata, in the flush fetch runs at exit: the storage destructor drops the error, fetch logs 'successfully fetched everything' and exits 0, and the new data is not recorded
+final_flush_test */s3/*  ticket 73: the same with every PUT of the binlog object or of its metadata failing (needs --s3-fault-proxy; not run by the nightly)
+replica_tamper_test position/forged_row  ticket 53 (PBS-126): a row value changed in the encrypted storage without the key (ciphertext XOR, CRC32 footer patched) is served by pull and applied by a MySQL replica, with no error on either side

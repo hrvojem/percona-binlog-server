@@ -131,7 +131,7 @@ QA_S3_EXAMPLES=${QA_S3_EXAMPLES:-5}
 S3_BUCKET_DIR=${S3_BUCKET_DIR:-$WS/s3/data/pbs-mtr}
 # the rotation of the heavier QA harnesses: '<weekday>:<harness>/<mode>'
 # (weekday 1-7 is Monday-Sunday, date +%u); 4-15 min a night (README.md)
-QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 4:pull_versions/ps-8.4 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 6:pull_versions/ps-9.7 7:network_fault_test/gtid 7:pull_soak_test/position 2:listener_exhaustion_test/position 5:file_security_test/position 1:hostile_source_test/position 3:secrets_exposure_test/position 4:upstream_tls_test/position 6:listener_replica_dos_test/gtid 2:metadata_tamper_test/position 7:listener_login_test/position 3:listener_command_fuzz_test/position 1:tls_config_test/position"}
+QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 4:pull_versions/ps-8.4 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 6:pull_versions/ps-9.7 7:network_fault_test/gtid 7:pull_soak_test/position 2:listener_exhaustion_test/position 5:file_security_test/position 1:hostile_source_test/position 3:secrets_exposure_test/position 4:upstream_tls_test/position 6:listener_replica_dos_test/gtid 2:metadata_tamper_test/position 7:listener_login_test/position 3:listener_command_fuzz_test/position 1:tls_config_test/position 4:replica_tamper_test/position 6:final_flush_test/position"}
 QA_ROTATION_DAY=${QA_ROTATION_DAY:-$(date -u +%u)}
 # pull_versions on Percona Server: '<label>:<series>:<distribution under
 # $WS/dist>' (8.4 is the release tarball, 9.7 a build of the 9.7 branch,
@@ -765,7 +765,9 @@ if want qa || want rotation; then
         [ "$harness" = metadata_tamper_test ] ||
         [ "$harness" = listener_login_test ] ||
         [ "$harness" = listener_command_fuzz_test ] ||
-        [ "$harness" = tls_config_test ]; then
+        [ "$harness" = tls_config_test ] ||
+        [ "$harness" = replica_tamper_test ] ||
+        [ "$harness" = final_flush_test ]; then
       build=debug_gcc14
       binsrv=$debug_binsrv
     fi
@@ -943,6 +945,18 @@ if want qa || want rotation; then
         qa_run tls_config_test "tls_config_test ($mode)" \
           "${common[@]}" --workdir "$out/qa/tc-$mode" \
           --port $((QA_PORT + 650)) --timeout 1500 ;;
+      replica_tamper_test)
+        # a MySQL replica of pull after the stored binlogs were changed
+        # without the key: a forged row, a doubled preamble (about 2 min)
+        qa_run replica_tamper_test "replica_tamper_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/rt-$mode" \
+          --port $((QA_PORT + 700)) --timeout 900 ;;
+      final_flush_test)
+        # ENOSPC / EIO on what fetch's final flush does (the fsfault
+        # LD_PRELOAD, so the debug build): is the failure reported?
+        qa_run final_flush_test "final_flush_test ($mode)" "${common[@]}" \
+          --workdir "$out/qa/ff-$mode" --port $((QA_PORT + 720)) \
+          --fsfault-lib "$WS/qa/fsfault/libfsfault.so" --timeout 900 ;;
       *) log "unknown QA_ROTATION harness $harness" ;;
     esac
     log "$harness ($mode) done in $(( ($(date +%s) - stage_started) / 60 )) min"

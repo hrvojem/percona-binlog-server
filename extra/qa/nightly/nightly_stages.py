@@ -335,7 +335,7 @@ def harness_command(args, workdir: Path) -> list:
             "--s3-endpoint", proxy,
             "--s3-fault-control", f"http://{proxy}/__faults__",
             "--s3-bucket-dir", str(args.s3_bucket_dir)]
-    if args.harness == "disk_fault_sweep":
+    if args.harness in ("disk_fault_sweep", "final_flush_test"):
         return script + common + mode + [
             "--fsfault-lib", str(args.fsfault_lib)]
     if args.harness == "network_fault_test":
@@ -365,7 +365,7 @@ def harness_command(args, workdir: Path) -> list:
                         "secrets_exposure_test", "upstream_tls_test",
                         "listener_replica_dos_test", "metadata_tamper_test",
                         "listener_login_test", "listener_command_fuzz_test",
-                        "tls_config_test"):
+                        "tls_config_test", "replica_tamper_test"):
         return script + common + mode
     raise SystemExit(f"unknown harness {args.harness}")
 
@@ -387,7 +387,8 @@ def harness_cases(args, returncode: int, output: str, lines: list,
                         "secrets_exposure_test", "upstream_tls_test",
                         "listener_replica_dos_test", "metadata_tamper_test",
                         "listener_login_test", "listener_command_fuzz_test",
-                        "tls_config_test"):
+                        "tls_config_test", "replica_tamper_test",
+                        "final_flush_test"):
         cases = []
         for result, _ in objects:
             if "case" not in result:
@@ -663,7 +664,7 @@ def precondition_failure(args) -> str:
     if args.harness in ("network_fault_test", "pull_replica_fault_test") \
             and not reachable(f"{args.toxiproxy_api}/version"):
         return f"Toxiproxy is not reachable at {args.toxiproxy_api}"
-    if args.harness == "disk_fault_sweep" and not (
+    if args.harness in ("disk_fault_sweep", "final_flush_test") and not (
             args.fsfault_lib and Path(args.fsfault_lib).is_file()):
         return f"the fsfault library {args.fsfault_lib} does not exist"
     return ""

@@ -314,6 +314,48 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/metadata_tamper_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/metadata-tamper
 ```
 
+### Tampered data served to a replica — `replica_tamper_test.py`
+
+The storage attack tests stop at the storage; this one puts a real MySQL
+replica behind `pull`. In `forged_row` the source commits one row with a
+known value into an encrypted storage; the test XORs the value's bytes in
+the stored ciphertext with (old XOR new) and patches the event's CRC32
+footer with `crc32(delta) XOR crc32(zeros)`, which needs no key. On
+2026-11-16 the replica ends with the forged value, and neither `pull` nor
+the replica reports anything (ticket 53, PBS-126, now shown end to end).
+Without the footer patch (`forged_row_bad_checksum`) the replica's receiver
+stops with error 13122 and applies nothing, so the replica's own checksum
+verification is the only check; `pull` serves the event either way. In
+`doubled_preamble` the binlog a hostile source leaves in ticket 69 is served
+to a replica: the replica ends with exactly the source's data, so that
+malformed binlog does not corrupt a replica (recorded, not judged).
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/replica_tamper_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/replica-tamper
+```
+
+### Is a failing final flush reported? — `final_flush_test.py`
+
+Without checkpointing, `fetch` writes what it received for the current
+binlog when it exits. The test lets a first `fetch` store one binlog, adds
+transactions without a rotation, and runs a second `fetch` with a persistent
+fault on what that last flush does: ENOSPC or EIO on the write or fsync of
+the binlog data and on the open, write, fsync or rename of its metadata
+(`--fsfault-lib`), or, with `--s3-fault-proxy`, every PUT of the binlog
+object or of its metadata failing. On 2026-11-16 all 12 disk cases and all 4
+S3 cases fail the same way: `fetch` logs "successfully fetched everything
+and disconnected" and exits 0 while the new data is not recorded (ticket
+73). The next `fetch` without a fault stores it, as long as the source still
+has it. Faults that hit a flush at a rotation are reported (the existing
+sweeps cover those).
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/final_flush_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/final-flush \
+  --fsfault-lib ~/ws/qa/fsfault/libfsfault.so
+```
+
 ### Listener logins and long statements — `listener_login_test.py`
 
 Talks to the `pull` listener with the raw client of `listener_fuzz_test.py`.
@@ -906,9 +948,9 @@ server rather than starting one.
      | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position, about 3 min) and `tls_config_test.py` (position, about 5 min) | ASan; debug |
      | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 4 min) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
      | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min) | ASan; debug |
-     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) | ASan; debug |
+     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) and `replica_tamper_test.py` (position, about 2 min) | ASan; debug |
      | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 4 min, with the local S3 server) | ASan; debug |
-     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min) | debug / ASan; debug |
+     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min); `final_flush_test.py` (position, about 1 min) | debug / ASan; debug |
      | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) | ASan / debug; debug |
 
      `pull_versions/<series>` runs the replica harnesses of the nightly 8.4

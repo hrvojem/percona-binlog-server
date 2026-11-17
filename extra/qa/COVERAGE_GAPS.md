@@ -32,7 +32,7 @@
 | Layer | What ran |
 |---|---|
 | mtr-s3-8.4 | `binlog_streaming` on 8.4.8 with S3 storage (92 tests). 12 tests fail, all known. |
-| crash-s3 | `fetch_crash_test.py --storage s3` (gtid + position, 5 examples, 8 steps). GTID mode hits ticket 14 (PBS-80) (a resume after a rotation skips `binlog.000002`), known. |
+| crash-s3 | `fetch_crash_test.py --storage s3` (gtid + position, 5 examples, 8 steps). GTID mode runs in the mandatory `rewrite` mode and compares transactions; ticket 14 (PBS-80) is fixed by upstream `4717df9`. |
 | listener-fuzz | `listener_fuzz_test.py --connections 2500 --seed 7` (position + gtid), now with TLS scenarios (about a third of the connections). Passes, with no crash; `pull` still serves plain and TLS clients afterwards. |
 | s3-faults | `s3_fault_sweep.py --mode position` (87 cases). It now stops `pull` with SIGTERM, so the `pull` cases keep their counters (41.2% of lines, 28.2% before). 10 cases fail, all matching `qa_known_failures.txt` (ticket 18, PBS-83 `PUT-.json`/`PUT-binlog.0` x6; ticket 37, PBS-110 `PUT-binlog.index … then DELETE-.json`). |
 | disk-faults | `disk_fault_sweep.py --mode position` with `libfsfault.so` (86 cases, 19 fail). The failures all match ticket 18 (PBS-83) (`*/binlog-metadata/*`) and ticket 37 (PBS-110) (`binlog-index … then unlink binlog-metadata`). |

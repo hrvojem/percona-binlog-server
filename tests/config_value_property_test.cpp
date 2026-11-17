@@ -704,7 +704,8 @@ const std::vector<std::string> &config_defects() {
       "connection_port",     "connection_timeout",
       "server_id",           "mode",
       "rewrite_mode",        "rewrite_file_size_unit",
-      "rewrite_file_size",   "source_port_zero",
+      "rewrite_file_size",   "gtid_without_rewrite",
+      "source_port_zero",
       "source_port_range",   "source_read_timeout",
       "source_write_timeout", "source_server_id_range",
       "source_server_uuid",  "authentication_user",
@@ -842,12 +843,18 @@ config_specs(std::string forced_defect = {}) {
         is_defect("server_id") ? out_of_range(uint32_max) : valid_uint32();
     replication["idle_time"] = valid_uint32();
     replication["verify_checksum"] = tc.draw(gs::booleans());
-    const bool with_rewrite{is_defect("rewrite_mode") ||
-                            is_defect("rewrite_file_size_unit") ||
-                            is_defect("rewrite_file_size") ||
-                            tc.draw(gs::integers<int>(
-                                {.min_value = 0, .max_value = 3})) == 0};
-    std::string mode{with_rewrite ? "gtid" : choose({"position", "gtid"})};
+    // since PBS-80 / PBS-98 (4717df9) a 'rewrite' section is required in
+    // 'gtid' mode and refused in 'position' mode
+    const bool rewrite_defect{is_defect("rewrite_mode") ||
+                              is_defect("rewrite_file_size_unit") ||
+                              is_defect("rewrite_file_size")};
+    std::string mode{rewrite_defect ? "gtid" : choose({"position", "gtid"})};
+    if (is_defect("gtid_without_rewrite")) {
+      mode = "gtid";
+    }
+    const bool with_rewrite{rewrite_defect ||
+                            (mode == "gtid" &&
+                             !is_defect("gtid_without_rewrite"))};
     if (is_defect("mode")) {
       mode = choose({"row", "", "GTID"});
     } else if (is_defect("rewrite_mode")) {

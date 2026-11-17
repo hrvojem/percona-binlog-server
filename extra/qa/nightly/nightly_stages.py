@@ -307,8 +307,8 @@ def harness_command(args, workdir: Path) -> list:
     if args.harness == "upgrade_test":
         command = script + common + mode + ["--old-binsrv",
                                             str(args.old_binsrv)]
-        # as in fetch_crash_test: a kill between a binlog's last
-        # transaction and its ROTATE hits ticket 14 in GTID mode
+        # the old binary still has ticket 14 (PBS-80): a kill between a
+        # binlog's last transaction and its ROTATE hits it in GTID mode
         if args.mode == "gtid":
             command.append("--tolerate-ticket-14")
         if args.s3_bucket_dir:
@@ -319,10 +319,6 @@ def harness_command(args, workdir: Path) -> list:
         command = script + common + [
             "--mode", args.mode, "--examples", str(args.examples),
             "--steps", str(args.steps)]
-        # ticket 14 has its own MTR test (gtid_resume_after_rotation); the
-        # harness accepts only its effects, so other GTID bugs are new
-        if args.mode == "gtid":
-            command.append("--tolerate-ticket-14")
         if args.storage == "s3":
             command += ["--storage", "s3", "--s3-endpoint", args.s3_endpoint,
                         "--s3-bucket-dir", str(args.s3_bucket_dir)]

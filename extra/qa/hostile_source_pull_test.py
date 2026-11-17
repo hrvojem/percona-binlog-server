@@ -107,8 +107,10 @@ while the attack lasts):
 For these the harness also stops the attack while 'pull' is still running
 and records whether it catches up without a restart.
 
---mode position (default) or gtid; --rewrite (GTID mode only) adds
-'replication.rewrite' (the results then carry "mode": "gtid_rewrite"). A JSON
+--mode position (default) or gtid; GTID mode always runs with
+'replication.rewrite' (mandatory there since PBS-80 / PBS-98; the results
+carry "mode": "gtid_rewrite"), and --rewrite, which needs --mode gtid, is
+kept for compatibility. A JSON
 line per case, then a summary; result.json in the work directory; exit 1 if
 any case failed. Example:
 
@@ -1388,8 +1390,8 @@ def main():
     parser.add_argument("--mode", choices=["position", "gtid"],
                         default="position")
     parser.add_argument("--rewrite", action="store_true",
-                        help="with 'replication.rewrite' (needs --mode "
-                             "gtid)")
+                        help="kept for compatibility: --mode gtid always "
+                             "uses 'replication.rewrite'")
     parser.add_argument("--cases", nargs="*",
                         help="the cases to run (default: a selection that "
                              "takes under ten minutes; 'all' runs every "
@@ -1403,7 +1405,9 @@ def main():
         parser.error("--rewrite needs --mode gtid")
     global ARGS, MODE, REPLICA, PULL_PORT  # pylint: disable=global-statement
     ARGS = args
-    MODE = "gtid_rewrite" if args.rewrite else args.mode
+    # 'replication.rewrite' is mandatory in GTID mode since PBS-80 /
+    # PBS-98 (upstream 4717df9): --mode gtid always runs the rewrite cases
+    MODE = "gtid_rewrite" if args.mode == "gtid" else args.mode
     args.mysql_basedir = args.mysql_basedir.expanduser()
     args.workdir = args.workdir.expanduser()
     args.workdir.mkdir(parents=True, exist_ok=True)

@@ -115,6 +115,14 @@ import metadata_tamper_test as tamper  # noqa: E402
 
 BINLOGS = 6
 TRANSACTIONS = 3
+# GTID mode: the rewrite file size and the filler that reaches it (see
+# build_source)
+REWRITE_FILE_SIZE = "8K"
+REWRITE_PADDING = 10000
+# the events between transactions, which rewrite mode generates itself
+NON_TRANSACTION_EVENTS = {harness.ROTATE_EVENT, harness.STOP_EVENT,
+                          harness.FORMAT_DESCRIPTION_EVENT,
+                          harness.PREVIOUS_GTIDS_LOG_EVENT}
 GTID_TAG = "qatag"
 FOREIGN_UUID = "f0f0f0f0-aaaa-4bbb-8ccc-0123456789ab"
 COMMAND_TIMEOUT_SECONDS = 60
@@ -175,9 +183,17 @@ class Truth:
             data = SOURCE.binlog_path(name).read_bytes()
             stamps = []
             binlog = {"name": name, "size": len(data), "transactions": []}
+            in_transaction = False
             for offset, type_code, _ in harness.parse_events(data):
                 stamp = struct.unpack_from("<I", data, offset)[0]
-                if stamp:
+                if type_code in harness.TRANSACTION_START_EVENTS:
+                    in_transaction = True
+                elif type_code in NON_TRANSACTION_EVENTS:
+                    in_transaction = False
+                # rewrite mode (GTID mode) writes its own preamble and
+                # ROTATE events, so only the source's transactions say what
+                # the stored binlog's time range is
+                if stamp and (in_transaction or not GTID_MODE):
                     stamps.append(stamp)
                 if type_code in harness.TRANSACTION_START_EVENTS:
                     statement = pending.pop(0)
@@ -298,6 +314,17 @@ def build_source(tagged: bool) -> Truth:
     SOURCE.sql("INSERT INTO qa.counter VALUES (1, 0)")
     statements.append({"label": "init_counter", "binlog": name_of(1),
                        "counter": 0})
+    if GTID_MODE:
+        # rewrite mode (mandatory in GTID mode since PBS-80 / PBS-98) cuts
+        # its own binlogs by size: the last transaction of each source
+        # binlog also writes REWRITE_PADDING bytes here, which takes the
+        # stored binlog past REWRITE_FILE_SIZE right where the source
+        # rotates, so the stored binlogs are the source's (the rest of a
+        # binlog stays far below that size)
+        SOURCE.sql("CREATE TABLE qa.pad (id INT UNSIGNED NOT NULL "
+                   "AUTO_INCREMENT PRIMARY KEY, filler LONGBLOB) "
+                   "ENGINE=InnoDB")
+        statements.append({"label": "create_pad", "binlog": name_of(1)})
     counter = 0
     for number in range(1, BINLOGS + 1):
         labels = [f"b{number}t{index}"
@@ -309,9 +336,14 @@ def build_source(tagged: bool) -> Truth:
             next_second()
             prefix = (f"SET gtid_next='AUTOMATIC:{GTID_TAG}';"
                       if label == "tagged" else "")
+            padding = (f"INSERT INTO qa.pad (filler) VALUES "
+                       f"(REPEAT('p', {REWRITE_PADDING}));"
+                       if GTID_MODE and number < BINLOGS and
+                       label == labels[-1] else "")
             SOURCE.sql(
                 f"{prefix}BEGIN;"
                 f"INSERT INTO qa.t (payload) VALUES ('{label}');"
+                f"{padding}"
                 f"UPDATE qa.counter SET v={counter} WHERE id=1;COMMIT")
             statements.append({"label": label, "binlog": name_of(number),
                                "payload": label, "counter": counter})
@@ -1468,6 +1500,9 @@ def main():
     binsrv.reset()
     binsrv.write_config()
     BASE_CONFIG = json.loads(binsrv.config_path.read_text())
+    if GTID_MODE:
+        BASE_CONFIG["replication"]["rewrite"]["file_size"] = \
+            REWRITE_FILE_SIZE
     shutil.rmtree(WORKDIR / "c", ignore_errors=True)
     names = args.cases or list(CASES)
     results = []

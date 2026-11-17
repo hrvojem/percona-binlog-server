@@ -100,11 +100,17 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/fetch_crash_test.py \
 `--examples` is the number of Hypothesis examples, `--steps` the rule steps per
 example. With `--storage s3` plus the `--s3-*` options it runs the same state
 machine against S3 storage; with `--fsfault-lib` or `--s3-fault-control` it
-also exercises the disk- and S3-fault rules (see below). In GTID mode,
-`--tolerate-ticket-14` makes both invariants accept ticket 14's effects and
-nothing else: a closed binlog stored without the ROTATE event that ends it on
-the source, and binlogs without transactions missing before the last stored
-one. It prints how often it accepted them. The other harnesses
+also exercises the disk- and S3-fault rules (see below). In GTID mode the
+binlog server runs in the now mandatory `rewrite` mode and writes its own
+binlog files, so both invariants compare transactions rather than files: the
+stored transactions must be a prefix of the source's during the run and all
+of them after a complete fetch. `--tolerate-ticket-14` makes the file
+comparison accept ticket 14's (PBS-80) effects and nothing else: a closed
+binlog stored without the ROTATE event that ends it on the source, and
+binlogs without transactions missing before the last stored one. It prints
+how often it accepted them. Mandatory `rewrite` mode (upstream `4717df9`)
+fixes ticket 14, so only `upgrade_test` still needs it, for the storage the
+old binary writes. The other harnesses
 reuse these pieces, so they share its config shape and its integrity checks.
 
 ## Correctness and crash tests
@@ -626,8 +632,9 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/rewrite_attack_test.py \
 `hostile_source_test.py` and `rewrite_attack_test.py` attack `fetch`. This
 one sends the same man-in-the-middle attacks to a long-running `pull` while
 a MySQL replica and a `mysqlbinlog --raw --stop-never` client are connected
-to its listener, in position mode, GTID mode and GTID mode with rewrite
-(`--rewrite`), and adds what only a long-running process meets: the source
+to its listener, in position mode and GTID mode (which always runs with
+rewrite now that upstream `4717df9` makes `replication.rewrite` mandatory
+there; `--rewrite` is kept for compatibility), and adds what only a long-running process meets: the source
 stalling in the middle of an event, dropping the connection in the middle
 of a transaction, replaying stored events after a reconnect, and ERR or EOF
 packets at odd points. A case passes when `pull` refuses cleanly and neither
@@ -644,7 +651,9 @@ BEGIN leaves fragments in the stored binlog that `pull` can no longer serve
 (ticket 83), and duplicated, swapped or replayed transactions are stored
 (ticket 81). A lowered `transaction_length` leaves a stub in every mode
 (ticket 82). `pull` reconnects once a second without back-off; an ERR
-packet from the source ends it with exit 1.
+packet from the source ends it with exit 1. Since rewrite mode is
+mandatory, the GTID-mode cases without it are gone: rewrite mode names its
+own binlogs, so the hostile names no longer reach the storage in GTID mode.
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/hostile_source_pull_test.py \
@@ -669,7 +678,15 @@ newest binlog included; a lowered `size` of the newest binlog makes any
 purge truncate it; edited timestamps, GTID sets or index order make the
 searches return lists that restore 3 or 6 rows of 11 with exit 0; and a
 binlog with unreadable metadata is left out of a "success" answer (ticket
-80).
+80). In GTID mode the storage is written in rewrite mode (mandatory since
+upstream `4717df9`), which cuts binlogs by size: the harness sets an 8K
+`file_size` and lets the last transaction of each source binlog also write
+10 000 bytes into a side table, so the stored binlogs switch where the
+source's do and the source's binlogs stay the truth; the time range of a
+stored binlog is that of its transactions, as rewrite mode writes its own
+preamble and ROTATE events. `clean_metadata` fails in GTID mode because of
+ticket 84: the `max_timestamp` of every closed binlog is the time of the
+fetch, which the generated closing ROTATE carries.
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/purge_search_tamper_test.py \
@@ -1027,8 +1044,8 @@ and, while the source keeps writing, stops and restarts `pull`:
 `kill_mid_big_event` (as soon as part of an 8 MB row is stored; the case
 fails if the kill missed the event), `down_with_rotations` (three FLUSH
 BINARY LOGS, rows and two more, so the source has binlogs without
-transactions: the GTID-mode resume of `pull` loses those, ticket 14, PBS-80, which
-the replica must not notice), `kill_during_replica_catchup` (100 rows
+transactions: before `rewrite` mode became mandatory the GTID-mode resume of
+`pull` lost those, ticket 14, PBS-80, which the replica must not notice), `kill_during_replica_catchup` (100 rows
 behind) and `flapping` (five SIGKILL / restart cycles a second apart). After
 each the replica must reconnect on its own (`SOURCE_CONNECT_RETRY`) and end
 with the source's data with no applier error, its error log must show the
@@ -1198,7 +1215,7 @@ server rather than starting one.
      | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position and gtid, about 1 min each) and `tls_config_test.py` (position, about 5 min); `hostile_source_pull_test.py` (position, about 5 min) | ASan; debug |
      | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 4 min) and `checkpoint_loss_test.py` (position, file storage, about 5 min); `purge_search_tamper_test.py` (gtid, about 2 min) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
      | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min); `rewrite_attack_test.py` (gtid, about 7 min) and `truncated_transaction_test.py` (position, about 3 min) | ASan; debug |
-     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) and `replica_tamper_test.py` (position, about 4 min); `hostile_source_pull_test.py` (gtid, about 5 min) | ASan; debug |
+     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) and `replica_tamper_test.py` (position, about 4 min) | ASan; debug |
      | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 7 min, with the local S3 server), `s3_upload_tamper_test.py` (position, about 1 min) and `listener_command_fuzz_test.py --tls` (gtid, about 5 min); `truncated_transaction_test.py` (gtid, about 3 min) and `damaged_binlog_consumers_test.py` (position, about 3 min) | ASan; debug |
      | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min); `final_flush_test.py` (position, about 3 min); `hostile_source_pull_test.py --rewrite` (gtid, about 9 min) | debug / ASan; debug |
      | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) and `replica_tamper_test.py` (gtid, about 4 min); `truncated_transaction_test.py --rewrite` (gtid, about 5 min) and `damaged_binlog_consumers_test.py` (gtid, about 11 min) | ASan / debug; debug |
@@ -1323,7 +1340,7 @@ server rather than starting one.
   build harnesses are skipped when the debug build fails, `fetch_crash_test`
   when the ASan build fails, the release `fetch_crash_test` when the release
   build fails. Tonight's whole run takes about 40-50 min for the
-  C++ stage plus 35-50 min of MTR (9-26 min per version) and 20-35 min of QA harnesses: about 11 min for `pull_replica_test`, `query_race_test` and `fetch_crash_test` on file storage, about 5 min for `pull_heartbeat_test`, about 7 min for `fetch_crash_test` on S3 (mostly Hypothesis shrinking the known ticket 14, PBS-80 failure in `gtid/s3`), plus the night's rotation (measured on MySQL 8.4.8: `s3_fault_sweep` 15 min per mode, 84 cases; `disk_fault_sweep` 3-6 min, 80 cases (plus 6 recovery cases, about 1.5 min); `network_fault_test` 4-5 min, 37 cases; `source_change_test` 3-4 min per mode, 4 cases; `large_binlog_test` about 20 min on the debug build, mostly MySQL writing the large transactions; `pull_load_test` about 6 min, 4 cases; `listener_fuzz_test` about 11 min per mode at 600 connections: about 1 s per connection since the listener always does full `caching_sha2_password` authentication (PBS-10), 2-3 min for 3000 before).
+  C++ stage plus 35-50 min of MTR (9-26 min per version) and 20-35 min of QA harnesses: about 11 min for `pull_replica_test`, `query_race_test` and `fetch_crash_test` on file storage, about 5 min for `pull_heartbeat_test`, about 7 min for `fetch_crash_test` on S3, plus the night's rotation (measured on MySQL 8.4.8: `s3_fault_sweep` 15 min per mode, 84 cases; `disk_fault_sweep` 3-6 min, 80 cases (plus 6 recovery cases, about 1.5 min); `network_fault_test` 4-5 min, 37 cases; `source_change_test` 3-4 min per mode, 4 cases; `large_binlog_test` about 20 min on the debug build, mostly MySQL writing the large transactions; `pull_load_test` about 6 min, 4 cases; `listener_fuzz_test` about 11 min per mode at 600 connections: about 1 s per connection since the listener always does full `caching_sha2_password` authentication (PBS-10), 2-3 min for 3000 before).
 
   To try a stage without touching the nightly's own results, select stages
   with `STAGES` (default `cpp mtr qa release ubsan fuzz mull`; without `cpp` the debug,
@@ -1398,10 +1415,13 @@ server rather than starting one.
   packet for a plain client under `require_secure_transport`),
   `telemetry_test position/settings_in_storage` (ticket 50:
   `local_settings_path` in the storage directory). GTID-mode
-  `fetch_crash_test` runs pass `--tolerate-ticket-14`: they accept only
-  ticket 14's effects (a closed binlog stored without its closing ROTATE,
-  binlogs without transactions skipped), which `gtid_resume_after_rotation`
-  reports every night, so any other GTID-mode failure is new.
+  `upgrade_test` runs pass `--tolerate-ticket-14`: the old binary still has
+  ticket 14 (PBS-80; a closed binlog stored without its closing ROTATE,
+  binlogs without transactions skipped), so they accept only those effects
+  in the storage it writes and any other GTID-mode failure is new. Mandatory
+  `rewrite` mode (upstream `4717df9`) fixes ticket 14 in the current binary,
+  so `fetch_crash_test` no longer needs the option and the MTR test
+  `gtid_resume_after_rotation` was removed.
 - **`ci_property_tests.sh`** — what the CI job *GCC 14 Debug Property Tests*
   (`.github/workflows/cmake.yml`, configured with `-DWITH_PROPERTY_TESTS=ON`)
   runs: every property test through `ctest` at Hegel's default settings,

@@ -157,6 +157,18 @@ def run_pull_read_case(args, faults) -> dict:
                                                    "timed out")
 
         def exact(directory: Path) -> bool:
+            if harness.BINSRV.gtid_mode:
+                # rewrite mode (mandatory in GTID mode since PBS-80 /
+                # PBS-98): pull serves PBS's own binlog files, so the
+                # copy must hold the source's transactions, not its files
+                copied = []
+                for path in sorted(directory.glob("binlog.[0-9]*")):
+                    copied += harness.transactions_of(path.read_bytes())
+                source = []
+                for name in names:
+                    source += harness.transactions_of(
+                        harness.SERVER.binlog_as_sent(name))
+                return copied == source
             return all((directory / name).exists() and
                        (directory / name).read_bytes() ==
                        harness.SERVER.binlog_as_sent(name)

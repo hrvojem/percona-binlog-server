@@ -50,7 +50,12 @@ step runs 'fetch' while chosen file system calls in the storage directory
 fail (open for writing, write, fsync, rename or truncate, with ENOSPC or
 EIO), with the same checks.
 
-With '--tolerate-ticket-14' (GTID mode), the checks accept the two known
+In GTID mode the binlog server runs in 'rewrite' mode (mandatory since
+upstream 4717df9) and writes its own binlog files, so the checks compare
+transactions: the stored ones must be a prefix of the server's during the
+run, and all of them after a complete fetch.
+
+With '--tolerate-ticket-14' (GTID mode, file comparison), the checks accept the two known
 effects of ticket 14 and nothing else: a closed binlog stored without the
 ROTATE event that ends it on the server, server binlogs that hold no
 transactions missing from the storage and from 'binlog.index', and such a
@@ -58,9 +63,9 @@ binlog stored with only the binlog magic (indexed while it was the server's
 current one, then rotated away while fetch was not running: the storage
 writes a binlog's preamble with its first transaction, and the GTID-mode
 resume starts in the next binlog). The test
-prints how many times it accepted them. Ticket 14 itself is tested by the
-MTR test binlog_streaming.gtid_resume_after_rotation; this option keeps the
-rest of the GTID-mode checks able to report a different bug.
+prints how many times it accepted them. Mandatory 'rewrite' mode fixes
+ticket 14 (PBS-80), so the option only matters for upgrade_test, whose old
+binary still writes storage with ticket 14's effects.
 
 Requirements: Python 3.10+, Hypothesis (found through PYTHONPATH or
 installed), a MySQL 8.0 / 8.4 binary distribution and a 'binlog_server'
@@ -314,6 +319,41 @@ def holds_transactions(data: bytes) -> bool:
                for _, type_code, _ in parse_events(data))
 
 
+def transactions_of(data: bytes) -> list:
+    """The complete transactions of a binlog file, each a tuple of its
+    events as (type code, body without the common header and the checksum),
+    for comparing a storage written in rewrite mode with the source: rewrite
+    mode (mandatory in GTID mode since PBS-80 / PBS-98) keeps every
+    transaction event but writes its own files, so positions, checksums and
+    the logical timestamps of GTID events differ. A GTID_LOG event is
+    reduced to its UUID and GNO; ANONYMOUS_GTID_LOG and GTID_TAGGED_LOG
+    events to their type. Callers pass data that ends at a transaction
+    boundary (a stored file cut at its metadata size, or a server file)."""
+    result = []
+    current = None
+    events = parse_events(data)
+    for index, (offset, type_code, size) in enumerate(events):
+        body = data[offset + COMMON_HEADER_SIZE:offset + size - CHECKSUM_SIZE]
+        if type_code in TRANSACTION_START_EVENTS:
+            if current is not None:
+                result.append(tuple(current))
+            if type_code == GTID_LOG_EVENT:
+                body = body[1:25]
+            else:
+                body = b""
+            current = [(type_code, body)]
+        elif type_code in (ROTATE_EVENT, STOP_EVENT, FORMAT_DESCRIPTION_EVENT,
+                           PREVIOUS_GTIDS_LOG_EVENT):
+            if current is not None:
+                result.append(tuple(current))
+                current = None
+        elif current is not None:
+            current.append((type_code, body))
+    if current is not None:
+        result.append(tuple(current))
+    return result
+
+
 def ticket_14_skippable(name: str) -> bool:
     """With --tolerate-ticket-14: a server binlog without transactions,
     which a GTID-mode resume never receives (ticket 14)."""
@@ -401,6 +441,9 @@ class BinlogServer:
         self.connect_timeout = 20
         self.read_timeout = 60
         self.idle_time = 1
+        # rewrite mode (GTID mode): small enough that the harnesses' workloads
+        # make PBS rotate on its own
+        self.rewrite_file_size = "64K"
 
     def reset(self):
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -436,7 +479,12 @@ class BinlogServer:
             "replication": {
                 "server_id": 4242, "idle_time": self.idle_time,
                 "verify_checksum": True,
-                "mode": "gtid" if self.gtid_mode else "position"},
+                "mode": "gtid" if self.gtid_mode else "position",
+                # since PBS-80 / PBS-98 GTID mode requires rewrite mode;
+                # the base name keeps the source's 'binlog' names
+                **({"rewrite": {"base_file_name": BINLOG_BASE_NAME,
+                                "file_size": self.rewrite_file_size}}
+                   if self.gtid_mode else {})},
             "replication_source": {
                 "port": 0xFFFF, "server_id": 142,
                 "server_uuid": "00000000-0000-0000-0000-00000000008e",
@@ -720,6 +768,9 @@ class FetchCrashMachine(RuleBasedStateMachine):
     def storage_holds_prefixes(self):
         if not hasattr(self, "steps"):
             return
+        if BINSRV.gtid_mode:
+            FetchCrashMachine.rewrite_storage_holds_prefix(complete=False)
+            return
         indexed = BINSRV.indexed_binlogs()
         server_names = SERVER.binlog_names()
         expected = expected_index(indexed, server_names)
@@ -752,7 +803,50 @@ class FetchCrashMachine(RuleBasedStateMachine):
                 raise Failure(f"{name}: the metadata size {size} is not at a "
                               f"transaction boundary of the server's file")
 
+    @staticmethod
+    def rewrite_storage_holds_prefix(complete: bool):
+        """GTID mode (always rewrite mode since PBS-80 / PBS-98): PBS writes
+        its own binlog files, so the stored transactions, read from every
+        indexed binlog up to its metadata size, must be the first
+        transactions of the server's binlogs, or all of them after a
+        complete fetch; and every metadata size must be at a transaction
+        boundary of the stored file."""
+        stored = []
+        for name in BINSRV.indexed_binlogs():
+            stored_path = BINSRV.storage / name
+            if not stored_path.exists():
+                raise Failure(f"{name} is in binlog.index but not stored")
+            data = stored_path.read_bytes()
+            size = len(data)
+            metadata_path = BINSRV.storage / (name + ".json")
+            if metadata_path.exists():
+                size = json.loads(metadata_path.read_text())["size"]
+            if size > len(data):
+                raise Failure(f"{name}: the metadata size {size} is beyond "
+                              f"the stored file ({len(data)} bytes)")
+            if size not in transaction_boundaries(data):
+                raise Failure(f"{name}: the metadata size {size} is not at a "
+                              f"transaction boundary of the stored file")
+            stored += transactions_of(data[:size])
+        source = []
+        for name in SERVER.binlog_names():
+            source += transactions_of(SERVER.binlog_as_sent(name))
+        if complete and stored != source:
+            raise Failure(f"after a complete fetch the storage holds "
+                          f"{len(stored)} transactions, the server "
+                          f"{len(source)}; first difference at transaction "
+                          f"{next((i for i in range(min(len(stored), len(source))) if stored[i] != source[i]), min(len(stored), len(source)))}")
+        if stored != source[:len(stored)]:
+            index = next(i for i in range(len(stored))
+                         if i >= len(source) or stored[i] != source[i])
+            raise Failure(f"stored transaction {index} of {len(stored)} "
+                          f"differs from the server's ({len(source)} "
+                          f"transactions)")
+
     def check_complete_copy(self):
+        if BINSRV.gtid_mode:
+            FetchCrashMachine.rewrite_storage_holds_prefix(complete=True)
+            return
         server_names = SERVER.binlog_names()
         indexed = BINSRV.indexed_binlogs()
         expected = expected_index(indexed, server_names)

@@ -28,6 +28,9 @@ eval $stmt_reset_binary_logs_and_gtids;
 --let $binsrv_idle_time = 10
 --let $binsrv_verify_checksum = TRUE
 --let $binsrv_replication_mode = gtid
+# GTID mode requires rewrite mode since PBS-80 / PBS-98
+--let $binsrv_rewrite_file_size = 1M
+--let $binsrv_rewrite_base_file_name = binlog
 --source ../include/set_up_binsrv_environment.inc
 
 --let $read_from_file = $MYSQL_TMP_DIR/search_result.json

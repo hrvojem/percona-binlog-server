@@ -184,7 +184,10 @@ write_config(const std::filesystem::path &directory,
   },
   "replication": {
     "server_id": 42, "idle_time": 10, "verify_checksum": true,
-    "mode": ")" << mode << R"("
+    "mode": ")" << mode << R"(")"
+         // since PBS-80 / PBS-98 GTID mode requires a rewrite section; the
+         // storage checks only its base name, which is the binlogs'
+         << (mode == "gtid" ? R"(, "rewrite": { "base_file_name": "binlog", "file_size": "1G" })" : "") << R"(
   },
   "replication_source": {
     "port": 3307, "server_id": 142,

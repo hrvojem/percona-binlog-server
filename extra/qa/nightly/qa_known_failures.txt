@@ -33,8 +33,8 @@ telemetry_test position/settings_in_storage  ticket 50: with instance.local_sett
 listener_exhaustion_test position/idle_flood  ticket 55 (PBS-128): idle connections past pull's RLIMIT_NOFILE make accept() fail with EMFILE, handle_exception("listener") ends the accept loop and pull stays up without a listener for good
 file_security_test position/modes/*  ticket 56 (PBS-129): storage files take their mode from the umask (binlog data and metadata 0644 under umask 022, everything 0666 under umask 000; MySQL creates binlogs 0640)
 file_security_test position/symlinks  ticket 57 (PBS-130): symlinks planted in the storage directory under the next binlog, its metadata's .tmp and binlog.index.tmp are written through into files outside the storage
-hostile_source_test */nul_*  ticket 59 (PBS-131): a binlog name from the source's ROTATE with a NUL byte ('binlog.000001\0.000002', 'metadata.json\0...', 'binlog.index\0...') passes composite_binlog_name::parse and is opened truncated at the NUL: a stored binlog loses its data, metadata.json or binlog.index is overwritten, and fetch exits 0
-hostile_source_test */newline  ticket 59 (PBS-131): a newline in a binlog name from the source's ROTATE is written into binlog.index, which then no longer opens
+hostile_source_test position/nul_*  ticket 59 (PBS-131): a binlog name from the source's ROTATE with a NUL byte ('binlog.000001\0.000002', 'metadata.json\0...', 'binlog.index\0...') passes composite_binlog_name::parse and is opened truncated at the NUL: a stored binlog loses its data, metadata.json or binlog.index is overwritten, and fetch exits 0
+hostile_source_test position/newline  ticket 59 (PBS-131): a newline in a binlog name from the source's ROTATE is written into binlog.index, which then no longer opens
 listener_replica_dos_test gtid/huge_gtid_set*  ticket 61 (PBS-135): a logged-in replica's COM_BINLOG_DUMP_GTID with a 1,000,000-interval GTID set (16 MB) occupies the listener for about 12 s, during which no other client is served, and leaves about 100 MB of resident memory behind
 metadata_tamper_test position/strip_encryption  ticket 62: with the 'encryption' record removed from the last binlog's metadata, the next fetch appends plaintext to the encrypted storage and exits 0 (validate_binlog_encryption_record checks a record only when it is present)
 metadata_tamper_test position/transplant_encryption  ticket 63: an 'encryption' record copied from another binlog's metadata is accepted (the wrapped file key is not bound to its binlog), so the appended data reuses that binlog's AES-CTR keystream
@@ -72,7 +72,6 @@ final_flush_test */disk/*  ticket 73: ENOSPC or EIO on the write or fsync of the
 final_flush_test */s3/*  ticket 73: the same with every PUT of the binlog object or of its metadata failing (needs --s3-fault-proxy; not run by the nightly)
 replica_tamper_test */forged_row  ticket 53 (PBS-126): a row value changed in the encrypted storage without the key (ciphertext XOR, CRC32 footer patched) is served by pull and applied by a MySQL replica, with no error on either side
 replica_tamper_test */plaintext_swap  ticket 62 (PBS-136): the data file of an encrypted binlog replaced with plaintext events (a row value of the attacker's choice, correct CRC32) and the 'encryption' member deleted from its metadata: pull serves it and a MySQL replica applies the row, with no error on either side
-hostile_source_test gtid/reannounce_midstream  ticket 69: in GTID mode an artificial ROTATE naming the open binlog at position 4, sent after a complete transaction and followed by a FORMAT_DESCRIPTION and PREVIOUS_GTIDS_LOG, is accepted: the second preamble and the later transactions are appended in the middle of the binlog and fetch exits 0
 file_security_test position/s3_buffer_swap  ticket 65: the S3 buffer file is opened again by path after the download: a file or symlink renamed over it by someone who can write an existing 0777 fs_buffer_directory is uploaded as the binlog object, and the symlink's target is appended to or truncated
 s3_upload_tamper_test */put_*_changed  ticket 78: with an http:// endpoint the uploads are sent with UNSIGNED-PAYLOAD and no checksum: a proxy on the path changes the body of a binlog or metadata PUT, the server answers 200 and fetch exits 0
 s3_upload_tamper_test */get_body_changed  ticket 78: the body of a GET of the binlog object changed on the way is taken by the resumed fetch, appended to and uploaded again
@@ -137,6 +136,7 @@ purge_search_tamper_test position/search_index_entry_dropped  ticket 80: a binlo
 purge_search_tamper_test position/search_index_head_dropped  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
 purge_search_tamper_test position/search_index_swapped  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
 purge_search_tamper_test position/search_index_reversed  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
+purge_search_tamper_test gtid/clean_metadata  ticket 84: on a rewrite-mode storage (every GTID-mode storage since PBS-80 / PBS-98) the generated closing ROTATE carries the time of the fetch, so the max_timestamp of every closed binlog in its metadata (and in 'list') is the fetch time, not the time of its last transaction
 hostile_source_pull_test position/nul_existing_binlog  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
 hostile_source_pull_test position/nul_metadata  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
 hostile_source_pull_test position/nul_index  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
@@ -146,17 +146,6 @@ hostile_source_pull_test position/long_name  ticket 59 (PBS-131): a hostile binl
 hostile_source_pull_test position/reannounce  ticket 69 (PBS-144): pull appends a second preamble to the open binlog
 hostile_source_pull_test position/lower_sequence  ticket 70: a binlog with a lower sequence number is created and served; the next start fails
 hostile_source_pull_test position/length_smaller  ticket 82: a lowered transaction_length leaves a cut-off transaction in the storage
-hostile_source_pull_test gtid/nul_existing_binlog  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
-hostile_source_pull_test gtid/nul_metadata  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
-hostile_source_pull_test gtid/nul_index  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
-hostile_source_pull_test gtid/newline  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
-hostile_source_pull_test gtid/dot_dot  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
-hostile_source_pull_test gtid/long_name  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
-hostile_source_pull_test gtid/reannounce  ticket 69 (PBS-144): pull appends a second preamble to the open binlog
-hostile_source_pull_test gtid/lower_sequence  ticket 70: a binlog with a lower sequence number is created and served; the next start fails
-hostile_source_pull_test gtid/gtid_bloat  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
-hostile_source_pull_test gtid/reannounce_midstream  ticket 69 (PBS-144): pull appends a second preamble to the open binlog
-hostile_source_pull_test gtid/length_smaller  ticket 82: a lowered transaction_length leaves a cut-off transaction in the storage
 hostile_source_pull_test gtid/gtid_twice/rewrite  ticket 81: in rewrite mode a duplicated, swapped, foreign or replayed transaction is stored and served
 hostile_source_pull_test gtid/gtid_swapped/rewrite  ticket 81: in rewrite mode a duplicated, swapped, foreign or replayed transaction is stored and served
 hostile_source_pull_test gtid/gtid_other_uuid/rewrite  ticket 81: in rewrite mode a duplicated, swapped, foreign or replayed transaction is stored and served
@@ -312,5 +301,4 @@ damaged_binlog_consumers_test gtid/S4_plaintext_swap/C4_gtid_replica  ticket 53 
 damaged_binlog_consumers_test gtid/S4_plaintext_swap/C5_resume  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
 damaged_binlog_consumers_test gtid/S5_lower_sequence/C5_list  ticket 70 / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
 damaged_binlog_consumers_test gtid/S5_lower_sequence/C5_search_by_timestamp  ticket 70 / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
-damaged_binlog_consumers_test gtid/S[26]_*/C2_replay_stop_datetime  ticket 84: on a rewrite-mode storage the generated events carry the time of the fetch, so --stop-datetime can stop before the transactions; depends on timing except in the S6 states (and ticket 81 for S2_tail_added_extended)
-damaged_binlog_consumers_test gtid/S0_rewrite_control/C2_replay_stop_datetime  ticket 84: as the S2 states, depends on timing
+damaged_binlog_consumers_test gtid/*/C2_replay_stop_datetime  ticket 84: on a rewrite-mode storage the generated events carry the time of the fetch, so --stop-datetime can stop before the transactions; since rewrite mode became mandatory in GTID mode (PBS-80 / PBS-98) every GTID-mode storage is one; depends on timing except in the S6 states (and ticket 81 for S2_tail_added_extended)

@@ -13,7 +13,9 @@
 # tls_config_test, replica_tamper_test, final_flush_test,
 # s3_upload_tamper_test, checkpoint_loss_test, rewrite_attack_test,
 # hostile_source_pull_test, purge_search_tamper_test,
-# truncated_transaction_test, damaged_binlog_consumers_test) run
+# truncated_transaction_test, damaged_binlog_consumers_test, keyring_test,
+# resource_exhaustion_test, stuck_storage_recovery_test,
+# pull_two_sided_attack_test) run
 # about once a week,
 # so their known failures show up on those nights only.
 # A sanitizer report is never covered by a pattern line (its reason names
@@ -302,3 +304,138 @@ damaged_binlog_consumers_test gtid/S4_plaintext_swap/C5_resume  ticket 53 (PBS-1
 damaged_binlog_consumers_test gtid/S5_lower_sequence/C5_list  ticket 70 (PBS-158) / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
 damaged_binlog_consumers_test gtid/S5_lower_sequence/C5_search_by_timestamp  ticket 70 (PBS-158) / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
 damaged_binlog_consumers_test gtid/*/C2_replay_stop_datetime  ticket 84 (PBS-151): on a rewrite-mode storage the generated events carry the time of the fetch, so --stop-datetime can stop before the transactions; since rewrite mode became mandatory in GTID mode (PBS-80 / PBS-98) every GTID-mode storage is one; depends on timing except in the S6 states (and ticket 81 for S2_tail_added_extended)
+keyring_test position/a_kek_replaced_ctr  ticket 85: a KEK id is not bound to its key bytes: with the key or the cipher of the active KEK changed in the keyring, list and fetch exit 0 and new data is stored under a key the operator did not choose
+keyring_test position/a_kek_replaced_gcm_rotated  ticket 85: a KEK id is not bound to its key bytes: with the key or the cipher of the active KEK changed in the keyring, list and fetch exit 0 and new data is stored under a key the operator did not choose
+keyring_test position/a_cipher_changed  ticket 85: a KEK id is not bound to its key bytes: with the key or the cipher of the active KEK changed in the keyring, list and fetch exit 0 and new data is stored under a key the operator did not choose
+keyring_test position/b_encryption_on  ticket 86: after encryption is turned on for a plain storage, fetch appends to the open binlog in plaintext while metadata.json says 'generic'
+keyring_test position/e_wrong_keyring_ctr  ticket 85: with a wrong keyring backup (right id, other bytes, CTR KEK) every fetch exits 0 and stores data the right keyring cannot read
+keyring_test gtid/a_kek_replaced_ctr  ticket 85: a KEK id is not bound to its key bytes: with the key or the cipher of the active KEK changed in the keyring, list and fetch exit 0 and new data is stored under a key the operator did not choose
+keyring_test gtid/a_kek_replaced_gcm_rotated  ticket 85: a KEK id is not bound to its key bytes: with the key or the cipher of the active KEK changed in the keyring, list and fetch exit 0 and new data is stored under a key the operator did not choose
+keyring_test gtid/a_cipher_changed  ticket 85: a KEK id is not bound to its key bytes: with the key or the cipher of the active KEK changed in the keyring, list and fetch exit 0 and new data is stored under a key the operator did not choose
+keyring_test gtid/b_encryption_on  ticket 86: after encryption is turned on for a plain storage, fetch appends to the open binlog in plaintext while metadata.json says 'generic'
+keyring_test gtid/e_wrong_keyring_ctr  ticket 85: with a wrong keyring backup (right id, other bytes, CTR KEK) every fetch exits 0 and stores data the right keyring cannot read
+resource_exhaustion_test position/unfinished_fetch  ticket 87: a transaction that never ends is buffered in memory without limit (about 1 byte of RSS per byte streamed, checkpoints do not help) until std::bad_alloc ends fetch or pull
+resource_exhaustion_test position/unfinished_checkpoints  ticket 87: a transaction that never ends is buffered in memory without limit (about 1 byte of RSS per byte streamed, checkpoints do not help) until std::bad_alloc ends fetch or pull
+resource_exhaustion_test position/unfinished_pull  ticket 87: a transaction that never ends is buffered in memory without limit (about 1 byte of RSS per byte streamed, checkpoints do not help) until std::bad_alloc ends fetch or pull
+resource_exhaustion_test position/unfinished_pull_dropped  ticket 87: a transaction that never ends is buffered in memory without limit (about 1 byte of RSS per byte streamed, checkpoints do not help) until std::bad_alloc ends fetch or pull
+resource_exhaustion_test position/complete_no_checkpoints  ticket 87: without checkpoint settings the whole binlog being received stays in memory
+resource_exhaustion_test position/rotation_flood  ticket 91: binlog.index is rewritten in full at every rotation, so the bytes written per rotation grow with the number of binlogs
+resource_exhaustion_test position/log_volume  ticket 45 (PBS-118): the info log grows by more than the stream it describes
+resource_exhaustion_test gtid/unfinished_fetch  ticket 87: a transaction that never ends is buffered in memory without limit (about 1 byte of RSS per byte streamed, checkpoints do not help) until std::bad_alloc ends fetch or pull
+resource_exhaustion_test gtid/unfinished_checkpoints  ticket 87: a transaction that never ends is buffered in memory without limit (about 1 byte of RSS per byte streamed, checkpoints do not help) until std::bad_alloc ends fetch or pull
+resource_exhaustion_test gtid/unfinished_pull  ticket 87: a transaction that never ends is buffered in memory without limit (about 1 byte of RSS per byte streamed, checkpoints do not help) until std::bad_alloc ends fetch or pull
+resource_exhaustion_test gtid/unfinished_pull_dropped  ticket 87: a transaction that never ends is buffered in memory without limit (about 1 byte of RSS per byte streamed, checkpoints do not help) until std::bad_alloc ends fetch or pull
+resource_exhaustion_test gtid/complete_no_checkpoints  ticket 87: without checkpoint settings the whole binlog being received stays in memory
+resource_exhaustion_test gtid/gtid_gaps  ticket 88: transactions with gapped GTIDs make every new rewrite-mode binlog carry the whole GTID set: 0.4 MiB of stream becomes 14 MiB in about 1,000 binlogs, and list needs 147 MiB
+resource_exhaustion_test gtid/rotation_flood  ticket 91: binlog.index is rewritten in full at every rotation, so the bytes written per rotation grow with the number of binlogs
+resource_exhaustion_test gtid/log_volume  ticket 45 (PBS-118): the info log grows by more than the stream it describes
+stuck_storage_recovery_test position/nul_metadata/R4  runbook: this repair deletes good binlogs and the storage stays stuck (ticket 59, PBS-131)
+stuck_storage_recovery_test position/nul_metadata/R9  runbook: this repair deletes good binlogs and the storage stays stuck (ticket 59, PBS-131)
+stuck_storage_recovery_test position/lower_sequence/R2  ticket 70 (PBS-158): this repair leaves the hostile ROTATE or indexes the binlog with the lower number first
+stuck_storage_recovery_test position/lower_sequence/R6  ticket 70 (PBS-158): this repair leaves the hostile ROTATE or indexes the binlog with the lower number first
+stuck_storage_recovery_test position/lower_sequence/R6+R3  ticket 70 (PBS-158): this repair leaves the hostile ROTATE or indexes the binlog with the lower number first
+stuck_storage_recovery_test position/lower_sequence  ticket 70 (PBS-158): this repair leaves the hostile ROTATE or indexes the binlog with the lower number first
+stuck_storage_recovery_test position/source_reset/R2  ticket 25 (PBS-141): a reset or replaced source has no in-place repair; these repairs leave two source lives mixed or delete good data
+stuck_storage_recovery_test position/source_reset/R9  ticket 25 (PBS-141): a reset or replaced source has no in-place repair; these repairs leave two source lives mixed or delete good data
+stuck_storage_recovery_test position/source_reset_longer/R2  ticket 25 (PBS-141): a reset or replaced source has no in-place repair; these repairs leave two source lives mixed or delete good data
+stuck_storage_recovery_test position/source_reset_longer/R5-before  ticket 25 (PBS-141): a reset or replaced source has no in-place repair; these repairs leave two source lives mixed or delete good data
+stuck_storage_recovery_test position/source_reset_longer/R9  ticket 25 (PBS-141): a reset or replaced source has no in-place repair; these repairs leave two source lives mixed or delete good data
+stuck_storage_recovery_test position/source_reset_longer  ticket 25 (PBS-141): a reset or replaced source has no in-place repair; these repairs leave two source lives mixed or delete good data
+stuck_storage_recovery_test position/source_gap/R2  runbook: after the source purged unfetched binlogs only a fresh storage works; this repair deletes stored data and stays stuck
+stuck_storage_recovery_test position/source_gap/R9  runbook: after the source purged unfetched binlogs only a fresh storage works; this repair deletes stored data and stays stuck
+stuck_storage_recovery_test position/interrupted_rotation/R2  runbook: deleting the last indexed binlog after an interrupted rotation leaves an orphan the start-up check refuses
+stuck_storage_recovery_test gtid/healthy/R2  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/healthy/R2+R3  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/cutoff_stub/R2  ticket 82: the cut-off transaction stays in an earlier binlog; these repairs leave it there
+stuck_storage_recovery_test gtid/cutoff_stub/R9  ticket 82: the cut-off transaction stays in an earlier binlog; these repairs leave it there
+stuck_storage_recovery_test gtid/cutoff_stub  ticket 82: the cut-off transaction stays in an earlier binlog; these repairs leave it there
+stuck_storage_recovery_test gtid/short_tail/R2  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/short_tail/R2+R3  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/short_tail  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/source_reset/R2  ticket 25 (PBS-141): a reset or replaced source has no in-place repair; these repairs leave two source lives mixed or delete good data
+stuck_storage_recovery_test gtid/source_reset/R2+R3  ticket 25 (PBS-141): a reset or replaced source has no in-place repair; these repairs leave two source lives mixed or delete good data
+stuck_storage_recovery_test gtid/source_reset/R9  ticket 25 (PBS-141): a reset or replaced source has no in-place repair; these repairs leave two source lives mixed or delete good data
+stuck_storage_recovery_test gtid/source_reset_longer/R2  ticket 25 (PBS-141): a reset or replaced source has no in-place repair; these repairs leave two source lives mixed or delete good data
+stuck_storage_recovery_test gtid/source_reset_longer/R2+R3  ticket 25 (PBS-141): a reset or replaced source has no in-place repair; these repairs leave two source lives mixed or delete good data
+stuck_storage_recovery_test gtid/source_reset_longer/R9  ticket 25 (PBS-141): a reset or replaced source has no in-place repair; these repairs leave two source lives mixed or delete good data
+stuck_storage_recovery_test gtid/source_reset_longer  ticket 25 (PBS-141): a reset or replaced source has no in-place repair; these repairs leave two source lives mixed or delete good data
+stuck_storage_recovery_test gtid/source_gap/R2  runbook: after the source purged unfetched binlogs only a fresh storage works; this repair deletes stored data and stays stuck
+stuck_storage_recovery_test gtid/source_gap/R2+R3  runbook: after the source purged unfetched binlogs only a fresh storage works; this repair deletes stored data and stays stuck
+stuck_storage_recovery_test gtid/source_gap/R9  runbook: after the source purged unfetched binlogs only a fresh storage works; this repair deletes stored data and stays stuck
+stuck_storage_recovery_test gtid/interrupted_rotation/R1  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/interrupted_rotation/R2  runbook: deleting the last indexed binlog after an interrupted rotation leaves an orphan the start-up check refuses
+stuck_storage_recovery_test gtid/interrupted_rotation/R3  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/interrupted_rotation/R2+R3  runbook: deleting the last indexed binlog after an interrupted rotation leaves an orphan the start-up check refuses
+stuck_storage_recovery_test gtid/interrupted_rotation/R4  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/interrupted_rotation/R4+R3  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/interrupted_rotation/R5-before  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/interrupted_rotation  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/tail_deleted/R2  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/tail_deleted/R3  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/tail_deleted/R2+R3  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/tail_deleted/R6  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/tail_deleted/R6+R3  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/tail_deleted  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/tail_deleted_index_too/R1  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/tail_deleted_index_too/R2  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/tail_deleted_index_too/R3  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/tail_deleted_index_too/R2+R3  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/tail_deleted_index_too  ticket 89: in rewrite mode a fetch after an interrupted rotation, or after the last binlog was removed, appends behind the closing ROTATE of the previous binlog, and refetched transactions land at other positions
+stuck_storage_recovery_test gtid/gtid_claims_extended/R2  ticket 81: the metadata lists GTIDs the files do not hold; this repair leaves the transactions missing or triggers ticket 89
+stuck_storage_recovery_test gtid/gtid_claims_extended/R2+R3  ticket 81: the metadata lists GTIDs the files do not hold; this repair leaves the transactions missing or triggers ticket 89
+stuck_storage_recovery_test gtid/gtid_claims_extended/R5-before  ticket 81: the metadata lists GTIDs the files do not hold; this repair leaves the transactions missing or triggers ticket 89
+stuck_storage_recovery_test gtid/gtid_claims_extended  ticket 81: the metadata lists GTIDs the files do not hold; this repair leaves the transactions missing or triggers ticket 89
+stuck_storage_recovery_test gtid/gtid_size_lowered/R2  ticket 63 (PBS-137): as gtid_claims_extended, after a lowered 'size'
+stuck_storage_recovery_test gtid/gtid_size_lowered/R2+R3  ticket 63 (PBS-137): as gtid_claims_extended, after a lowered 'size'
+stuck_storage_recovery_test gtid/gtid_size_lowered/R5-before  ticket 63 (PBS-137): as gtid_claims_extended, after a lowered 'size'
+stuck_storage_recovery_test gtid/gtid_size_lowered  ticket 63 (PBS-137): as gtid_claims_extended, after a lowered 'size'
+hostile_source_pull_test position/nul_existing_binlog/s3  ticket 59 (PBS-131): as on file storage
+hostile_source_pull_test position/nul_metadata/s3  ticket 59 (PBS-131): as on file storage
+hostile_source_pull_test position/nul_index/s3  ticket 59 (PBS-131): as on file storage
+hostile_source_pull_test position/newline/s3  ticket 59 (PBS-131): as on file storage
+hostile_source_pull_test position/dot_dot/s3  ticket 59 (PBS-131): as on file storage
+hostile_source_pull_test position/long_name/s3  ticket 59 (PBS-131): as on file storage
+hostile_source_pull_test position/reannounce/s3  ticket 69 (PBS-144): as on file storage
+hostile_source_pull_test position/lower_sequence/s3  ticket 70 (PBS-158): as on file storage
+hostile_source_pull_test position/length_smaller/s3  ticket 82: as on file storage
+hostile_source_pull_test position/s3_name_parent_prefix/s3  ticket 59 (PBS-131): a name with a path separator is refused, but the ROTATE carrying it is already appended to the stored object and every restart fails
+hostile_source_pull_test position/s3_name_absolute_key/s3  ticket 59 (PBS-131): a name with a path separator is refused, but the ROTATE carrying it is already appended to the stored object and every restart fails
+hostile_source_pull_test position/s3_name_sibling_prefix/s3  ticket 59 (PBS-131): a name with a path separator is refused, but the ROTATE carrying it is already appended to the stored object and every restart fails
+truncated_transaction_test gtid/lie_after_gtid/s3  ticket 82: as on file storage
+truncated_transaction_test gtid/lie_after_begin/s3  ticket 82: as on file storage
+truncated_transaction_test gtid/lie_after_table_map/s3  ticket 82: as on file storage
+truncated_transaction_test gtid/lie_after_first_rows/s3  ticket 82: as on file storage
+truncated_transaction_test gtid/lie_multi_after_statement/s3  ticket 82: as on file storage
+truncated_transaction_test gtid/lie_ddl_after_gtid/s3  ticket 82: as on file storage
+truncated_transaction_test gtid/lie_compressed_after_gtid/s3  ticket 82: as on file storage
+truncated_transaction_test gtid/lie_last_after_begin/s3  ticket 82: as on file storage
+truncated_transaction_test gtid/lie_after_begin_eof/s3  ticket 82: as on file storage
+truncated_transaction_test gtid/lie_after_gtid_eof/s3  ticket 82: as on file storage
+truncated_transaction_test gtid/lie_after_begin_drop/s3  ticket 82: as on file storage
+truncated_transaction_test gtid/lie_after_begin_rest_removed/s3  ticket 82: as on file storage
+truncated_transaction_test gtid/pull_lie_after_begin/s3  ticket 82: as on file storage
+truncated_transaction_test gtid/pull_lie_after_begin_drop/s3  ticket 82: as on file storage
+purge_search_tamper_test gtid/clean_metadata/s3  ticket 84 (PBS-151): as on file storage
+purge_search_tamper_test gtid/purge_index_only_tail/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/purge_index_head_dropped_tail_target/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/purge_index_swapped_low/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/purge_index_tail_moved/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/purge_size_tail_lowered/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/purge_size_tail_lowered_refused/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/purge_retention_max_lowered/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/search_min_timestamp_future/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/search_min_timestamp_past/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/search_min_timestamp_removed/s3  ticket 80: as on file storage
+purge_search_tamper_test gtid/search_min_timestamp_number/s3  ticket 80: as on file storage
+purge_search_tamper_test gtid/search_metadata_unparsable/s3  ticket 80: as on file storage
+purge_search_tamper_test gtid/search_metadata_missing/s3  ticket 80: as on file storage
+purge_search_tamper_test gtid/search_index_entry_dropped/s3  ticket 80: as on file storage
+purge_search_tamper_test gtid/search_index_head_dropped/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/search_index_swapped/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/search_index_reversed/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/search_added_gtids_superset/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/search_added_gtids_shifted/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/search_added_gtids_removed/s3  ticket 80: as on file storage
+purge_search_tamper_test gtid/search_index_swapped_gtid_replay/s3  ticket 53 (PBS-126): as on file storage
+purge_search_tamper_test gtid/s3_purge_nested_tmp/s3  ticket 90: an object ending in .tmp below the storage prefix is deleted at any start for writing
+purge_search_tamper_test gtid/s3_size_tail_lowered_upload_fails/s3  ticket 90: a failed upload in the start-up resize leaves a copy of the binlog in the buffer directory

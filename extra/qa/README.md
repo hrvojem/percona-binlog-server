@@ -747,6 +747,136 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/damaged_binlog_consumers_test.py \
   --mode gtid
 ```
 
+### The keyring and the life of a key — `keyring_test.py`
+
+Attacks the keyring file instead of the storage, and walks through what an
+operator does with keys. The test decrypts every stored binlog itself (it
+unwraps the file key with a given keyring), so it can say which bytes the
+operator, an attacker or nobody can read. On 2026-11-17, 5 of 19 cases fail
+in both modes, the same on the ASan and release builds and on the build
+with mandatory rewrite mode. A KEK id is not bound to its key bytes
+(ticket 85): with the bytes of the active CTR KEK overwritten in the
+keyring (write access is enough), `list` and `fetch` exit 0 and everything
+stored afterwards is readable with the attacker's key only; a GCM KEK
+catches that on the open binlog, but not once the operator rotates to a
+KEK whose bytes were already replaced; a cipher name changed from CBC to
+CTR is accepted too. A wrong keyring backup (right id, other bytes) is the
+same by accident: three `fetch` runs exit 0 and store data the right
+keyring cannot read. Turning encryption on for a plain storage leaves the
+open binlog in plaintext until the next rotation (ticket 86). What works:
+rotation to a new KEK (the open binlog stays under the old one, nothing is
+re-wrapped; with the old KEK removed every command refuses the whole
+storage until its binlogs are purged), 93 malformed keyrings (clean exits,
+no key bytes in any message), key and IV uniqueness over 200 binlogs, and
+no secret outside the process's memory. The keyring is read once at start.
+`c_hygiene` records how many copies of each secret a memory image of
+`pull` holds (nothing is wiped or locked; informational).
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/keyring_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/keyring
+```
+
+### Memory and disk a source can make PBS use — `resource_exhaustion_test.py`
+
+A proxy turns a real transaction into one that never ends, floods
+rotations, sends GTIDs with gaps or events of 64 to 256 MiB, and 300
+replicas stall their dumps, while the test records resident memory, bytes
+written and start-up times. Every `binlog_server` runs under an
+address-space cap (`--memory-cap-mib`), and a run needs about 1.3 GB of
+disk. On 2026-11-17, 7 of 18 cases fail in position mode and 8 in GTID
+mode. An unfinished transaction is buffered whole, about one byte of
+memory per byte streamed, whatever the checkpoint settings, until
+`std::bad_alloc` ends `fetch` or `pull` (ticket 87); without checkpoint
+settings the whole binlog being received is held the same way.
+Transactions whose GTIDs skip numbers make every new rewrite-mode binlog
+carry the whole GTID set: 0.4 MiB of stream became 14 MiB in about 1,000
+binlogs, and with 6,000 such transactions `list` fails with
+`std::bad_alloc` at 3 GiB (ticket 88). `binlog.index` is rewritten in full
+at every rotation (ticket 91), and the info log outgrows the stream
+(ticket 45). Bounded: an event header that claims 3.5 GiB allocates
+nothing ahead of the data, a transaction longer than declared is refused
+at once, sequence number 1,000,000 is refused, and a stalled replica costs
+about 4 MiB.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/resource_exhaustion_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/resources \
+  --mode gtid
+```
+
+### A hostile source and hostile clients at once — `pull_two_sided_attack_test.py`
+
+Runs one `pull` for 90 s per case (`--duration`, `--seed`) with a
+man-in-the-middle on its source connection (drops, stalls, replays, ERR
+packets, rotations in a loop) and, at the same time, six client threads
+sending malformed commands, dumps from odd positions, aborted and unread
+dumps, wrong logins, TLS and plain; honest readers, a replica and `list` /
+search loops run next to them, and a SIGTERM ends each case. Attacks of
+known tickets are kept out of the mix. It passes: with a ThreadSanitizer
+build of `binlog_server` (not built by the nightly; the test detects one
+and runs it under `setarch -R`) about 40 minutes of this gave no report,
+and the ASan and debug builds none either; memory stays flat, no wrong
+login is accepted, and after a clean restart replicas match the source.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/pull_two_sided_attack_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/two-sided
+```
+
+### Repairing a stuck storage — `stuck_storage_recovery_test.py`
+
+Several tickets end in a storage no run can continue. This test produces
+each such state (hostile names, a second preamble, a lower sequence
+number, a cut-off transaction, a short last binlog, a reset or replaced
+source, binlogs the source purged, an interrupted rotation, a deleted
+last binlog, metadata that lists GTIDs the files do not hold) and tries
+the repairs an operator would, each on a copy: run again (R1), delete the
+last binlog (R2), trim it to a transaction boundary (R3), delete from the
+damage on (R4), purge (R5), rebuild the index or `metadata.json` (R6), a
+fresh storage next to the old one (R7), edit the GTID sets back (R8),
+empty the last binlog (R9). Cases are `<state>/<repair>` and one line per
+state; a repair fails when it leaves the backup silently wrong or destroys
+more. On 2026-11-17, 15 of 208 lines fail in position mode and 45 of 147
+in GTID mode, the same with and without mandatory rewrite mode. In
+rewrite mode, after an interrupted rotation (a kill at the wrong moment is
+enough: 22 of 40 random kills), the next `fetch` appends transactions
+behind the closing ROTATE of the previous binlog, and deleting the last
+binlog and fetching again does the same and moves transactions to other
+positions (ticket 89); only an in-place trim, an emptied last binlog or a
+fresh storage are clean there. A reset or replaced source (ticket 25) has
+no in-place repair. Rebuilding `binlog.index` from a directory listing is
+wrong when a binlog with a lower number was planted (ticket 70).
+
+What worked, by the message `fetch` and `pull` exit with (stop the writer
+and copy the storage first; verify with two `fetch` runs, `list`, and a
+scratch replica of `pull`):
+
+| Message | Repair that worked |
+| --- | --- |
+| `cannot perform recovery - size from the binlog metadata is bigger than the actual binlog file size` | truncate the last binlog at the end of its last complete transaction (`mysqlbinlog --base64-output=DECODE-ROWS`, the `end_log_pos` of the last `Xid`), set `size`, `last_sequence_number` and in GTID mode `added_gtids` in its `.json`, then `fetch`; or empty the last binlog (below) |
+| `binlog index contains a reference to a non-existing object`, the last index line names files that are gone | position mode: remove that index line, `fetch`; GTID mode: empty the last binlog instead |
+| the same, with the index not ascending | remove the planted binlog and its index line, cut the ROTATE that names it off the binlog before, set that binlog's `size`, `fetch`; do not rebuild the index from `ls` |
+| `binlog index contains an entry that has an invalid path` | rebuild `binlog.index` (`./binlog.NNNNNN` per line), cut the hostile ROTATE off the last binlog, set `size`, `fetch` |
+| `unable to extract "mode"` | write `metadata.json` again (`{"version":1,"mode":"position"}`), then as the line above |
+| `Client requested source to start replication from position > file size`, `transaction group must start from one of the gtid log events` | cut the last binlog at its last complete transaction, set `size` and `last_sequence_number`, `fetch` |
+| `Could not find first log file name in binary log index file`, `Replica has more GTIDs than the source has`, `the source purged required binary logs` | a fresh storage next to the old one; the old one still answers `list` |
+| no error, `list` shows `added_gtids` the last binlog does not hold | before the next `fetch`: set its `added_gtids` to what the file holds, then `fetch` |
+| no error, GTID mode, a warning "left after an interrupted binlog rotation" | before `fetch`: empty the last indexed binlog |
+
+Emptying the last binlog: write the 4-byte magic as the data file (on an
+encrypted storage truncate it to 4 bytes and keep its `encryption`
+record), and a `.json` with `size` 4, `added_gtids` empty and
+`previous_gtids` the union of the previous binlog's two sets; keep its
+index line. `purge_binlogs` never repairs a stuck storage. PBS has no
+`verify` or repair command, and no message names the damaged object.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/stuck_storage_recovery_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/stuck \
+  --mode gtid
+```
+
 ### Secrets in output — `secrets_exposure_test.py`
 
 Runs `fetch`, `pull` (with right and wrong client logins), `list` and
@@ -1212,13 +1342,13 @@ server rather than starting one.
 
      | Day | Harness (mode) | Build |
      | --- | --- | --- |
-     | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position and gtid, about 1 min each) and `tls_config_test.py` (position, about 5 min); `hostile_source_pull_test.py` (position, about 5 min) | ASan; debug |
-     | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 4 min) and `checkpoint_loss_test.py` (position, file storage, about 5 min); `purge_search_tamper_test.py` (gtid, about 2 min) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
-     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min); `rewrite_attack_test.py` (gtid, about 7 min) and `truncated_transaction_test.py` (position, about 3 min) | ASan; debug |
-     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) and `replica_tamper_test.py` (position, about 4 min) | ASan; debug |
-     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 7 min, with the local S3 server), `s3_upload_tamper_test.py` (position, about 1 min) and `listener_command_fuzz_test.py --tls` (gtid, about 5 min); `truncated_transaction_test.py` (gtid, about 3 min) and `damaged_binlog_consumers_test.py` (position, about 3 min) | ASan; debug |
-     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min); `final_flush_test.py` (position, about 3 min); `hostile_source_pull_test.py --rewrite` (gtid, about 9 min) | debug / ASan; debug |
-     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) and `replica_tamper_test.py` (gtid, about 4 min); `truncated_transaction_test.py --rewrite` (gtid, about 5 min) and `damaged_binlog_consumers_test.py` (gtid, about 11 min) | ASan / debug; debug |
+     | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position and gtid, about 1 min each) and `tls_config_test.py` (position, about 5 min); `hostile_source_pull_test.py` (position, about 5 min, and again with `--storage s3`, cases `position/<case>/s3`); `stuck_storage_recovery_test.py` (position, about 4 min) | ASan; debug |
+     | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 4 min) and `checkpoint_loss_test.py` (position, file storage, about 5 min); `purge_search_tamper_test.py` (gtid, about 2 min); `keyring_test.py` (position, about 4 min) and `pull_two_sided_attack_test.py` (position, about 5 min) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
+     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min); `rewrite_attack_test.py` (gtid, about 7 min) and `truncated_transaction_test.py` (position, about 3 min, and gtid with `--storage s3`, about 5 min); `resource_exhaustion_test.py` (position, about 5 min) | ASan; debug |
+     | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) and `replica_tamper_test.py` (position, about 4 min); `keyring_test.py` (gtid, about 4 min) | ASan; debug |
+     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 7 min, with the local S3 server), `s3_upload_tamper_test.py` (position, about 1 min) and `listener_command_fuzz_test.py --tls` (gtid, about 5 min); `truncated_transaction_test.py` (gtid, about 3 min) and `damaged_binlog_consumers_test.py` (position, about 3 min); `stuck_storage_recovery_test.py` (gtid, about 9 min) | ASan; debug |
+     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min); `final_flush_test.py` (position, about 3 min); `hostile_source_pull_test.py --rewrite` (gtid, about 9 min); `resource_exhaustion_test.py` (gtid, about 9 min) | debug / ASan; debug |
+     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) and `replica_tamper_test.py` (gtid, about 4 min); `truncated_transaction_test.py --rewrite` (gtid, about 5 min) and `damaged_binlog_consumers_test.py` (gtid, about 11 min); `pull_two_sided_attack_test.py` (gtid, about 5 min) and `purge_search_tamper_test.py --storage s3` (gtid, about 22 min) | ASan / debug; debug |
 
      `pull_versions/<series>` runs the replica harnesses of the nightly 8.4
      stage against another MySQL version of `MTR_DISTS`: `upgrade_test.py`,

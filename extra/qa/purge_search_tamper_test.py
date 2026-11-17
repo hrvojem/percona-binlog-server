@@ -86,6 +86,46 @@ storages; all of them are consequences of ticket 53, three also of ticket
   with a list that omits needed binlogs or is out of order, and the replay
   of that list gives other data than the true state.
 
+With '--storage s3' the storages are key prefixes in a bucket of an
+S3-compatible server whose objects are files under '--s3-bucket-dir' (the
+POSIX backend of Versity S3 Gateway), where the checks read them. Every
+case works on a copy of a golden prefix, '<prefix>/c/<case>-<flavour>/st',
+with canary objects under the sibling prefixes '<case>-<flavour>/',
+'.../victim/' and '.../stx/'; the edits are S3 requests of someone with
+write access to the bucket ('--s3-edit file' makes them on the files
+instead). binlog_server reaches the server through an s3_fault_proxy.py of
+the run, which counts its requests ('s3_traffic' of each line) and injects
+the faults of the s3_* cases. The cases that need symbolic links are
+skipped with the reason, and these run in addition:
+- 's3_purge_index_*', 's3_purge_targets_outside': index entries and purge
+  targets that name keys outside the storage's prefix (a sibling prefix,
+  a full key, '//', a trailing '/');
+- 's3_purge_nested_*': objects one level below the storage's prefix;
+- 's3_purge_delete_fails_midway', 's3_purge_killed_midway',
+  's3_purge_index_put_fails': a purge deletes its objects one by one after
+  it has uploaded the new index - what an error or a kill half way leaves,
+  what 'list' and the searches say then, and whether the next 'fetch'
+  removes the rest;
+- 's3_size_tail_lowered_upload_fails': the truncation of the newest binlog
+  (a download into 'fs_buffer_directory', a truncated upload) when the
+  upload fails.
+The lines of an S3 run carry "storage": "s3" and the flavour as "flavour";
+the run deletes its prefix at the end and lists what is left of it
+('s3_left_behind', which fails the run).
+
+On 2026-11-17 (local Versity gateway) every case both storages have ends
+on S3 as on the file storage, with the same reason; edits made with S3
+requests and on the files give the same results. No index entry, purge
+target or object of the s3_* cases made a purge touch a key outside the
+storage's prefix. Two s3_* cases fail: 's3_purge_nested_tmp' (any start
+for writing deletes every object below the prefix whose name ends in
+'.tmp', also in a "directory" of its own) and 's3_size_tail_lowered_
+upload_fails' (the truncated copy stays in 'fs_buffer_directory').
+'s3_purge_delete_fails_midway' passes, but takes two minutes: the purge
+retries each failing DELETE for about 30 s and then answers "warning" with
+exit 0; the next start for writing removes the rest. A run takes 12
+minutes in position mode and 23 in GTID mode (file storage: under 2).
+
 A JSON line per case and storage flavour (the full answers go to
 result.json), then a summary; exit 1 if any case failed. GTID-set cases
 run only with '--mode gtid'. Example:
@@ -99,13 +139,21 @@ run only with '--mode gtid'. Example:
 import argparse
 import datetime
 import hashlib
+import hmac
+import html
+import http.client
 import json
 import os
+import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -140,8 +188,297 @@ SCRATCH: "harness.MySQLServer | None" = None
 SCRATCH_PORT = 0
 BASE_CONFIG = {}
 GOLDEN = {}
+# S3: flavour -> the objects of the golden storage (name -> content)
+GOLDEN_OBJECTS = {}
 TRUTH: "Truth | None" = None
 KEEP = False
+# '--storage s3': an S3Setup, else None
+S3: "S3Setup | None" = None
+# how the attacker's edits are made on S3: 'put' (S3 requests) or 'file'
+# (the files of the S3 server's bucket directory)
+S3_EDIT = "put"
+
+
+# ---------------------------------------------------------------------------
+# '--storage s3' (also used by hostile_source_pull_test.py and
+# truncated_transaction_test.py)
+# ---------------------------------------------------------------------------
+
+S3_REGION = "us-east-1"
+
+
+class S3Api:
+    """Signed (SigV4) path-style requests to an S3-compatible server: what
+    someone with write access to the bucket and no key of the storage can
+    do."""
+
+    def __init__(self, endpoint: str, bucket: str, access_key: str,
+                 secret_key: str):
+        self.endpoint = endpoint
+        self.bucket = bucket
+        self.access_key = access_key
+        self.secret_key = secret_key
+
+    def request(self, method: str, key: str, body: bytes = b"",
+                query: "dict | None" = None) -> tuple:
+        """(status, body) of one request on the object 'key' (on the
+        bucket itself for an empty key)."""
+        path = "/" + urllib.parse.quote(
+            f"{self.bucket}/{key}" if key else self.bucket, safe="/")
+        pairs = sorted((urllib.parse.quote(name, safe=""),
+                        urllib.parse.quote(value, safe=""))
+                       for name, value in (query or {}).items())
+        query_text = "&".join(f"{name}={value}" for name, value in pairs)
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y%m%dT%H%M%SZ")
+        day = stamp[:8]
+        payload_hash = hashlib.sha256(body).hexdigest()
+        headers = {"host": self.endpoint,
+                   "x-amz-content-sha256": payload_hash, "x-amz-date": stamp}
+        signed = ";".join(sorted(headers))
+        canonical = "\n".join([
+            method, path, query_text,
+            "".join(f"{name}:{headers[name]}\n" for name in sorted(headers)),
+            signed, payload_hash])
+        scope = f"{day}/{S3_REGION}/s3/aws4_request"
+        to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope,
+                             hashlib.sha256(canonical.encode()).hexdigest()])
+        key_bytes = ("AWS4" + self.secret_key).encode()
+        for part in (day, S3_REGION, "s3", "aws4_request"):
+            key_bytes = hmac.new(key_bytes, part.encode(),
+                                 hashlib.sha256).digest()
+        signature = hmac.new(key_bytes, to_sign.encode(),
+                             hashlib.sha256).hexdigest()
+        headers["Authorization"] = (
+            f"AWS4-HMAC-SHA256 Credential={self.access_key}/{scope}, "
+            f"SignedHeaders={signed}, Signature={signature}")
+        connection = http.client.HTTPConnection(self.endpoint, timeout=60)
+        try:
+            connection.request(
+                method, path + ("?" + query_text if query_text else ""),
+                body=body if method == "PUT" else None, headers=headers)
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+
+    def put(self, key: str, data: bytes) -> None:
+        status, answer = self.request("PUT", key, data)
+        if status != 200:
+            raise harness.Failure(f"S3 PUT {key!r}: HTTP {status} "
+                                  f"{answer[:200]!r}")
+
+    def delete(self, key: str) -> None:
+        status, answer = self.request("DELETE", key)
+        if status not in (200, 204, 404):
+            raise harness.Failure(f"S3 DELETE {key!r}: HTTP {status} "
+                                  f"{answer[:200]!r}")
+
+    def list(self, prefix: str) -> list:
+        """(key, size) of every object whose key starts with 'prefix'."""
+        result = []
+        token = None
+        while True:
+            query = {"list-type": "2", "prefix": prefix}
+            if token:
+                query["continuation-token"] = token
+            status, answer = self.request("GET", "", query=query)
+            text = answer.decode(errors="replace")
+            if status != 200:
+                raise harness.Failure(f"S3 list {prefix!r}: HTTP {status} "
+                                      f"{text[:200]!r}")
+            for entry in re.findall(r"<Contents>(.*?)</Contents>", text,
+                                    re.S):
+                key = re.search(r"<Key>(.*?)</Key>", entry, re.S).group(1)
+                size = re.search(r"<Size>(\d+)</Size>", entry).group(1)
+                result.append((html.unescape(key), int(size)))
+            more = re.search(r"<NextContinuationToken>(.*?)<", text)
+            if "<IsTruncated>true" not in text or not more:
+                return result
+            token = html.unescape(more.group(1))
+
+
+class S3Proxy:
+    """An s3_fault_proxy.py of this run between binlog_server and the S3
+    server: its traffic counters and its fault rules."""
+
+    def __init__(self, listen: str, backend: str):
+        self.listen = listen
+        self.control = f"http://{listen}/__faults__"
+        self.process = subprocess.Popen(
+            [sys.executable,
+             str(Path(__file__).resolve().parent / "s3_fault_proxy.py"),
+             "--listen", listen, "--backend", backend],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                self.state()
+                return
+            except (urllib.error.URLError, OSError):
+                if self.process.poll() is not None or \
+                        time.monotonic() > deadline:
+                    self.stop()
+                    raise harness.Failure(
+                        f"s3_fault_proxy.py did not start on {listen}")
+                time.sleep(0.2)
+
+    def set_rules(self, rules: list, reset_traffic: bool = False) -> None:
+        request = urllib.request.Request(
+            self.control, method="PUT",
+            data=json.dumps({"rules": rules,
+                             "reset_traffic": reset_traffic}).encode())
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+
+    def state(self) -> dict:
+        with urllib.request.urlopen(self.control, timeout=10) as response:
+            return json.loads(response.read())
+
+    def stop(self) -> None:
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+
+
+def add_s3_arguments(parser) -> None:
+    parser.add_argument("--storage", choices=["file", "s3"], default="file")
+    parser.add_argument("--s3-endpoint", default="127.0.0.1:9000")
+    parser.add_argument("--s3-bucket", default="pbs-mtr")
+    parser.add_argument("--s3-bucket-dir", type=Path,
+                        help="where the S3 server keeps the objects of the "
+                             "bucket as files (the checks read them there)")
+    parser.add_argument("--s3-access-key", default="pbsaccesskey")
+    parser.add_argument("--s3-secret-key", default="pbs/secret+key=1")
+    parser.add_argument("--s3-prefix",
+                        help="the prefix in the bucket this run works under "
+                             "and deletes at its end (default: the "
+                             "harness, the mode and the process id)")
+    parser.add_argument("--s3-proxy-port", type=int,
+                        help="where this run's s3_fault_proxy.py listens "
+                             "(it counts the uploads and injects the "
+                             "faults of the s3_* cases)")
+    parser.add_argument("--no-s3-proxy", action="store_true",
+                        help="connect to --s3-endpoint directly: no upload "
+                             "counters, no fault cases")
+
+
+class S3Setup:
+    """What a run with '--storage s3' works with: a prefix of its own in
+    the bucket, the requests of an attacker, and the proxy."""
+
+    def __init__(self, parser, args, default_prefix: str, proxy_port: int):
+        if args.s3_bucket_dir is None:
+            parser.error("--storage s3 needs --s3-bucket-dir")
+        self.bucket = args.s3_bucket
+        self.bucket_dir = args.s3_bucket_dir.expanduser().resolve()
+        self.root = (args.s3_prefix or default_prefix).strip("/")
+        self.access_key = args.s3_access_key
+        self.secret_key = args.s3_secret_key
+        # the harness's own requests go to the server directly: the proxy
+        # counts what binlog_server does
+        self.api = S3Api(args.s3_endpoint, args.s3_bucket,
+                         args.s3_access_key, args.s3_secret_key)
+        self.proxy = None
+        self.endpoint = args.s3_endpoint
+        if (self.bucket_dir / self.root).exists() or self.api.list(
+                self.root + "/"):
+            parser.error(f"the prefix {self.root!r} exists in the bucket")
+        if not args.no_s3_proxy:
+            self.endpoint = \
+                f"127.0.0.1:{args.s3_proxy_port or proxy_port}"
+            self.proxy = S3Proxy(self.endpoint, args.s3_endpoint)
+
+    def storage(self, prefix: str) -> harness.S3Storage:
+        """The storage of binlog_server at 'prefix' (a key prefix below
+        the run's own)."""
+        return harness.S3Storage(self.endpoint, self.bucket, self.bucket_dir,
+                                 self.access_key, self.secret_key,
+                                 f"{self.root}/{prefix}")
+
+    def directory(self, prefix: str = "") -> Path:
+        return self.bucket_dir / self.root / prefix
+
+    def inventory(self, prefix: str, skip: str = "") -> dict:
+        """The objects below 'prefix' (but not below 'skip'), read as
+        files: name -> size and hash."""
+        result = {}
+        top = self.directory(prefix)
+        for path in sorted(top.rglob("*")):
+            name = str(path.relative_to(top))
+            if skip and (name + "/").startswith(skip + "/"):
+                continue
+            if path.is_file():
+                data = path.read_bytes()
+                result[name] = (f"{len(data)} bytes "
+                                f"{hashlib.sha256(data).hexdigest()[:16]}")
+        return result
+
+    def put_canaries(self, names: list, skip: str = "st") -> dict:
+        """Objects of the run's prefix next to the storage 'skip'. Returns
+        the inventory to compare with later (outside_changes)."""
+        for name in names:
+            self.api.put(f"{self.root}/{name}",
+                         f"canary {name}\n".encode())
+        return self.inventory("", skip)
+
+    def outside_changes(self, expected: dict, skip: str = "st") -> list:
+        """What changed among the objects of the run's prefix that are
+        not the storage's."""
+        now = self.inventory("", skip)
+        return [f"{name}: {expected.get(name, 'absent')} -> "
+                f"{now.get(name, 'absent')}"
+                for name in sorted(set(expected) | set(now))
+                if expected.get(name) != now.get(name)]
+
+    def reset_traffic(self, rules: "list | None" = None) -> None:
+        if self.proxy is not None:
+            self.proxy.set_rules(rules or [], reset_traffic=True)
+
+    def traffic(self) -> "dict | None":
+        """What binlog_server sent since the last reset: requests and body
+        bytes per method."""
+        if self.proxy is None:
+            return None
+        counters = self.proxy.state()["traffic"]
+        result = {}
+        for method in ("PUT", "GET", "DELETE"):
+            entry = counters.get(method)
+            if entry:
+                result[method.lower() + "_requests"] = entry["requests"]
+        put = counters.get("PUT", {})
+        result["put_bytes"] = put.get("request_bytes", 0)
+        result["largest_put_bytes"] = put.get("max_request_bytes", 0)
+        result["get_bytes"] = counters.get("GET", {}).get(
+            "response_bytes", 0)
+        return result
+
+    def remove(self, prefix: str = "") -> None:
+        """Deletes every object below 'prefix' of the run's own prefix:
+        with S3 requests, then what is left of the directory."""
+        top = f"{self.root}/{prefix}".rstrip("/")
+        try:
+            # the longest keys first: a directory object after its content
+            for key, _ in sorted(self.api.list(top + "/"), reverse=True):
+                self.api.delete(key)
+        except (harness.Failure, OSError):
+            pass
+        shutil.rmtree(self.bucket_dir / top, ignore_errors=True)
+
+    def close(self) -> list:
+        """Stops the proxy and deletes the run's prefix. Returns what is
+        left of it (nothing, if all went well)."""
+        if self.proxy is not None:
+            self.proxy.stop()
+        self.remove()
+        left = [key for key, _ in self.api.list(self.root + "/")]
+        if (self.bucket_dir / self.root).exists():
+            left.append(str(self.bucket_dir / self.root))
+        return left
 
 
 def name_of(number: int) -> str:
@@ -368,6 +705,12 @@ def build_source(tagged: bool) -> Truth:
 def make_config(storage: Path, flavour: str, path: Path) -> Path:
     config = json.loads(json.dumps(BASE_CONFIG))
     config["storage"] = {"backend": "file", "uri": f"file://{storage}"}
+    if S3 is not None:
+        # 'storage' is where the objects of the prefix are files
+        prefix = str(storage.relative_to(S3.directory()))
+        config["storage"] = {
+            "backend": "s3", "uri": S3.storage(prefix).uri(),
+            "fs_buffer_directory": str(buffer_directory(path))}
     if flavour == "encrypted":
         keyring = WORKDIR / "binsrv" / "keyring.json"
         keyring.write_text(json.dumps(tamper.KEYRING))
@@ -377,13 +720,19 @@ def make_config(storage: Path, flavour: str, path: Path) -> Path:
     return path
 
 
-def run_binsrv(config: Path, command: str, *arguments: str) -> dict:
+def buffer_directory(config: Path) -> Path:
+    """The 'fs_buffer_directory' of a configuration (S3 only)."""
+    return WORKDIR / "binsrv" / "buf" / config.stem
+
+
+def run_binsrv(config: Path, command: str, *arguments: str,
+               timeout: float = COMMAND_TIMEOUT_SECONDS) -> dict:
     argv = [str(BINARY), command, str(config), *arguments]
     record = {"cmd": " ".join(argv),
               "what": " ".join([command, *arguments])}
     try:
         completed = subprocess.run(
-            argv, capture_output=True, timeout=COMMAND_TIMEOUT_SECONDS,
+            argv, capture_output=True, timeout=timeout,
             check=False,
             env=dict(os.environ, AWS_EC2_METADATA_DISABLED="true"))
     except subprocess.TimeoutExpired:
@@ -426,7 +775,14 @@ class Box:
 
     def __init__(self, case: str, flavour: str):
         self.flavour = flavour
+        self.commands = []
+        self.edit = None
+        if S3 is not None:
+            self.init_s3(case, flavour)
+            return
         self.dir = WORKDIR / "c" / f"{case}-{flavour}"
+        # how an entry of the index names something next to the storage
+        self.absolute = str(self.dir)
         shutil.rmtree(self.dir, ignore_errors=True)
         self.dir.mkdir(parents=True)
         self.storage = self.dir / "st"
@@ -446,13 +802,71 @@ class Box:
         self.config = make_config(
             self.storage, flavour,
             WORKDIR / "binsrv" / f"{case}-{flavour}.json")
-        self.commands = []
-        self.edit = None
 
-    def run(self, command: str, *arguments: str) -> dict:
-        record = run_binsrv(self.config, command, *arguments)
+    def init_s3(self, case: str, flavour: str):
+        """The same on S3: the storage is the key prefix '<box>/st' of
+        the bucket, the canaries are objects of the sibling prefixes
+        '<box>/', '<box>/victim/' and '<box>/stx/' (which starts with the
+        storage's own prefix)."""
+        self.key = f"c/{case}-{flavour}"
+        S3.remove(self.key)
+        self.dir = S3.directory(self.key)
+        # an absolute key, as the S3 backend composes them
+        self.absolute = f"/{S3.root}/{self.key}"
+        self.storage = self.dir / "st"
+        objects = GOLDEN_OBJECTS[flavour]
+        first = name_of(1)
+        contents = {f"st/{name}": data for name, data in objects.items()}
+        contents["canary.txt"] = b"canary\n"
+        contents["keyring.json"] = json.dumps(tamper.KEYRING).encode()
+        for place in ("", "victim/", "stx/"):
+            contents[place + first] = objects[first]
+            contents[place + first + ".json"] = objects[first + ".json"]
+        for name, data in contents.items():
+            S3.api.put(f"{S3.root}/{self.key}/{name}", data)
+        self.config = make_config(
+            self.storage, flavour,
+            WORKDIR / "binsrv" / f"{case}-{flavour}.json")
+        self.buffer = buffer_directory(self.config)
+        shutil.rmtree(self.buffer, ignore_errors=True)
+
+    def run(self, command: str, *arguments: str,
+            timeout: float = COMMAND_TIMEOUT_SECONDS) -> dict:
+        record = run_binsrv(self.config, command, *arguments,
+                            timeout=timeout)
         self.commands.append(record)
+        if S3 is not None:
+            self.note_buffer(record)
         return record
+
+    def note_buffer(self, record: dict) -> None:
+        """What a command left in the buffer directory of the S3
+        storage."""
+        left = [f"{path.name}: {path.stat().st_size} bytes"
+                for path in sorted(self.buffer.glob("*")) if path.is_file()]
+        if left:
+            record["buffer_left"] = left
+            for path in self.buffer.glob("*"):
+                if path.is_file():
+                    path.unlink()
+
+    # -- the storage's objects, as the attacker reads and writes them --------
+    def read(self, name: str) -> bytes:
+        return (self.storage / name).read_bytes()
+
+    def write(self, name: str, data: bytes) -> None:
+        if S3 is not None and S3_EDIT == "put":
+            S3.api.put(f"{S3.root}/{self.key}/st/{name}", data)
+            return
+        if S3 is not None:
+            (self.storage / name).parent.mkdir(parents=True, exist_ok=True)
+        (self.storage / name).write_bytes(data)
+
+    def remove(self, name: str) -> None:
+        if S3 is not None and S3_EDIT == "put":
+            S3.api.delete(f"{S3.root}/{self.key}/st/{name}")
+        else:
+            (self.storage / name).unlink()
 
     def inventory(self) -> dict:
         result = {}
@@ -468,30 +882,28 @@ class Box:
 
     # -- the attacker's edits -----------------------------------------------
     def metadata(self, number: int) -> dict:
-        return json.loads(
-            (self.storage / (name_of(number) + ".json")).read_text())
+        return json.loads(self.read(name_of(number) + ".json"))
 
     def set_member(self, number: int, member: str, value) -> str:
-        path = self.storage / (name_of(number) + ".json")
-        metadata = json.loads(path.read_text())
+        name = name_of(number) + ".json"
+        metadata = json.loads(self.read(name))
         old = metadata.get(member, "<absent>")
         if value is tamper.REMOVE:
             metadata.pop(member, None)
             value = "<removed>"
         else:
             metadata[member] = value
-        path.write_text(json.dumps(metadata))
-        return f"{path.name} '{member}': {old!r} -> {value!r}"
+        self.write(name, json.dumps(metadata).encode())
+        return f"{name} '{member}': {old!r} -> {value!r}"
 
     def index(self) -> list:
         return [line for line in
-                (self.storage / "binlog.index").read_text().splitlines()
-                if line]
+                self.read("binlog.index").decode().splitlines() if line]
 
     def set_index(self, lines: list) -> str:
         old = self.index()
-        (self.storage / "binlog.index").write_text(
-            "".join(line + "\n" for line in lines))
+        self.write("binlog.index",
+                   "".join(line + "\n" for line in lines).encode())
         return f"binlog.index: {old} -> {lines}"
 
     def stored_names(self) -> list:
@@ -499,6 +911,9 @@ class Box:
 
     def discard(self):
         if not KEEP:
+            if S3 is not None:
+                S3.remove(self.key)
+                shutil.rmtree(self.buffer, ignore_errors=True)
             shutil.rmtree(self.dir, ignore_errors=True)
             self.config.unlink(missing_ok=True)
 
@@ -1102,12 +1517,12 @@ def member(number: int, name: str, value):
 
 def raw_metadata(number: int, content: "bytes | None"):
     def edit(box: Box) -> str:
-        path = box.storage / (name_of(number) + ".json")
+        name = name_of(number) + ".json"
         if content is None:
-            path.unlink()
-            return f"{path.name} deleted"
-        path.write_bytes(content)
-        return f"{path.name} replaced by {content!r}"
+            box.remove(name)
+            return f"{name} deleted"
+        box.write(name, content)
+        return f"{name} replaced by {content!r}"
     return edit
 
 
@@ -1117,11 +1532,10 @@ def tail_symlink_and_size(box: Box) -> str:
 
 
 def flip_mode(box: Box) -> str:
-    path = box.storage / "metadata.json"
-    metadata = json.loads(path.read_text())
+    metadata = json.loads(box.read("metadata.json"))
     old = metadata["mode"]
     metadata["mode"] = "position" if old == "gtid" else "gtid"
-    path.write_text(json.dumps(metadata))
+    box.write("metadata.json", json.dumps(metadata).encode())
     return f"metadata.json 'mode': {old!r} -> {metadata['mode']!r}"
 
 
@@ -1160,7 +1574,7 @@ PURGE_CASES = {
         first_line(lambda box: f"../{name_of(1)}"), name_of(1), False,
         "first entry '../binlog.000001' (the canary next to the storage)"),
     "purge_index_absolute_path": (
-        first_line(lambda box: f"{box.dir}/victim/{name_of(1)}"),
+        first_line(lambda box: f"{box.absolute}/victim/{name_of(1)}"),
         name_of(1), False, "first entry an absolute path into ../victim"),
     "purge_index_nested_path": (
         first_line(lambda box: f"./../victim/{name_of(1)}"), name_of(1),
@@ -1175,7 +1589,7 @@ PURGE_CASES = {
         first_line(lambda box: "./binlog.index"), name_of(2), False,
         "first entry './binlog.index'"),
     "purge_index_keyring_path": (
-        first_line(lambda box: f"{box.dir}/keyring.json"), name_of(2),
+        first_line(lambda box: f"{box.absolute}/keyring.json"), name_of(2),
         False, "first entry the path of the keyring canary"),
     # -- symbolic links
     "purge_symlink_data": (
@@ -1416,6 +1830,282 @@ def make_search_case(edit, kinds: tuple, to_replay, description: str):
 
 
 # ---------------------------------------------------------------------------
+# '--storage s3' only
+# ---------------------------------------------------------------------------
+
+# the cases that cannot exist on S3, and why
+FILE_ONLY = {
+    "purge_symlink_data":
+        "an S3 object cannot be a symbolic link (ticket 57 is about the "
+        "file storage)",
+    "purge_symlink_metadata":
+        "an S3 object cannot be a symbolic link (ticket 57 is about the "
+        "file storage)",
+    "purge_symlink_index":
+        "an S3 object cannot be a symbolic link (ticket 57 is about the "
+        "file storage)",
+    "purge_symlink_tail_size":
+        "an S3 object cannot be a symbolic link, so the start-up recovery "
+        "has no file outside the storage to truncate; what a lowered size "
+        "does to the object itself: purge_size_tail_lowered, "
+        "purge_size_tail_lowered_refused, s3_size_tail_lowered_upload_fails",
+}
+# how long the proxy holds the DELETE in which 'purge_binlogs' is killed
+KILL_STALL_SECONDS = 5
+# a purge whose DELETE requests fail retries each of them for a while
+FAILING_PURGE_TIMEOUT_SECONDS = 600
+
+
+def nested_binlog(box: Box) -> str:
+    first = name_of(1)
+    box.write(f"sub/{first}", box.read(first))
+    box.write(f"sub/{first}.json", box.read(first + ".json"))
+    return (f"objects 'sub/{first}' and 'sub/{first}.json' added below "
+            "the storage's prefix")
+
+
+def nested_tmp(box: Box) -> str:
+    box.write("sub/upload.tmp", b"not an object of the Binlog Server\n")
+    return "object 'sub/upload.tmp' added below the storage's prefix"
+
+
+# name: (edit, target of the purge, GTID mode only, what is expected)
+S3_PURGE_CASES = {
+    "s3_purge_index_sibling_prefix": (
+        first_line(lambda box: f"../stx/{name_of(1)}"), name_of(1), False,
+        "first entry '../stx/binlog.000001': an object of a sibling prefix "
+        "whose name starts with the storage's"),
+    "s3_purge_index_full_key": (
+        first_line(lambda box: f"{box.absolute[1:]}/victim/{name_of(1)}"),
+        name_of(1), False,
+        "first entry the full key of an object of a sibling prefix"),
+    "s3_purge_index_double_slash": (
+        first_line(lambda box: f".//{name_of(1)}"), name_of(1), False,
+        "first entry './/binlog.000001'"),
+    "s3_purge_index_trailing_slash": (
+        first_line(lambda box: f"./{name_of(1)}/"), name_of(1), False,
+        "first entry './binlog.000001/'"),
+    "s3_purge_nested_binlog": (
+        nested_binlog, name_of(2), False,
+        "a binlog and its metadata one level below the storage's prefix"),
+    "s3_purge_nested_tmp": (
+        nested_tmp, name_of(2), False,
+        "a '.tmp' object one level below the storage's prefix"),
+}
+
+
+def case_s3_purge_targets_outside(box: Box) -> dict:
+    """Targets that name keys outside the storage's prefix: all must be
+    refused, with nothing touched."""
+    first = name_of(1)
+    problems = []
+    targets = [f"../victim/{first}", f"../stx/{first}",
+               f"{box.absolute}/victim/{first}",
+               f"{box.absolute[1:]}/victim/{first}", f"..//victim/{first}",
+               f"/{first}", f"//{name_of(3)}", f"{name_of(3)}/",
+               f"st/{name_of(3)}", f".//{name_of(3)}"]
+    for target in targets:
+        problems += purge_and_check(box, target, clean=True)
+        if box.commands[-1]["exit"] == 0:
+            problems.append(f"'purge_binlogs {target!r}' was accepted")
+            break
+    return finish(box, problems)
+
+
+def changes(before: dict, after: dict) -> tuple:
+    removed = sorted(set(before) - set(after))
+    created = sorted(set(after) - set(before))
+    changed = sorted(name for name in set(before) & set(after)
+                     if before[name] != after[name])
+    return removed, created, changed
+
+
+def partial_purge(box: Box, before: dict, run: dict, target: str) -> tuple:
+    """What a purge that could not delete all of its objects leaves: the
+    problems, and the facts for the result line. The index is the commit
+    point of a purge, the objects of the purged binlogs are then deleted
+    one by one."""
+    problems = []
+    after = box.inventory()
+    removed, created, changed = changes(before, after)
+    requested = requested_objects(before, target)
+    left = sorted(requested - set(removed))
+    run.update(removed=removed, created=created,
+               changed=[f"{name}: {before[name]} -> {after[name]}"
+                        for name in changed], left_behind=left)
+    index_changed = "st/binlog.index" in changed
+    outside = [name for name in removed + created + changed
+               if name not in requested and name != "st/binlog.index"]
+    if outside:
+        problems.append(f"the interrupted purge removed, created or "
+                        f"changed {outside}")
+    if run["exit"] == 0 and run["status"] == "success" and left:
+        problems.append(f"'purge_binlogs {target}' answered success; "
+                        f"{left} are still there")
+    if run["exit"] == 1 and (index_changed or removed):
+        problems.append(f"'purge_binlogs {target}' answered with an error "
+                        f"({run['message']}) after it had changed the index "
+                        f"or removed {removed}")
+    survivors = [name for name in TRUTH.names
+                 if not index_changed or number_of(name) > number_of(target)]
+    facts = {"answer": f"exit {run['exit']}, status {run['status']}: "
+                       f"{run['message']}",
+             "index_changed": index_changed, "left_behind": left}
+    listed = box.run("list")
+    if listed["exit"] != 0 or listed["names"] != survivors:
+        problems.append(
+            f"after the interrupted purge 'list' exits {listed['exit']} "
+            f"with {listed['message'] or short(listed['names'])}; the "
+            f"index names binlogs {short(survivors)}")
+    problems += after_purge_probes(box, survivors)
+    # the next command that opens the storage for writing removes the
+    # leftovers ("left after an interrupted binlog purge")
+    fetch = box.run("fetch")
+    final = box.inventory()
+    stored = sorted(name[3:] for name in final
+                    if name.startswith("st/") and name[3:] in TRUTH.names)
+    orphans = sorted(name for name in final if name in requested)
+    facts.update(fetch_exit=fetch["exit"], left_after_fetch=orphans,
+                 binlogs_after_fetch=short(stored))
+    if fetch["exit"] != 0:
+        problems.append(f"the next fetch exits {fetch['exit']}: "
+                        f"{fetch['message'] or fetch['answer']}")
+    elif index_changed and orphans:
+        problems.append(f"the next fetch left {orphans} in the bucket")
+    elif stored != survivors:
+        problems.append(f"after the next fetch the storage holds binlogs "
+                        f"{short(stored)}, the index names "
+                        f"{short(survivors)}")
+    return problems, facts
+
+
+def case_s3_purge_delete_fails_midway(box: Box) -> dict:
+    """'purge_binlogs binlog.000003' while the S3 server answers every
+    DELETE from the third on with an error."""
+    target = name_of(3)
+    before = box.inventory()
+    S3.proxy.set_rules([{"method": "DELETE", "nth": 3, "count": 100000,
+                         "action": "error500"}])
+    started = time.monotonic()
+    try:
+        run = box.run("purge_binlogs", target,
+                      timeout=FAILING_PURGE_TIMEOUT_SECONDS)
+    finally:
+        seconds = round(time.monotonic() - started, 1)
+        failed_requests = sum(rule["applied"] for rule in
+                              S3.proxy.state()["rules"])
+        S3.proxy.set_rules([])
+    problems = [died(run)] if died(run) else []
+    more, facts = partial_purge(box, before, run, target)
+    return finish(box, problems + more, purge_seconds=seconds,
+                  delete_requests_failed=failed_requests, **facts)
+
+
+def case_s3_purge_killed_midway(box: Box) -> dict:
+    """'purge_binlogs binlog.000003' is killed (SIGKILL) while its third
+    DELETE is on its way."""
+    target = name_of(3)
+    before = box.inventory()
+    S3.proxy.set_rules([{"method": "DELETE", "nth": 3, "count": 1,
+                         "action": "stall",
+                         "seconds": KILL_STALL_SECONDS}])
+    argv = [str(BINARY), "purge_binlogs", str(box.config), target]
+    run = {"cmd": " ".join(argv),
+           "what": f"purge_binlogs {target} (SIGKILL in its third DELETE)",
+           "status": None, "message": None, "names": None, "answer": None}
+    box.commands.append(run)
+    process = subprocess.Popen(
+        argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, AWS_EC2_METADATA_DISABLED="true"))
+    try:
+        deadline = time.monotonic() + COMMAND_TIMEOUT_SECONDS
+        while process.poll() is None and time.monotonic() < deadline and \
+                len(changes(before, box.inventory())[0]) < 2:
+            time.sleep(0.05)
+        run["removed_at_the_kill"] = changes(before, box.inventory())[0]
+        killed = process.poll() is None
+        process.send_signal(signal.SIGKILL)
+        run["exit"] = process.wait()
+    finally:
+        # the DELETE that was held reaches the server after the kill
+        time.sleep(KILL_STALL_SECONDS + 1)
+        S3.proxy.set_rules([])
+    box.note_buffer(run)
+    problems = []
+    if not killed:
+        problems.append(f"purge_binlogs ended (exit {run['exit']}) before "
+                        "it could be killed: the case did not run")
+    # a killed command answers nothing; that is not judged
+    run["exit"] = None
+    more, facts = partial_purge(box, before, run, target)
+    return finish(box, problems + more, **facts)
+
+
+def case_s3_purge_index_put_fails(box: Box) -> dict:
+    """'purge_binlogs binlog.000003' while the S3 server refuses the upload
+    of binlog.index: the purge must fail with nothing deleted."""
+    S3.proxy.set_rules([{"method": "PUT", "match": "binlog.index",
+                         "count": 100000, "action": "error500"}])
+    try:
+        problems = purge_and_check(box, name_of(3))
+    finally:
+        S3.proxy.set_rules([])
+    purge = next(command for command in box.commands
+                 if command["what"].startswith("purge_binlogs"))
+    if purge["exit"] == 0:
+        problems.append("the purge answered " + str(purge["status"]) +
+                        " although binlog.index could not be uploaded")
+    return finish(box, problems)
+
+
+def case_s3_size_tail_lowered_upload_fails(box: Box) -> dict:
+    """A lowered size of the newest binlog (ticket 53) makes every start for
+    writing download the object into the buffer directory, truncate the
+    copy and upload it; here the S3 server refuses that upload."""
+    box.edit = box.set_member(BINLOGS, "size", tail_cut(box))
+    S3.proxy.set_rules([{"method": "PUT", "match": name_of(BINLOGS),
+                         "count": 100000, "action": "error500"}])
+    try:
+        problems = purge_and_check(box, name_of(1))
+    finally:
+        S3.proxy.set_rules([])
+    purge = next(command for command in box.commands
+                 if command["what"].startswith("purge_binlogs"))
+    if purge.get("buffer_left"):
+        problems.append(
+            "the failed truncation left a copy of the binlog in "
+            f"'fs_buffer_directory': {purge['buffer_left']}")
+    return finish(box, problems)
+
+
+def with_proxy(function):
+    def case(box: Box) -> dict:
+        if S3.proxy is None:
+            return {"ok": True, "skipped": "needs the proxy (not with "
+                                           "--no-s3-proxy)"}
+        return function(box)
+    case.__doc__ = function.__doc__
+    return case
+
+
+def build_s3_cases() -> dict:
+    """name -> (function, GTID mode only): the cases of '--storage s3'."""
+    cases = {}
+    for name, (edit, target, gtid_only,
+               description) in S3_PURGE_CASES.items():
+        cases[name] = (make_purge_case(edit, target, description), gtid_only)
+    cases["s3_purge_targets_outside"] = (case_s3_purge_targets_outside,
+                                         False)
+    for function in (case_s3_purge_delete_fails_midway,
+                     case_s3_purge_killed_midway,
+                     case_s3_purge_index_put_fails,
+                     case_s3_size_tail_lowered_upload_fails):
+        cases[function.__name__[len("case_"):]] = (with_proxy(function),
+                                                   False)
+    return cases
+
+
+# ---------------------------------------------------------------------------
 
 def build_cases() -> dict:
     """name -> (function, GTID mode only)."""
@@ -1443,13 +2133,17 @@ def build_cases() -> dict:
 
 
 CASES = build_cases()
+S3_CASES = build_s3_cases()
 
 
 def build_storages(flavours: list):
     for flavour in flavours:
         storage = WORKDIR / "golden" / flavour
-        shutil.rmtree(storage, ignore_errors=True)
-        storage.mkdir(parents=True)
+        if S3 is not None:
+            storage = S3.directory(f"golden/{flavour}")
+        else:
+            shutil.rmtree(storage, ignore_errors=True)
+            storage.mkdir(parents=True)
         config = make_config(storage, flavour,
                              WORKDIR / "binsrv" / f"golden-{flavour}.json")
         completed = subprocess.run(
@@ -1461,6 +2155,10 @@ def build_storages(flavours: list):
                 f"fetch into the {flavour} storage exited with "
                 f"{completed.returncode}: {completed.stderr[-400:]!r}")
         GOLDEN[flavour] = storage
+        if S3 is not None:
+            GOLDEN_OBJECTS[flavour] = {
+                path.name: path.read_bytes()
+                for path in sorted(storage.iterdir()) if path.is_file()}
 
 
 def main():
@@ -1473,9 +2171,11 @@ def main():
                              "replays listens on the next one")
     parser.add_argument("--mode", choices=["gtid", "position"],
                         default="position")
-    parser.add_argument("--cases", nargs="*", choices=list(CASES),
+    parser.add_argument("--cases", nargs="*",
+                        choices=list(CASES) + list(S3_CASES),
                         metavar="CASE",
-                        help="the cases to run (default: all of the mode)")
+                        help="the cases to run (default: all of the mode; "
+                             "with --storage s3 also the s3_* cases)")
     parser.add_argument("--flavours", nargs="*", choices=FLAVOURS,
                         default=FLAVOURS,
                         help="the storages to run the cases on")
@@ -1483,9 +2183,15 @@ def main():
                         help="no transaction with a tagged GTID")
     parser.add_argument("--keep", action="store_true",
                         help="keep the storage copy of every case")
+    add_s3_arguments(parser)
+    parser.add_argument("--s3-edit", choices=["put", "file"], default="put",
+                        help="how the edits are made on S3: with S3 "
+                             "requests, as someone with write access to "
+                             "the bucket would (default), or on the files "
+                             "of --s3-bucket-dir")
     args = parser.parse_args()
     global BINARY, WORKDIR, BASEDIR, GTID_MODE, SOURCE, SCRATCH_PORT, \
-        BASE_CONFIG, TRUTH, KEEP  # pylint: disable=global-statement
+        BASE_CONFIG, TRUTH, KEEP, S3, S3_EDIT  # pylint: disable=global-statement
     WORKDIR = args.workdir.expanduser().resolve()
     WORKDIR.mkdir(parents=True, exist_ok=True)
     BASEDIR = args.mysql_basedir.expanduser()
@@ -1505,11 +2211,24 @@ def main():
             REWRITE_FILE_SIZE
     shutil.rmtree(WORKDIR / "c", ignore_errors=True)
     names = args.cases or list(CASES)
+    all_cases = dict(CASES)
+    all_cases.update(S3_CASES)
+    s3_left = []
+    if args.storage == "s3":
+        if args.keep:
+            parser.error("--keep is for the file storage: the prefix of an "
+                         "S3 run is deleted at its end")
+        S3_EDIT = args.s3_edit
+        S3 = S3Setup(parser, args,
+                     f"purge-search-tamper-{args.mode}-{os.getpid()}",
+                     args.port + 2)
+        if args.cases is None:
+            names += list(S3_CASES)
     results = []
     started = time.monotonic()
     setup = {}
-    SOURCE.start()
     try:
+        SOURCE.start()
         tagged = (GTID_MODE and not args.no_tagged and
                   SOURCE.version() >= (8, 3, 0))
         TRUTH = build_source(tagged)
@@ -1527,17 +2246,30 @@ def main():
                      for binlog in TRUTH.binlogs]}
         print(json.dumps({"setup": setup}), flush=True)
         for name in names:
-            function, gtid_only = CASES[name]
+            function, gtid_only = all_cases[name]
             for flavour in args.flavours:
                 result = {"case": name, "storage": flavour}
+                if S3 is not None:
+                    # 'storage' tells the S3 lines from the file storage's
+                    result = {"case": name, "storage": "s3",
+                              "flavour": flavour}
+                skipped = None
                 if gtid_only and not GTID_MODE:
-                    result.update(ok=True, skipped="needs --mode gtid: GTID "
-                                  "sets are stored in GTID mode only")
+                    skipped = ("needs --mode gtid: GTID "
+                               "sets are stored in GTID mode only")
+                elif S3 is not None and name in FILE_ONLY:
+                    skipped = "not on S3: " + FILE_ONLY[name]
+                elif S3 is None and name in S3_CASES:
+                    skipped = "needs --storage s3"
+                if skipped:
+                    result.update(ok=True, skipped=skipped)
                     print(json.dumps(result), flush=True)
                     results.append(result)
                     break
                 case_started = time.monotonic()
                 box = Box(name, flavour)
+                if S3 is not None:
+                    S3.reset_traffic()
                 try:
                     result.update(function(box))
                 except (harness.Failure, RuntimeError, KeyError, ValueError,
@@ -1545,6 +2277,14 @@ def main():
                     result.update(
                         ok=False, why=harness.describe_failure(failure, 500),
                         edit=box.edit, commands=box.commands)
+                if S3 is not None:
+                    if S3.proxy is not None:
+                        result["s3_traffic"] = S3.traffic()
+                    buffer_left = [entry for command in box.commands
+                                   for entry in command.get("buffer_left",
+                                                            [])]
+                    if buffer_left:
+                        result["s3_buffer_left"] = buffer_left
                 box.discard()
                 result["seconds"] = round(time.monotonic() - case_started, 1)
                 results.append(result)
@@ -1569,19 +2309,28 @@ def main():
         shutil.rmtree(WORKDIR / "scratch", ignore_errors=True)
         if not KEEP:
             shutil.rmtree(WORKDIR / "c", ignore_errors=True)
+        if S3 is not None:
+            # the run's prefix does not outlive it either
+            s3_left = S3.close()
     failures = [result for result in results if not result.get("ok")]
     skipped = [result for result in results if result.get("skipped")]
-    print(json.dumps({
+    summary = {
         "cases": len(results), "failures": len(failures),
-        "failed": [f"{result['case']}/{result['storage']}"
+        "failed": [f"{result['case']}/"
+                   f"{result.get('flavour', result['storage'])}"
                    for result in failures],
         "skipped": len(skipped), "mode": args.mode,
         "seconds": round(time.monotonic() - started),
-        "passed": not failures}), flush=True)
+        "passed": not failures}
+    if S3 is not None:
+        summary.update(storage="s3", s3_prefix=S3.root, s3_edit=S3_EDIT,
+                       s3_left_behind=s3_left)
+        summary["passed"] = not failures and not s3_left
+    print(json.dumps(summary), flush=True)
     (WORKDIR / "result.json").write_text(
         json.dumps({"setup": setup, "results": results}, indent=2,
                    default=str))
-    return 1 if failures else 0
+    return 1 if failures or s3_left else 0
 
 
 if __name__ == "__main__":

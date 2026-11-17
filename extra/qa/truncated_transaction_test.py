@@ -119,6 +119,22 @@ Optional (--replica-crash, or named in --cases), GTID mode only:
                              'mysqlbinlog <file> | mysql'. The edited files
                              are kept in <workdir>/minimal
 
+With '--storage s3' the storage is the key prefix '<prefix>/st' of a bucket
+of an S3-compatible server whose objects are files under '--s3-bucket-dir'
+(where the checks read them); binlog_server reaches the server through an
+s3_fault_proxy.py of the run, which counts its requests ('s3_traffic').
+'pull' uses 'checkpoint_size' 1 here too, so the stub of a cut transaction
+reaches the bucket as soon as it is "complete". The lines carry "storage":
+"s3", the keys and sizes of the prefix at the end of the case ('s3_keys')
+and what is left in 'fs_buffer_directory' ('s3_buffer_left'); canary
+objects next to the storage's prefix fail a case if they are touched. The
+run deletes its prefix at the end ('s3_left_behind' lists what is left,
+which fails the run).
+On 2026-11-17 (local Versity gateway) the same 14 cases fail on S3 as on
+the file storage in every mode, with the same verdicts: the stub is in the
+object of the newest binlog and its GTID in the object's metadata. A run
+takes 3.5 minutes in position mode and 5.5 in GTID mode.
+
 A JSON line per case ('case', 'ok', 'verdict', and 'why' with the evidence
 on failure), then a summary; result.json in the work directory; exit 1 if
 any case failed. The default run takes 3 to 5 minutes with a debug build
@@ -134,6 +150,7 @@ Ports: --port (the source), +1 (the replica), +2 ('pull'), +3 (the proxy),
 
 import argparse
 import json
+import os
 import shutil
 import signal
 import socket
@@ -152,6 +169,7 @@ import fetch_crash_test as harness  # noqa: E402
 import hostile_source_test as hostile  # noqa: E402
 import metadata_tamper_test as tamper  # noqa: E402
 import pull_replica_test as replication  # noqa: E402
+import purge_search_tamper_test as s3tools  # noqa: E402
 import replica_tamper_test as replica_tamper  # noqa: E402
 import rewrite_attack_test as rw  # noqa: E402
 
@@ -193,6 +211,11 @@ REWRITE = False
 FILE_SIZE = "1M"
 REPLICA_ALL = False
 WORKDIR: Path = None
+# an s3tools.S3Setup with '--storage s3'
+S3 = None
+# objects next to the storage's prefix that nothing may touch
+S3_CANARIES = ["canary/binlog.000001", "canary/binlog.index",
+               "stx/binlog.000001", "binlog.000001", "metadata.json"]
 EDITED_SOURCE: harness.MySQLServer = None
 
 
@@ -1426,6 +1449,40 @@ CASES = {name: run_scenario for name in SCENARIOS}
 CASES.update(OPTIONAL_CASES)
 
 
+def s3_facts(result: dict, canaries: dict) -> None:
+    """'--storage s3': marks the result line, adds what binlog_server
+    sent to the S3 server in the case and what the storage's prefix and
+    the buffer directory hold at its end, and fails the case if an object
+    outside the storage's prefix was created, changed or deleted."""
+    result["storage"] = "s3"
+    binsrv = harness.BINSRV
+    traffic = S3.traffic()
+    if traffic is not None:
+        stored = sum(path.stat().st_size
+                     for path in binsrv.storage.rglob("*") if path.is_file())
+        traffic["stored_bytes_at_the_end"] = stored
+        if stored:
+            traffic["put_bytes_per_stored_byte"] = round(
+                traffic["put_bytes"] / stored, 1)
+        result["s3_traffic"] = traffic
+    result["s3_keys"] = sorted(
+        f"{repr(key)[1:-1][len(S3.root) + 1:][:60]}:{size}"
+        for key, size in S3.api.list(f"{S3.root}/st/"))[-14:]
+    buffer = binsrv.workdir / "s3-buffer"
+    left = [f"{path.name}: {path.stat().st_size} bytes"
+            for path in sorted(buffer.glob("*"))] if buffer.is_dir() else []
+    if left:
+        result["s3_buffer_left"] = left[:6]
+    outside = S3.outside_changes(canaries)
+    if outside:
+        result["s3_outside_the_prefix"] = outside[:10]
+        result["ok"] = False
+        result["why"] = (result.get("why", "") + "; " if result.get("why")
+                         else "") + (
+            "objects OUTSIDE the storage's prefix were created, changed or "
+            "deleted: " + "; ".join(outside[:4]))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--mysql-basedir", type=Path, required=True)
@@ -1449,13 +1506,14 @@ def main():
     parser.add_argument("--replica-all", action="store_true",
                         help="run a replica of 'pull' in every case that "
                              "ends with a stub in the storage")
+    s3tools.add_s3_arguments(parser)
     args = parser.parse_args()
     if args.rewrite and args.mode != "gtid":
         parser.error("--rewrite needs --mode gtid")
     args.workdir = args.workdir.expanduser()
     args.workdir.mkdir(parents=True, exist_ok=True)
     # pylint: disable-next=global-statement
-    global GTID_MODE, REWRITE, REPLICA_ALL, WORKDIR, EDITED_SOURCE
+    global GTID_MODE, REWRITE, REPLICA_ALL, WORKDIR, EDITED_SOURCE, S3
     GTID_MODE = args.mode == "gtid"
     REWRITE = args.rewrite
     REPLICA_ALL = args.replica_all
@@ -1472,22 +1530,37 @@ def main():
     EDITED_SOURCE = harness.MySQLServer(rw.MYSQL_BASEDIR,
                                         args.workdir / "source2",
                                         args.port + 4, True, server_id=3)
+    s3_storage = None
+    if args.storage == "s3":
+        # the storage is '<prefix>/st'
+        S3 = s3tools.S3Setup(
+            parser, args,
+            "truncated-transaction-" + args.mode +
+            ("-rewrite" if REWRITE else "") + f"-{os.getpid()}",
+            args.port + 9)
+        s3_storage = S3.storage("st")
     harness.BINSRV = harness.BinlogServer(args.binsrv.expanduser(),
                                           args.workdir / "binsrv", args.port,
-                                          GTID_MODE, None)
+                                          GTID_MODE, s3_storage)
     cases = args.cases
     if cases is None:
         cases = list(SCENARIOS) + (list(OPTIONAL_CASES)
                                    if args.replica_crash else [])
     results = []
+    s3_left = []
     started = time.monotonic()
     # a replica that died of what it was sent may die again when it starts
     shutil.rmtree(rw.REPLICA.datadir, ignore_errors=True)
-    harness.SERVER.start()
     try:
+        harness.SERVER.start()
         rw.REPLICA.start()
         for name in cases:
             case_started = time.monotonic()
+            canaries = None
+            if S3 is not None:
+                S3.remove()
+                canaries = S3.put_canaries(S3_CANARIES)
+                S3.reset_traffic()
             try:
                 result = CASES[name](name)
             except (harness.Failure, RuntimeError,
@@ -1496,6 +1569,8 @@ def main():
                           "why": harness.describe_failure(failure, 600)}
                 if harness.SERVER.process is None:
                     harness.SERVER.start()
+            if S3 is not None:
+                s3_facts(result, canaries)
             result["mode"] = args.mode + ("+rewrite" if REWRITE else "")
             result["seconds"] = round(time.monotonic() - case_started, 1)
             print(json.dumps(result), flush=True)
@@ -1504,13 +1579,21 @@ def main():
         rw.REPLICA.stop()
         harness.SERVER.stop()
         EDITED_SOURCE.stop()
+        if S3 is not None:
+            # the run's prefix does not outlive it
+            s3_left = S3.close()
     failures = [result for result in results if not result.get("ok")]
-    print(json.dumps({"cases": len(results), "failures": len(failures),
-                      "failed": [result["case"] for result in failures],
-                      "seconds": round(time.monotonic() - started),
-                      "passed": not failures}), flush=True)
+    summary = {"cases": len(results), "failures": len(failures),
+               "failed": [result["case"] for result in failures],
+               "seconds": round(time.monotonic() - started),
+               "passed": not failures}
+    if S3 is not None:
+        summary.update(storage="s3", s3_prefix=S3.root,
+                       s3_left_behind=s3_left,
+                       passed=not failures and not s3_left)
+    print(json.dumps(summary), flush=True)
     (args.workdir / "result.json").write_text(json.dumps(results, indent=2))
-    return 1 if failures else 0
+    return 1 if failures or s3_left else 0
 
 
 if __name__ == "__main__":

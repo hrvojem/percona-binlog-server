@@ -107,6 +107,28 @@ while the attack lasts):
 For these the harness also stops the attack while 'pull' is still running
 and records whether it catches up without a restart.
 
+With '--storage s3' the storage is the key prefix '<prefix>/st' of a bucket
+of an S3-compatible server whose objects are files under '--s3-bucket-dir'
+(where the checks read them); 'pull' reaches the server through an
+s3_fault_proxy.py of the run, which counts what it uploads: every flush
+uploads the whole object again (ticket 17), so 's3_traffic' of a result
+and 's3_put_bytes' of its 'attack' say what a hostile source makes 'pull'
+upload. Canary objects under the sibling prefixes '<prefix>/',
+'<prefix>/canary/' and '<prefix>/stx/' fail a case if they are touched,
+and three more names run ('s3_name_parent_prefix', 's3_name_absolute_key',
+'s3_name_sibling_prefix': names with a path in them, which would be keys
+outside the storage's prefix). The lines carry "storage": "s3"; the run
+deletes its prefix at the end ('s3_left_behind' lists what is left, which
+fails the run).
+On 2026-11-17 (local Versity gateway) the same cases fail on S3 as on the
+file storage, with the same reasons (9 of 20 in position mode, 6 of 23 in
+GTID mode). The three names with a path are refused ("binlog base name
+contains filesystem separator") with no request sent for them and no
+canary touched; in position mode they fail like 'long_name', because the
+ROTATE event that carries the name is stored before the name is refused.
+A reconnect loop uploads and downloads nothing. A run takes 6 minutes in
+position mode and 10 in GTID mode.
+
 --mode position (default) or gtid; GTID mode always runs with
 'replication.rewrite' (mandatory there since PBS-80 / PBS-98; the results
 carry "mode": "gtid_rewrite"), and --rewrite, which needs --mode gtid, is
@@ -122,6 +144,7 @@ any case failed. Example:
 
 import argparse
 import json
+import os
 import re
 import shutil
 import signal
@@ -139,6 +162,7 @@ import fetch_crash_test as harness  # noqa: E402
 import hostile_source_test as hostile  # noqa: E402
 import metadata_tamper_test as tamper  # noqa: E402
 import pull_replica_test as replication  # noqa: E402
+import purge_search_tamper_test as s3tools  # noqa: E402
 import rewrite_attack_test as rewrite  # noqa: E402
 
 IDLE_TIME = 1
@@ -187,8 +211,29 @@ FETCH_KNOWN = {
                      "gtid_other_uuid": 81, "length_smaller": 82},
 }
 
+# run by default with '--storage s3' only: names with a path in them for
+# the source's next binlog. An S3 key is the storage's prefix plus the
+# name, and the S3 server resolves '..' in a key, so that these would name
+# objects of other prefixes of the bucket (the canaries of main()). On the
+# file storage (when named in --cases, for comparison) they point next to
+# the storage directory.
+S3_NAME_CASES = {
+    "s3_name_parent_prefix": lambda n: b"../canary/binlog.%06d" % n,
+    "s3_name_absolute_key": lambda n: b"/%s/canary/binlog.%06d" % (
+        (S3.root if S3 is not None else
+         str(harness.BINSRV.workdir).strip("/")).encode(), n),
+    "s3_name_sibling_prefix": lambda n: b"../stx/binlog.%06d" % n,
+}
+S3_CANARIES = [f"{place}binlog.{number:06d}{suffix}"
+               for place in ("canary/", "stx/", "")
+               for number in range(1, 5) for suffix in ("", ".json")] + [
+    "canary/binlog.index", "canary/metadata.json", "binlog.index",
+    "metadata.json"]
+
 # set by main()
 ARGS = None
+# an s3tools.S3Setup with '--storage s3'
+S3 = None
 MODE = "position"
 CASE = ""
 REPLICA: harness.MySQLServer = None
@@ -198,7 +243,8 @@ PULL_PORT = 0
 def all_cases() -> list:
     names = rewrite.NAME_CASES if MODE == "gtid_rewrite" else NAME_CASES
     return (["control"] + names + hostile.RESOURCE_CASES +
-            hostile.STREAM_CASES + TRANSACTION_CASES + LIVE_CASES)
+            hostile.STREAM_CASES + TRANSACTION_CASES + LIVE_CASES +
+            (list(S3_NAME_CASES) if S3 is not None else []))
 
 
 def kind_of(name: str) -> str:
@@ -730,9 +776,45 @@ def replica_matches() -> bool:
         return False
 
 
+STOP_REPLICA_SECONDS = 30
+STUCK_REPLICA = []
+
+
+def bounded_replica_sql(statements: str) -> str:
+    """REPLICA.sql() with a limit. A MySQL 8.0 applier that was sent a
+    cut-off transaction (ticket 82) never finishes STOP REPLICA: the
+    coordinator waits for the end of the group, rpl_stop_replica_timeout
+    is a year. Such a server is killed (the next case sets it up again);
+    returns what happened, or ''."""
+    try:
+        completed = subprocess.run(
+            [str(REPLICA.basedir / "bin" / "mysql"), "--no-defaults",
+             f"--socket={REPLICA.socket}", "-uroot", "-N", "-B", "-e",
+             statements], capture_output=True, text=True,
+            timeout=STOP_REPLICA_SECONDS, check=False)
+    except subprocess.TimeoutExpired:
+        try:
+            state = REPLICA.sql(
+                "SELECT GROUP_CONCAT(DISTINCT STATE SEPARATOR ' / ') FROM "
+                "information_schema.processlist WHERE USER = "
+                "'system user' OR INFO LIKE 'STOP REPLICA%'").strip()
+        except RuntimeError as error:
+            state = str(error)[:80]
+        REPLICA.process.kill()
+        REPLICA.process.wait()
+        stuck = (f"'{statements[:40]}' did not return in "
+                 f"{STOP_REPLICA_SECONDS} s (replica threads: {state}); "
+                 "the replica server was killed")
+        STUCK_REPLICA.append(stuck)
+        return stuck
+    if completed.returncode != 0:
+        raise RuntimeError(f"SQL failed: {completed.stderr.strip()}")
+    return ""
+
+
 def replica_sql(statements: str):
     try:
-        REPLICA.sql(statements)
+        bounded_replica_sql(statements)
     except RuntimeError:
         if not replica_died():
             raise
@@ -976,7 +1058,10 @@ def start_attack(name: str, proxy, result: dict):
     if kind in ("name", "resource"):
         upcoming = int(source.binlog_names()[-1].rsplit(".", 1)[1]) + 1
         proxy.old_name = proxy.new_name = b"binlog.%06d" % upcoming
-        if kind == "name":
+        if kind == "name" and name in S3_NAME_CASES:
+            proxy.new_name = S3_NAME_CASES[name](upcoming)
+            result["hostile_name"] = repr(proxy.new_name)[:80]
+        elif kind == "name":
             proxy.new_name = (
                 rewrite.storage_file_names(len(binsrv.indexed_binlogs()),
                                            upcoming)[name]
@@ -1042,7 +1127,8 @@ def run_case(name: str, proxy_port: int) -> dict:
         # the storage's first binlog is then not binlog.000001; the purged
         # binlogs hold nothing, so a replica can still start from the rest
         source.sql("DROP TABLE qa.t")
-        source.sql("RESET BINARY LOGS AND GTIDS")
+        source.sql("RESET BINARY LOGS AND GTIDS"
+                   if source.version() >= (8, 2, 0) else "RESET MASTER")
         for _ in range(hostile.PURGED_BINLOGS):
             source.sql("FLUSH BINARY LOGS")
         source.sql("PURGE BINARY LOGS TO 'binlog.%06d'" %
@@ -1089,6 +1175,7 @@ def run_case(name: str, proxy_port: int) -> dict:
         connections = len(proxy.connect_times)
         log_before = len(pull.log().encode())
         started = time.monotonic()
+        uploads_before = S3.traffic() if S3 is not None else None
         start_attack(name, proxy, result)
         window = ARGS.observe
         if stalls:
@@ -1109,6 +1196,22 @@ def run_case(name: str, proxy_port: int) -> dict:
         attack["pull_seconds_until_exit"] = (
             round(exited_at - started, 1) if exited_at else None)
         attack["pull_errors"] = pull.errors()
+        if uploads_before is not None:
+            # what 'pull' uploaded while the attack was watched
+            uploads = S3.traffic()
+            attack["s3_put_requests"] = (uploads.get("put_requests", 0) -
+                                         uploads_before.get("put_requests",
+                                                            0))
+            attack["s3_put_bytes"] = (uploads["put_bytes"] -
+                                      uploads_before["put_bytes"])
+            attack["s3_put_bytes_per_minute"] = round(
+                attack["s3_put_bytes"] * 60 / max(seconds, 1))
+            # and downloaded (the listener's clients read through GET too)
+            attack["s3_get_requests"] = (uploads.get("get_requests", 0) -
+                                         uploads_before.get("get_requests",
+                                                            0))
+            attack["s3_get_bytes"] = (uploads["get_bytes"] -
+                                      uploads_before["get_bytes"])
         if isinstance(proxy, NameProxy) and name in hostile.STREAM_CASES:
             attack["injected_at"] = proxy.injections + (
                 [proxy.injected_at] if proxy.injected_at is not None else [])
@@ -1366,16 +1469,54 @@ def run_case(name: str, proxy_port: int) -> dict:
                     process.process.kill()
                     process.process.wait()
         try:
-            REPLICA.sql("STOP REPLICA")
+            bounded_replica_sql("STOP REPLICA")
         except RuntimeError:
             # the replica server died; the next case sets it up again
             pass
+        if STUCK_REPLICA:
+            result["replica_stuck"] = list(STUCK_REPLICA)
+            problems.append("the replica could not be stopped: " +
+                            STUCK_REPLICA[0])
+            STUCK_REPLICA.clear()
     # the same problem is not reported twice
     problems = list(dict.fromkeys(problems))
     result["ok"] = not problems
     if problems:
         result["why"] = "; ".join(problems)
     return result
+
+
+def s3_facts(result: dict, canaries: dict) -> None:
+    """'--storage s3': marks the result line, adds what 'pull' sent to the
+    S3 server in the case, and fails the case if an object outside the
+    storage's prefix was created, changed or deleted."""
+    result["storage"] = "s3"
+    binsrv = harness.BINSRV
+    traffic = S3.traffic()
+    if traffic is not None:
+        stored = sum(path.stat().st_size
+                     for path in binsrv.storage.rglob("*") if path.is_file())
+        traffic["stored_bytes_at_the_end"] = stored
+        if stored:
+            traffic["put_bytes_per_stored_byte"] = round(
+                traffic["put_bytes"] / stored, 1)
+        result["s3_traffic"] = traffic
+    result["s3_keys"] = sorted(
+        repr(key)[1:-1][len(S3.root) + 1:][:60]
+        for key, _ in S3.api.list(f"{S3.root}/st/"))[-14:]
+    buffer = binsrv.workdir / "s3-buffer"
+    left = [f"{path.name}: {path.stat().st_size} bytes"
+            for path in sorted(buffer.glob("*"))] if buffer.is_dir() else []
+    if left:
+        result["s3_buffer_left"] = left[:6]
+    outside = S3.outside_changes(canaries)
+    if outside:
+        result["s3_outside_the_prefix"] = outside[:10]
+        result["ok"] = False
+        result["why"] = (result.get("why", "") + "; " if result.get("why")
+                         else "") + (
+            "objects OUTSIDE the storage's prefix were created, changed or "
+            "deleted: " + "; ".join(outside[:4]))
 
 
 def main():
@@ -1400,10 +1541,12 @@ def main():
                         help="seconds the attack is watched")
     parser.add_argument("--recover", type=float, default=15,
                         help="seconds the clean restart gets to catch up")
+    s3tools.add_s3_arguments(parser)
     args = parser.parse_args()
     if args.rewrite and args.mode != "gtid":
         parser.error("--rewrite needs --mode gtid")
-    global ARGS, MODE, REPLICA, PULL_PORT  # pylint: disable=global-statement
+    # pylint: disable-next=global-statement
+    global ARGS, MODE, REPLICA, PULL_PORT, S3
     ARGS = args
     # 'replication.rewrite' is mandatory in GTID mode since PBS-80 /
     # PBS-98 (upstream 4717df9): --mode gtid always runs the rewrite cases
@@ -1411,10 +1554,21 @@ def main():
     args.mysql_basedir = args.mysql_basedir.expanduser()
     args.workdir = args.workdir.expanduser()
     args.workdir.mkdir(parents=True, exist_ok=True)
-    cases = args.cases or DEFAULT_CASES[MODE]
+    s3_storage = None
+    if args.storage == "s3":
+        # the storage is '<prefix>/st'; the proxy of the S3 traffic listens
+        # above the ports of the source proxies
+        S3 = s3tools.S3Setup(
+            parser, args,
+            f"hostile-source-pull-{MODE}-{os.getpid()}",
+            args.port + 30)
+        s3_storage = S3.storage("st")
+    cases = args.cases or DEFAULT_CASES[MODE] + (
+        list(S3_NAME_CASES) if S3 is not None else [])
     if cases == ["all"]:
         cases = all_cases()
-    unknown = [name for name in cases if name not in all_cases()]
+    unknown = [name for name in cases
+               if name not in all_cases() + list(S3_NAME_CASES)]
     if unknown or len(set(cases)) != len(cases):
         parser.error(f"unknown or repeated cases {unknown}; the cases of "
                      f"this mode: {' '.join(all_cases())}")
@@ -1428,35 +1582,51 @@ def main():
                                   gtid_mode, server_id=2)
     harness.BINSRV = harness.BinlogServer(args.binsrv.expanduser(),
                                           args.workdir / "binsrv", args.port,
-                                          gtid_mode)
+                                          gtid_mode, s3_storage)
     results = []
+    s3_left = []
     started = time.monotonic()
     # a replica that died of what it was sent may die again when it starts
     shutil.rmtree(REPLICA.datadir, ignore_errors=True)
-    harness.SERVER.start()
     try:
+        harness.SERVER.start()
         REPLICA.start()
         for index, name in enumerate(cases):
             case_started = time.monotonic()
+            canaries = None
+            if S3 is not None:
+                S3.remove()
+                canaries = S3.put_canaries(S3_CANARIES)
+                S3.reset_traffic()
             try:
                 result = run_case(name, args.port + 3 + index % 20)
             except (harness.Failure, RuntimeError,
                     subprocess.SubprocessError, OSError) as failure:
                 result = {"case": name, "mode": MODE, "ok": False,
                           "why": harness.describe_failure(failure, 700)}
+            if S3 is not None:
+                s3_facts(result, canaries)
             result["seconds"] = round(time.monotonic() - case_started, 1)
             print(json.dumps(result), flush=True)
             results.append(result)
     finally:
         REPLICA.stop()
         harness.SERVER.stop()
+        if S3 is not None:
+            # the run's prefix does not outlive it
+            s3_left = S3.close()
     failures = [result for result in results if not result.get("ok")]
-    print(json.dumps({"cases": len(results), "failures": len(failures),
-                      "failed": [result["case"] for result in failures],
-                      "seconds": round(time.monotonic() - started),
-                      "passed": not failures}), flush=True)
+    summary = {"cases": len(results), "failures": len(failures),
+               "failed": [result["case"] for result in failures],
+               "seconds": round(time.monotonic() - started),
+               "passed": not failures}
+    if S3 is not None:
+        summary.update(storage="s3", s3_prefix=S3.root,
+                       s3_left_behind=s3_left,
+                       passed=not failures and not s3_left)
+    print(json.dumps(summary), flush=True)
     (args.workdir / "result.json").write_text(json.dumps(results, indent=2))
-    return 1 if failures else 0
+    return 1 if failures or s3_left else 0
 
 
 if __name__ == "__main__":

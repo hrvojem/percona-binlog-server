@@ -38,13 +38,13 @@ hostile_source_test position/newline  ticket 59 (PBS-131): a newline in a binlog
 listener_replica_dos_test gtid/huge_gtid_set*  ticket 61 (PBS-135): a logged-in replica's COM_BINLOG_DUMP_GTID with a 1,000,000-interval GTID set (16 MB) occupies the listener for about 12 s, during which no other client is served, and leaves about 100 MB of resident memory behind
 metadata_tamper_test position/strip_encryption  ticket 62: with the 'encryption' record removed from the last binlog's metadata, the next fetch appends plaintext to the encrypted storage and exits 0 (validate_binlog_encryption_record checks a record only when it is present)
 metadata_tamper_test position/transplant_encryption  ticket 63: an 'encryption' record copied from another binlog's metadata is accepted (the wrapped file key is not bound to its binlog), so the appended data reuses that binlog's AES-CTR keystream
-secrets_exposure_test position/s3_unencoded_*  ticket 64: a storage URI whose S3 secret key holds a '/' that is not percent-encoded parses without user info, so the 'binlog storage backend URI (masked)' log line carries the secret
+secrets_exposure_test position/s3_unencoded_*  ticket 64 (PBS-159): a storage URI whose S3 secret key holds a '/' that is not percent-encoded parses without user info, so the 'binlog storage backend URI (masked)' log line carries the secret
 file_security_test position/s3_buffer  ticket 65: the S3 backend's local buffer under $TMPDIR is created 0755 / 0644 under umask 022, and an existing fs_buffer_directory of mode 0777 is accepted
 file_security_test position/telemetry_symlinks  ticket 66: a symlink planted under the next telemetry report's temporary name ('<unix seconds>-<tag>.tmp', both predictable) is written through, and the target's mode becomes 0644
 listener_login_test position/user_name_probe  ticket 67: once a client has logged in, a wrong scramble gets ERR 1045 at once for the configured user name and 'perform full authentication' for any other name
 hostile_source_test position/reannounce  ticket 69: an artificial ROTATE that names the binlog just closed, at position 4, reopens it for append: a second FORMAT_DESCRIPTION and the next binlog's events follow its ROTATE, and fetch exits 0
-hostile_source_test */lower_sequence  ticket 70: a binlog with a lower sequence number than the first stored one is created and indexed, and the next start takes it for the leftover of an interrupted purge ('binlog index contains a reference to a non-existing object')
-hostile_source_test position/case_variant  ticket 71: on a file system that ignores case (--case-insensitive-dir), 'BINLOG.000001' is new to binlog.index and is opened with truncation, which replaces the stored 'binlog.000001'
+hostile_source_test */lower_sequence  ticket 70 (PBS-158): a binlog with a lower sequence number than the first stored one is created and indexed, and the next start takes it for the leftover of an interrupted purge ('binlog index contains a reference to a non-existing object')
+hostile_source_test position/case_variant  ticket 71 (PBS-157): on a file system that ignores case (--case-insensitive-dir), 'BINLOG.000001' is new to binlog.index and is opened with truncation, which replaces the stored 'binlog.000001'
 listener_login_test position/long_statement  ticket 72: a COM_QUERY of 'SET' and 100,000 spaces from a logged-in client is matched with std::regex, which recurses per character: pull ends with SIGSEGV (debug and release builds)
 metadata_tamper_test */encryption_null  ticket 62: 'encryption': null in the last binlog's metadata is taken as no record, like a removed one: fetch appends plaintext and exits 0
 metadata_tamper_test */data_iv_counter_lowered  ticket 63: with the block counter in the stored data IV lowered by size / 16, the appended data is encrypted with the keystream of the same binlog's start (no second binlog needed)
@@ -64,19 +64,19 @@ metadata_tamper_test */key_iv_*  ticket 73: as cipher_*, through a key-wrapping 
 metadata_tamper_test */key_tag_added  ticket 73: as cipher_*, through a tag on a CTR-wrapped file key
 metadata_tamper_test */gcm_file_key_changed  ticket 73: the GCM tag detects the changed wrapped key at the final flush, but fetch exits 0 with nothing stored
 metadata_tamper_test */gcm_key_*  ticket 73: as gcm_file_key_changed, through the tag or the key-wrapping IV
-listener_login_test position/plain_password_without_tls  ticket 76: a line feed in the user name of a failed login puts a line of the client's choosing into the pull log (the user name is logged raw, and without a length limit)
-listener_command_fuzz_test */query_max_frame  ticket 74: one COM_QUERY of 16 MB is run through four std::regex searches on the listener's only thread: no client is served for 25 s (debug build; 3 s on a release build)
-listener_command_fuzz_test */heartbeat_1*ns_blocking_dump  ticket 75: a heartbeat period of 1 ns or 1,000 ns is accepted, and an idle blocking dump then sends and logs thousands of heartbeats a second: one core busy and megabytes of log every second
+listener_login_test position/plain_password_without_tls  ticket 76 (PBS-152): a line feed in the user name of a failed login puts a line of the client's choosing into the pull log (the user name is logged raw, and without a length limit)
+listener_command_fuzz_test */query_max_frame  ticket 74 (PBS-156): one COM_QUERY of 16 MB is run through four std::regex searches on the listener's only thread: no client is served for 25 s (debug build; 3 s on a release build)
+listener_command_fuzz_test */heartbeat_1*ns_blocking_dump  ticket 75 (PBS-155): a heartbeat period of 1 ns or 1,000 ns is accepted, and an idle blocking dump then sends and logs thousands of heartbeats a second: one core busy and megabytes of log every second
 listener_command_fuzz_test */regex_run_*  ticket 72: other statements with a run of 40,000 or more characters matched by one of the handshake patterns (digits after the heartbeat period, white space in any SET statement) end pull the same way
 final_flush_test */disk/*  ticket 73: ENOSPC or EIO on the write or fsync of the binlog data, or on saving the binlog metadata, in the flush fetch runs at exit: the storage destructor drops the error, fetch logs 'successfully fetched everything' and exits 0, and the new data is not recorded
 final_flush_test */s3/*  ticket 73: the same with every PUT of the binlog object or of its metadata failing (needs --s3-fault-proxy; not run by the nightly)
 replica_tamper_test */forged_row  ticket 53 (PBS-126): a row value changed in the encrypted storage without the key (ciphertext XOR, CRC32 footer patched) is served by pull and applied by a MySQL replica, with no error on either side
 replica_tamper_test */plaintext_swap  ticket 62 (PBS-136): the data file of an encrypted binlog replaced with plaintext events (a row value of the attacker's choice, correct CRC32) and the 'encryption' member deleted from its metadata: pull serves it and a MySQL replica applies the row, with no error on either side
 file_security_test position/s3_buffer_swap  ticket 65: the S3 buffer file is opened again by path after the download: a file or symlink renamed over it by someone who can write an existing 0777 fs_buffer_directory is uploaded as the binlog object, and the symlink's target is appended to or truncated
-s3_upload_tamper_test */put_*_changed  ticket 78: with an http:// endpoint the uploads are sent with UNSIGNED-PAYLOAD and no checksum: a proxy on the path changes the body of a binlog or metadata PUT, the server answers 200 and fetch exits 0
-s3_upload_tamper_test */get_body_changed  ticket 78: the body of a GET of the binlog object changed on the way is taken by the resumed fetch, appended to and uploaded again
-listener_command_fuzz_test */query_max_frame/tls  ticket 74: as without TLS
-listener_command_fuzz_test */heartbeat_1*ns_blocking_dump/tls  ticket 75: as without TLS
+s3_upload_tamper_test */put_*_changed  ticket 78 (PBS-154): with an http:// endpoint the uploads are sent with UNSIGNED-PAYLOAD and no checksum: a proxy on the path changes the body of a binlog or metadata PUT, the server answers 200 and fetch exits 0
+s3_upload_tamper_test */get_body_changed  ticket 78 (PBS-154): the body of a GET of the binlog object changed on the way is taken by the resumed fetch, appended to and uploaded again
+listener_command_fuzz_test */query_max_frame/tls  ticket 74 (PBS-156): as without TLS
+listener_command_fuzz_test */heartbeat_1*ns_blocking_dump/tls  ticket 75 (PBS-155): as without TLS
 listener_command_fuzz_test */regex_run_*/tls  ticket 72: as without TLS
 final_flush_test */pull_sig*/data*  ticket 73: pull stopped by SIGTERM or SIGINT with a fault on the flush it runs at exit logs 'successfully shut down after receiving a termination signal' and exits 0 while the new data is not recorded
 final_flush_test */pull_sig*/metadata*  ticket 73: the same with the fault on saving the binlog metadata
@@ -144,7 +144,7 @@ hostile_source_pull_test position/newline  ticket 59 (PBS-131): a hostile binlog
 hostile_source_pull_test position/dot_dot  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
 hostile_source_pull_test position/long_name  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
 hostile_source_pull_test position/reannounce  ticket 69 (PBS-144): pull appends a second preamble to the open binlog
-hostile_source_pull_test position/lower_sequence  ticket 70: a binlog with a lower sequence number is created and served; the next start fails
+hostile_source_pull_test position/lower_sequence  ticket 70 (PBS-158): a binlog with a lower sequence number is created and served; the next start fails
 hostile_source_pull_test position/length_smaller  ticket 82: a lowered transaction_length leaves a cut-off transaction in the storage
 hostile_source_pull_test gtid/gtid_twice/rewrite  ticket 81: in rewrite mode a duplicated, swapped, foreign or replayed transaction is stored and served
 hostile_source_pull_test gtid/gtid_swapped/rewrite  ticket 81: in rewrite mode a duplicated, swapped, foreign or replayed transaction is stored and served
@@ -207,8 +207,8 @@ damaged_binlog_consumers_test position/S4_plaintext_swap/C2_replay  ticket 53 (P
 damaged_binlog_consumers_test position/S4_plaintext_swap/C3_remote  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
 damaged_binlog_consumers_test position/S4_plaintext_swap/C4_position_replica  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
 damaged_binlog_consumers_test position/S4_plaintext_swap/C5_resume  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
-damaged_binlog_consumers_test position/S5_lower_sequence/C5_list  ticket 70 / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
-damaged_binlog_consumers_test position/S5_lower_sequence/C5_search_by_timestamp  ticket 70 / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
+damaged_binlog_consumers_test position/S5_lower_sequence/C5_list  ticket 70 (PBS-158) / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
+damaged_binlog_consumers_test position/S5_lower_sequence/C5_search_by_timestamp  ticket 70 (PBS-158) / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
 damaged_binlog_consumers_test gtid/S1_midstream/C1_stop_position  ticket 69 (PBS-144): this consumer loses or misreads transactions of a binlog with a second preamble
 damaged_binlog_consumers_test gtid/S1_midstream/C2_replay_stop_position  ticket 69 (PBS-144): this consumer loses or misreads transactions of a binlog with a second preamble
 damaged_binlog_consumers_test gtid/S1_midstream/C3_raw  ticket 69 (PBS-144): this consumer loses or misreads transactions of a binlog with a second preamble
@@ -299,6 +299,6 @@ damaged_binlog_consumers_test gtid/S4_plaintext_swap/C2_replay_skip_gtids  ticke
 damaged_binlog_consumers_test gtid/S4_plaintext_swap/C3_remote  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
 damaged_binlog_consumers_test gtid/S4_plaintext_swap/C4_gtid_replica  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
 damaged_binlog_consumers_test gtid/S4_plaintext_swap/C5_resume  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
-damaged_binlog_consumers_test gtid/S5_lower_sequence/C5_list  ticket 70 / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
-damaged_binlog_consumers_test gtid/S5_lower_sequence/C5_search_by_timestamp  ticket 70 / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
+damaged_binlog_consumers_test gtid/S5_lower_sequence/C5_list  ticket 70 (PBS-158) / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
+damaged_binlog_consumers_test gtid/S5_lower_sequence/C5_search_by_timestamp  ticket 70 (PBS-158) / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
 damaged_binlog_consumers_test gtid/*/C2_replay_stop_datetime  ticket 84 (PBS-151): on a rewrite-mode storage the generated events carry the time of the fetch, so --stop-datetime can stop before the transactions; since rewrite mode became mandatory in GTID mode (PBS-80 / PBS-98) every GTID-mode storage is one; depends on timing except in the S6 states (and ticket 81 for S2_tail_added_extended)

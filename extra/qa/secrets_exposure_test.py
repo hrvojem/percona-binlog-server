@@ -44,7 +44,7 @@ Runs (each a JSON line with the secrets it found, by place):
                         (the secret starts with '/', only digits come before
                         the '/', the endpoint form); such a URI parses
                         without user info, and the "masked" URI in the log
-                        then carries the secret (ticket 64)
+                        then carries the secret (ticket 64, PBS-159)
 
 Exit 1 if any secret was found. Example:
 

@@ -111,7 +111,7 @@ UNSUPPORTED = re.compile(r"ERROR (1193|1235|1064) ")
 PREFIX = "qv_"
 # the 'alpha' record of the repository's sample keyring: its record 'beta'
 # holds 31 bytes for AES-256-GCM, so every build rejects the whole file
-# (ticket 52)
+# (ticket 52, PBS-160)
 KEYRING_SOURCE = Path(__file__).resolve().parents[2] / "keyring_data.json"
 KEYRING: Path = None  # written into the work directory by main()
 ENCRYPTION = {"format": "generic", "kek_id": "alpha", "cipher": "AES-256-CTR"}

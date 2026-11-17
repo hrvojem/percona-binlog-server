@@ -60,8 +60,8 @@ States (a state that needs the other --mode is skipped with the reason):
                          tickets 53 / 62: a row changed in the ciphertext, a
                          plaintext binlog put into an encrypted storage
                          (replica_tamper_test.py)
-  S5_lower_sequence      ticket 70: a binlog with a lower sequence number
-                         indexed after higher ones ('lower_sequence')
+  S5_lower_sequence      ticket 70 (PBS-158): a binlog with a lower sequence
+                         number indexed after higher ones ('lower_sequence')
   S6_gtid_intervals / S6_large_transaction
                          rewrite mode without an attacker: every file
                          starts with a PREVIOUS_GTIDS_LOG larger than

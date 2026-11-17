@@ -21,9 +21,10 @@ With an 'http://' endpoint the S3 backend's requests are signed (SigV4), but
 the signature covers the request line and some headers only: the uploads say
 'x-amz-content-sha256: UNSIGNED-PAYLOAD' and carry no Content-MD5 and no
 checksum header or trailer, and the downloads are not compared with anything
-(ticket 78). This harness puts its own HTTP proxy between 'binlog_server
-fetch' and the local S3 server. The proxy forwards every request with its
-request line and all of its headers unchanged (the Host header included, so
+(ticket 78, PBS-154). This harness puts its own HTTP proxy between
+'binlog_server fetch' and the local S3 server. The proxy forwards every
+request with its request line and all of its headers unchanged (the Host
+header included, so
 the signatures stay valid) and, when a case asks for it, replaces bytes of a
 body with other bytes of the same length. Cases:
 

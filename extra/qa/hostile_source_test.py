@@ -57,12 +57,13 @@ The names (the sequence number is the real next one, N):
   lower_sequence       'binlog.000002' for a storage that starts at
                        'binlog.000004' (the source purged its first binlogs
                        before the first fetch); the storage must still open
-                       for the next fetch (ticket 70: the start-up recovery
-                       takes the new binlog for the leftover of a purge)
+                       for the next fetch (ticket 70, PBS-158: the start-up
+                       recovery takes the new binlog for the leftover of a
+                       purge)
   case_variant         'BINLOG.000001', with the storage on a file system
                        that ignores case (--case-insensitive-dir, e.g. a
                        vfat mount; not run without it): the stored
-                       'binlog.000001' must keep its data (ticket 71)
+                       'binlog.000001' must keep its data (ticket 71, PBS-157)
 
 Two attacks on resources run in the same way: 'size_lie' makes the first
 ordinary event of the next binlog claim 0xFFFFFF00 bytes (its CRC32 kept

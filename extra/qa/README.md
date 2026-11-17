@@ -435,7 +435,7 @@ ends `pull`):
   ClientHello, packets after the OK. One fails: a line feed in the user
   name of a failed login puts a line of the client's choosing into the
   `pull` log, and a 1 MB user name is logged twice and echoed in a 1 MB
-  error packet (ticket 76).
+  error packet (ticket 76, PBS-152).
 
 ### What a logged-in client can send — `listener_command_fuzz_test.py`
 
@@ -448,9 +448,9 @@ dump; then 300 random connections (`--connections`, `--seed`). After each it
 requires `pull` to run, to serve a new login within 10 s and to stay under
 1 GiB. 31 of 43 cases pass on 2026-11-16, the random phase included. Three
 failures are new: one COM_QUERY of 16 MB keeps every client waiting for 25 s
-(3 s with the release build; ticket 74), and a heartbeat period of 1 ns or
+(3 s with the release build; ticket 74, PBS-156), and a heartbeat period of 1 ns or
 1,000 ns makes an idle dump send and log thousands of heartbeats a second
-(ticket 75). The other nine are ticket 72 again, with other statements: any
+(ticket 75, PBS-155). The other nine are ticket 72 again, with other statements: any
 run of 40,000 or more characters that one of the handshake patterns matches
 ends `pull`; they run last (`--no-long-runs` leaves them out).
 
@@ -478,7 +478,7 @@ in plain. With Ubuntu 24.04's OpenSSL policy the listener takes TLS 1.2 and
 four CBC-SHA1 and six static-RSA suites. The listener sets no minimum
 version or cipher list itself, so under a legacy OpenSSL policy
 (`OPENSSL_CONF` with `MinProtocol = TLSv1`) the same binary accepts TLS 1.0
-and 1.1; that case only records what it finds (ticket 77). Towards a TLS
+and 1.1; that case only records what it finds (ticket 77, PBS-153). Towards a TLS
 source it runs `fetch` with `connection.ssl` and `connection.tls` settings:
 a client certificate for a `REQUIRE X509` user (missing, of another CA,
 expired, with the wrong key), `ca` / `capath`, `crl` / `crlpath` with the
@@ -526,11 +526,11 @@ the stored binlog gets a second FORMAT_DESCRIPTION and the next binlog's
 events after its ROTATE (ticket 69; in GTID mode `fetch` refuses it).
 `lower_sequence` uses `binlog.000002` on a storage that starts at
 `binlog.000004`: `fetch` exits 0, and every later start fails with "binlog
-index contains a reference to a non-existing object" (ticket 70, also in
+index contains a reference to a non-existing object" (ticket 70, PBS-158, also in
 GTID mode). `case_variant` uses `BINLOG.000001` and runs only with
 `--case-insensitive-dir <directory>`, a directory on a file system that
 ignores case (a vfat loop mount, for example), where the storage is then
-placed: the stored `binlog.000001` is replaced (ticket 71). The nightly has
+placed: the stored `binlog.000001` is replaced (ticket 71, PBS-157). The nightly has
 no such mount, so it does not run this case.
 
 `reannounce_midstream` (2026-11-16, GTID mode only) is the variant of
@@ -553,7 +553,7 @@ With an `http://` S3 endpoint the uploads carry `x-amz-content-sha256:
 UNSIGNED-PAYLOAD` and no checksum header, so the request signature does not
 cover the body. The test puts its own proxy between `fetch` and the local S3
 server and changes bodies without touching anything signed. On 2026-11-16
-three cases fail (ticket 78). `put_body_changed`: a row value in the PUT of
+three cases fail (ticket 78, PBS-154). `put_body_changed`: a row value in the PUT of
 the binlog is replaced (event CRC32 recomputed); the server answers 200,
 `fetch` exits 0 and the object keeps the attacker's bytes. `put_metadata_changed`:
 the `size` in the PUT of the binlog's metadata is changed; set to the start
@@ -725,7 +725,7 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/truncated_transaction_test.py \
 Produces the malformed binlogs the attack tests leave in a storage (a
 second preamble, ticket 69; duplicated, swapped, foreign or missing
 GTIDs, ticket 81; a cut-off transaction, ticket 82; a forged row and a
-plaintext swap, tickets 53 and 62; a lower sequence number, ticket 70; the
+plaintext swap, tickets 53 and 62; a lower sequence number, ticket 70 (PBS-158); the
 rewrite-mode layouts) and gives each to every consumer: `mysqlbinlog` on
 the files with position and GTID options, a replay into a scratch server,
 `mysqlbinlog --read-from-remote-server` through `pull`, position and GTID
@@ -759,7 +759,7 @@ secret. On 2026-11-16 nothing was found in 7 runs. Three runs added later
 that day (`s3_unencoded_*`) use a storage URI whose S3 secret key holds a `/`
 that is not percent-encoded: such a URI parses without user info, and the
 "binlog storage backend URI (masked)" log line carries the secret in all
-three shapes (ticket 64).
+three shapes (ticket 64, PBS-159).
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/secrets_exposure_test.py \
@@ -1069,7 +1069,7 @@ it to a MySQL replica through `pull`; whether the release can still list
 the storage afterwards is reported), `encrypted_takeover` (the same with
 KEK `alpha` and AES-256-CTR, checked through the replica; every build
 rejects the repository's sample `keyring_data.json`, whose AES-256-GCM
-record `beta` holds 31 bytes (ticket 52), so the harness writes a keyring
+record `beta` holds 31 bytes (ticket 52, PBS-160), so the harness writes a keyring
 with `alpha` only) and
 `killed_takeover` (the release is killed with SIGKILL after 1.5 MB of a
 fetch with `checkpoint_size` 64K; the current build must recover the

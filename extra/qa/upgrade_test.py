@@ -76,7 +76,7 @@ import pull_replica_test as replication  # noqa: E402
 
 # the 'alpha' record of the repository's sample keyring: its AES-256-GCM
 # record 'beta' holds 31 bytes, so the release and the current build alike
-# reject the whole file ("key data length mismatch", ticket 52)
+# reject the whole file ("key data length mismatch", ticket 52, PBS-160)
 KEYRING_SOURCE = Path(__file__).resolve().parents[2] / "keyring_data.json"
 KEYRING: Path = None  # written into the work directory by main()
 ENCRYPTION = {"format": "generic", "kek_id": "alpha", "cipher": "AES-256-CTR"}

@@ -7,6 +7,6 @@
 # A finding listed here is reported as known; any other one is NEW.
 # Remove a line once its bug is fixed.
 #
-# PBS-68 (ticket 1) and PBS-112 (ticket 39) were filtered in the targets
+# PBS-68 (ticket 1, PBS-68) and PBS-112 (ticket 39, PBS-112) were filtered in the targets
 # until upstream fixed them (dd136e5); the filters are gone. A UBSan report
 # in Boost's lexical_cast is silenced by fuzz/ubsan_ignorelist.txt.

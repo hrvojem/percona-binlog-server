@@ -72,14 +72,14 @@ A refusal of something that is stored, caused by an edit, is recorded as
 
 On 2026-11-16 (MySQL 8.4.8, debug build) every 'clean_*' case passes and
 22 edits fail in GTID mode (18 in position mode), the same on both
-storages; all of them are consequences of ticket 53, three also of ticket
+storages; all of them are consequences of ticket 53, PBS-126, three also of ticket
 80 (a binlog whose metadata is unreadable is left out of a "success"):
 - a 'binlog.index' without its first entries makes any 'purge_binlogs',
   even one that answers with an error, delete those binlogs as leftovers
   of an interrupted purge; a reordered index makes a purge delete by index
   position (binlog 3 for "up to 2", the newest binlog for "up to 3");
 - a lowered 'size' of the newest binlog makes any 'purge_binlogs', even a
-  refused one, truncate it (through a symbolic link too, ticket 57); in
+  refused one, truncate it (through a symbolic link too, ticket 57, PBS-130); in
   GTID mode the next fetch does not bring the cut transactions back;
 - an edited 'min_timestamp' or 'added_gtids', a dropped or swapped index
   entry or an unreadable metadata file make the searches answer "success"
@@ -1758,7 +1758,7 @@ SEARCH_CASES = {
     "search_min_timestamp_number": (
         member(3, "min_timestamp", 0), ("timestamp",), False, None,
         "min_timestamp of binlog 3 the number 0"),
-    # -- unreadable metadata (ticket 80)
+    # -- unreadable metadata (ticket 80, PBS-146)
     "search_metadata_unparsable": (
         raw_metadata(3, b"{"), ("timestamp", "gtid"), False,
         ("search_by_timestamp", "b4t2"), "metadata of binlog 3 unparsable"),
@@ -1836,13 +1836,13 @@ def make_search_case(edit, kinds: tuple, to_replay, description: str):
 # the cases that cannot exist on S3, and why
 FILE_ONLY = {
     "purge_symlink_data":
-        "an S3 object cannot be a symbolic link (ticket 57 is about the "
+        "an S3 object cannot be a symbolic link (ticket 57 (PBS-130) is about the "
         "file storage)",
     "purge_symlink_metadata":
-        "an S3 object cannot be a symbolic link (ticket 57 is about the "
+        "an S3 object cannot be a symbolic link (ticket 57 (PBS-130) is about the "
         "file storage)",
     "purge_symlink_index":
-        "an S3 object cannot be a symbolic link (ticket 57 is about the "
+        "an S3 object cannot be a symbolic link (ticket 57 (PBS-130) is about the "
         "file storage)",
     "purge_symlink_tail_size":
         "an S3 object cannot be a symbolic link, so the start-up recovery "
@@ -2059,7 +2059,7 @@ def case_s3_purge_index_put_fails(box: Box) -> dict:
 
 
 def case_s3_size_tail_lowered_upload_fails(box: Box) -> dict:
-    """A lowered size of the newest binlog (ticket 53) makes every start for
+    """A lowered size of the newest binlog (ticket 53, PBS-126) makes every start for
     writing download the object into the buffer directory, truncate the
     copy and upload it; here the S3 server refuses that upload."""
     box.edit = box.set_member(BINLOGS, "size", tail_cut(box))

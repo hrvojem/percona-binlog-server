@@ -49,7 +49,7 @@ is connected). Only attacks that keep 'pull' alive and writing:
   loop and now and then a transaction larger than a rewritten binlog.
 
 The case 'hostile' (--mode gtid only) adds what rewrite mode is known to
-store (ticket 81): gtid_twice, gtid_swapped, replay_after_reconnect. Its
+store (ticket 81, PBS-147): gtid_twice, gtid_swapped, replay_after_reconnect. Its
 storage and its readers are then not compared with the source; liveness,
 shutdown and sanitizer reports are checked as in the other cases.
 
@@ -91,7 +91,7 @@ A case FAILS on
     source's GTIDs once and in order) after the SIGTERM;
   * after a clean restart without the proxy: a storage, a replica or a new
     mysqlbinlog client without the source's data, a replica error;
-  * a query that crashes, or fails for another reason than ticket 29.
+  * a query that crashes, or fails for another reason than ticket 29 (PBS-101).
 
 Not in the mix, as the single-sided harnesses already report them: the
 hostile binlog names (tickets 59, 69, 70), a lowered transaction_length
@@ -100,8 +100,8 @@ keeps the open transaction, resumes inside it and ends with "transaction
 group must start from one of the gtid log events"), statements with long
 runs of white space or digits (72), a 16 MB statement (74), a heartbeat
 period below 50 ms (75). Dumps from a position inside an event are sent,
-but what they return is not judged (ticket 39); 'eof' and client resets
-logged as errors (42) are not counted; ticket 43 is why read_timeout is
+but what they return is not judged (ticket 39, PBS-112); 'eof' and client resets
+logged as errors (42) are not counted; ticket 43 (PBS-116) is why read_timeout is
 4 s here.
 
 Cases (--cases): plain, encrypted (the storage encrypted with a keyring
@@ -149,12 +149,12 @@ import pull_replica_test as replication  # noqa: E402
 import rewrite_attack_test as rewrite  # noqa: E402
 
 IDLE_TIME = 1
-# ticket 43: an idle source delays the stop by up to this
+# ticket 43 (PBS-116): an idle source delays the stop by up to this
 READ_TIMEOUT = 4
 REWRITE_FILE_SIZE = "16K"
 CATCH_UP_SECONDS = 60
 LOGIN_SECONDS = 10
-# the shortest heartbeat period a client here asks for (ticket 75)
+# the shortest heartbeat period a client here asks for (ticket 75, PBS-155)
 MIN_HEARTBEAT_NS = 50_000_000
 HEARTBEAT_PERIOD = re.compile(rb"heartbeat_period\s*=\s*([0-9]+)")
 TSAN_DEFAULTS = "halt_on_error=0 second_deadlock_stack=1 history_size=4"
@@ -173,7 +173,7 @@ SOURCE_MIX = {
     "gtid": ["drop"] + LIVE,
     "gtid_rewrite": ["drop"] + LIVE + ["reannounce_midstream"],
 }
-# ticket 81: stored and served in rewrite mode
+# ticket 81 (PBS-147): stored and served in rewrite mode
 HOSTILE_MIX = ["gtid_twice", "gtid_swapped", "replay_after_reconnect"]
 TRANSACTION_FAMILY = ("gtid_twice", "gtid_swapped")
 STREAM_FAMILY = ("reannounce_midstream",)
@@ -488,7 +488,7 @@ class Pull:
         lines = [line.strip().split("] ", 2)[-1][:230]
                  for line in self.log().splitlines()
                  if ("[  error]" in line or "exception caught" in line) and
-                 # a client that closes its connection (ticket 42)
+                 # a client that closes its connection (ticket 42, PBS-115)
                  "caught in session" not in line]
         return lines[-limit:]
 
@@ -1243,7 +1243,7 @@ class Case:
                      in watch.query_errors.items()
                      if not TICKET_29.search(message)}
             if len(other) != len(watch.query_errors):
-                known.append("ticket 29: " + str(sum(
+                known.append("ticket 29 (PBS-101): " + str(sum(
                     watch.query_errors.values()) - sum(other.values())) +
                     " queries failed next to the writer")
             if other:
@@ -1322,7 +1322,7 @@ class Case:
                 capture_output=True, timeout=120 * SCALE, check=False,
                 env=environment())
             recovery["list_exit"] = listed.returncode
-            # the source is idle now: ticket 43
+            # the source is idle now: ticket 43 (PBS-116)
             recovery["pull_stop"] = recovered.stop(limit)
             result["recovery"] = recovery
             located = [f"{detail} [{'; '.join(places)}]"
@@ -1357,10 +1357,10 @@ class Case:
                                  "after the clean restart")
             end_state += located
             if self.hostile:
-                # ticket 81: what a hostile source sent twice or out of
+                # ticket 81 (PBS-147): what a hostile source sent twice or out of
                 # order is in the storage and went to the readers
                 if end_state:
-                    known.append("ticket 81 (not judged in this case): " +
+                    known.append("ticket 81 (PBS-147) (not judged in this case): " +
                                  "; ".join(end_state)[:600])
                 problems += [problem for problem in end_state
                              if problem.startswith("pull crashed")]

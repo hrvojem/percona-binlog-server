@@ -34,7 +34,7 @@ Then a few recovery cases: a failure of the binlog index save leaves the
 files of an interrupted binlog creation behind, the next 'fetch' (whose start
 removes them, PBS-59) fails to delete one of them ('unlink'), and a third
 'fetch' without a failure must still recover and leave exact copies
-(ticket 37).
+(ticket 37, PBS-110).
 
 The result of every case is printed as one JSON line and collected in
 '<workdir>/sweep.json'. Uses the helpers of fetch_crash_test.py.

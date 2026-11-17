@@ -30,7 +30,7 @@ two attacks:
   hash the source has not cached, so the full authentication happens).
 - 'strip': it clears CLIENT_SSL in the source's greeting, so the client
   either goes on without TLS or refuses (the source's password hash is
-  cached first, so that a plain login can succeed despite ticket 23).
+  cached first, so that a plain login can succeed despite ticket 23, PBS-133).
 
 Each case runs 'fetch' through the proxy with one 'connection.ssl' setting
 and records whether it connected and stored data, and whether the proxy
@@ -41,7 +41,7 @@ also refuses the trusted CA's certificate for another host; 'required',
 an 'ssl' section, and with 'preferred' or 'required', a MySQL client does not
 verify the server, which these cases record as 'accepted' (they pass; the
 summary lists them, as they let an attacker on the path act as the source,
-see ticket 59).
+see ticket 59, PBS-131).
 
 's3_https_self_signed': an S3 storage at https://127.0.0.1:<port> served by a
 TLS endpoint with a self-signed certificate; 'fetch' must not send an HTTP

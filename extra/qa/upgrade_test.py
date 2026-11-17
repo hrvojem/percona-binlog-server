@@ -45,7 +45,7 @@ JSON line each):
                    With --tolerate-ticket-14 (GTID mode, as the nightly
                    runs it) the copy may lack a closing ROTATE where the
                    kill came between a binlog's last transaction and its
-                   ROTATE (ticket 14: the GTID-mode resume starts in the
+                   ROTATE (ticket 14 (PBS-80): the GTID-mode resume starts in the
                    next binlog); hit on 9.7 on 2026-11-05;
   downgrade        (reported, not checked) the release lists the storage
                    after the current build has written to it.
@@ -436,7 +436,7 @@ def main():
     parser.add_argument("--tolerate-ticket-14", action="store_true",
                         help="GTID mode: accept a closed binlog stored "
                              "without its closing ROTATE and missing binlogs "
-                             "without transactions (ticket 14), as "
+                             "without transactions (ticket 14, PBS-80), as "
                              "fetch_crash_test does")
     args = parser.parse_args()
     if args.tolerate_ticket_14 and args.mode != "gtid":

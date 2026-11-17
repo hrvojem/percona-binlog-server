@@ -118,7 +118,7 @@ E. the serving side of 'pull'
                          whether mysqlbinlog is still served
   replica_huge_event     a storage whose binlog holds one event of
                          --serve-event-mib (256; the listener cannot send
-                         an event of 16 MiB or more, ticket 10): one
+                         an event of 16 MiB or more, ticket 10, PBS-76): one
                          replica requests that binlog, then --serve-clients
                          (8) at once: peak RSS of 'pull' as a multiple of
                          the event, and whether 'pull' survives
@@ -176,7 +176,7 @@ EOF_PACKET = b"\xfe\x00\x00\x02\x00"
 MAX_PACKET = 0xFFFFFF
 # the proxy hands its packets to the socket in pieces of this size
 FLUSH_BYTES = 256 * 1024
-# 'transaction_length' just under the 4 GiB the reader accepts (ticket 41)
+# 'transaction_length' just under the 4 GiB the reader accepts (ticket 41, PBS-114)
 DECLARED_LENGTH = 0xFFFFFF00
 # an event header that declares 3.5 GiB
 DECLARED_EVENT_SIZE = 3500 * MIB
@@ -1249,7 +1249,7 @@ def case_honest_large_transaction(name: str) -> dict:
     return finish(name, result, problems,
                   f"peak RSS is at most {worst}"
                   " times the transaction, which the reader limits to 4 GiB "
-                  "(ticket 41)")
+                  "(ticket 41, PBS-114)")
 
 
 # ---------------------------------------------------------------------------
@@ -1732,7 +1732,7 @@ def case_sequence_exhaustion(name: str) -> dict:
 
 def start_pull(label: str, **settings):
     # a short read timeout: 'pull' notices SIGTERM only when its read from
-    # the source returns (ticket 43)
+    # the source returns (ticket 43, PBS-116)
     config = make_config(label, read_timeout=5, **settings)
     process = start_binsrv("pull", config, label)
     deadline = time.monotonic() + 60

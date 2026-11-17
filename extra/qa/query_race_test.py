@@ -21,7 +21,7 @@ A source MySQL server gets a steady stream of small inserts with a
 a filesystem storage with checkpoint_size "1K" (so it saves its metadata and
 renames its temporary files all the time), and 'binlog_server list' runs
 --runs times against the same storage. Every 'list' run must exit with 0 and
-print a "success" response. Ticket 29: a query next to a writer fails
+print a "success" response. Ticket 29 (PBS-101): a query next to a writer fails
 stat()ing a '.tmp' file the writer renamed away, so a few percent of the
 runs fail today.
 

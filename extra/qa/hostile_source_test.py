@@ -53,7 +53,7 @@ The names (the sequence number is the real next one, N):
   reannounce           the current binlog's own name: after its closing
                        ROTATE the source announces the same binlog again at
                        position 4; the stored binlog must not get a second
-                       FORMAT_DESCRIPTION appended (ticket 69)
+                       FORMAT_DESCRIPTION appended (ticket 69, PBS-144)
   lower_sequence       'binlog.000002' for a storage that starts at
                        'binlog.000004' (the source purged its first binlogs
                        before the first fetch); the storage must still open
@@ -73,7 +73,7 @@ match; for these the peak memory and the duration of the proxied 'fetch' are
 recorded as well (at most 2 GiB and 120 s). --mode gtid runs every case in
 GTID mode, and --storage s3 against the local S3 server.
 
-One attack on the stream itself, 'reannounce_midstream' (ticket 69 in GTID
+One attack on the stream itself, 'reannounce_midstream' (ticket 69 (PBS-144) in GTID
 mode, where 'reannounce' is refused): the source does not rotate, so the
 proxied 'fetch' resumes in the binlog it has stored; after the first
 complete transaction the proxy inserts an artificial ROTATE that names that
@@ -480,7 +480,7 @@ def run_fetch(binsrv, config_path: Path) -> "tuple[int, str]":
 def cache_password_hash(basedir: Path, port: int):
     """A plain-TCP login as the replication user with the server's public
     key: the server caches the password hash, so that 'fetch' (which cannot
-    request the key, ticket 23) gets the fast path without TLS."""
+    request the key, ticket 23, PBS-133) gets the fast path without TLS."""
     subprocess.run(
         [str(basedir / "bin" / "mysql"), "--no-defaults",
          "--ssl-mode=DISABLED", "--get-server-public-key",

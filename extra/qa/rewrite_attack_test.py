@@ -112,8 +112,8 @@ transactions (GTIDs 10-12) in between.
                              'size_rewrite', here with the replica)
   storage_tail_size_raised, storage_older_size_lowered
   storage_tail_encryption_removed / _transplanted, storage_tail_iv_lowered
-                             the encryption record removed (ticket 62),
-                             replaced by the first binlog's (ticket 63),
+                             the encryption record removed (ticket 62, PBS-136),
+                             replaced by the first binlog's (ticket 63, PBS-137),
                              its IV counter lowered by 64 blocks
 In rewrite mode nothing ties the resume point to the stored bytes: 'fetch'
 asks the source for everything outside 'previous_gtids' + 'added_gtids' of
@@ -606,7 +606,7 @@ class PullSession:
             self.process.send_signal(signal.SIGTERM)
             try:
                 # with an idle source 'pull' may take up to
-                # connection.read_timeout to notice (ticket 43)
+                # connection.read_timeout to notice (ticket 43, PBS-116)
                 self.process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 self.process.kill()

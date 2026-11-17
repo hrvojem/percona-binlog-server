@@ -8,7 +8,7 @@
 # Usage: ci_property_tests.sh <build dir> [<known_failures.txt>] [--parallel N]
 set -euo pipefail
 # without this, every S3 backend a config test creates waits on EC2 instance
-# metadata lookups (ticket 16): config_value_property_test takes ~9 min
+# metadata lookups (ticket 16, PBS-84): config_value_property_test takes ~9 min
 # instead of ~30 s
 export AWS_EC2_METADATA_DISABLED=true
 build_dir=$(cd "${1:?usage: $0 <build dir> [<known_failures.txt>] [--parallel N]}" && pwd)

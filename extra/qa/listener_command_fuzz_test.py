@@ -86,15 +86,15 @@ an acceptable answer to any of the inputs. Three groups of cases:
    still run; on a crash the bytes sent are written to '<workdir>/crash.bin'
    and the exit code or signal and the end of the standard error and log of
    'pull' are reported. Runs of white space or digits stay below 2,000
-   characters here, so that ticket 72 does not hide other findings.
+   characters here, so that ticket 72 (PBS-140) does not hide other findings.
 
 3. Last, with a restart of 'pull' after every crash (skipped with
    --no-long-runs): 'regex_run_threshold', which looks for the shortest run
    of digits in 'SET @master_heartbeat_period=<digits>' that ends 'pull',
    and 'regex_run_<place>', a run of 100,000 characters at each '\\s+',
-   '\\s*' and '[0-9]+' of the patterns. These are the known ticket 72
+   '\\s*' and '[0-9]+' of the patterns. These are the known ticket 72 (PBS-140)
    (std::regex recurses once per character and overflows the stack); their
-   lines carry "known": "ticket 72".
+   lines carry "known": "ticket 72 (PBS-140)".
 
 With --tls 'pull' gets an 'ssl' section (the test certificate of the MTR
 suite) and every login of the cases above is made inside TLS (the SSL
@@ -198,11 +198,11 @@ KNOWN_QUERIES = [
     b"@source_heartbeat_period = 30000000000"]
 UUID = bytes(range(0x10, 0x20))
 # the longest run of white space or digits the fuzz phase sends: far below
-# what ends pull through ticket 72
+# what ends pull through ticket 72 (PBS-140)
 FUZZ_MAX_RUN = 2000
 LONG_RUN = re.compile(rb"[ \t\n\v\f\r]{%d,}|[0-9]{%d,}" %
                       (FUZZ_MAX_RUN + 1, FUZZ_MAX_RUN + 1))
-TICKET_72 = "ticket 72"
+TICKET_72 = "ticket 72 (PBS-140)"
 
 
 class PullDied(Exception):
@@ -2188,7 +2188,7 @@ def mutate(rng: random.Random, payload: bytes) -> bytes:
                                   COM_BINLOG_DUMP_GTID, COM_REGISTER_SLAVE,
                                   COM_CHANGE_USER, rng.randrange(256)])
     mutated = bytes(data)
-    # nothing that ticket 72 would answer for
+    # nothing that ticket 72 (PBS-140) would answer for
     return payload if LONG_RUN.search(mutated) else mutated
 
 
@@ -2258,7 +2258,7 @@ def case_fuzz(ctx: Context) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# ticket 72: the long runs, last
+# ticket 72 (PBS-140): the long runs, last
 # ---------------------------------------------------------------------------
 
 def case_regex_run_threshold(ctx: Context) -> dict:
@@ -2375,7 +2375,7 @@ def main():
     parser.add_argument("--max-idle-cpu", type=float, default=0.5,
                         help="the share of one CPU an idle dump may use")
     parser.add_argument("--no-long-runs", action="store_true",
-                        help="without the cases of ticket 72, which end pull")
+                        help="without the cases of ticket 72, PBS-140, which end pull")
     parser.add_argument("--tls", action="store_true",
                         help="pull with an 'ssl' section; every case logs "
                              "in and sends its commands inside TLS, and the "

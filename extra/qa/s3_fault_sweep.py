@@ -31,7 +31,7 @@ Then two recovery cases: failing uploads of the binlog index leave the
 objects of an interrupted binlog creation behind, the next 'fetch' (whose
 start removes them, PBS-59) fails to delete the binlog metadata object, and
 a third 'fetch' without a fault must still recover and leave exact copies
-(ticket 37). Only the metadata delete is failed: a 'binlog.0' match would
+(ticket 37, PBS-110). Only the metadata delete is failed: a 'binlog.0' match would
 hit both objects.
 
 Last, one read case: 'pull' serves its S3 storage while the proxy answers

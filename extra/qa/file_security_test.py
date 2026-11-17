@@ -48,7 +48,7 @@ Cases:
   'fs_buffer_directory' that file is created under $TMPDIR; under umask 022
   neither it nor its directory may be accessible to other users, and an
   existing 'fs_buffer_directory' that anyone can write to must be refused
-  (ticket 65).
+  (ticket 65, PBS-138).
 - 's3_buffer_swap' (with --s3-bucket-dir): what that 0777 buffer directory
   allows. On a resumed 'fetch' the backend downloads the last binlog object
   into '<fs_buffer_directory>/<random uuid>' and then opens that PATH again

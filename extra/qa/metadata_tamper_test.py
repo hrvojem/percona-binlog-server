@@ -26,10 +26,10 @@ they are. Cases:
 
 - 'strip_encryption': the 'encryption' member of the last binlog's metadata
   is removed. The next 'fetch' resumes that binlog; what it appends must not
-  be readable (ticket 62: it is appended in plaintext, and fetch exits 0).
+  be readable (ticket 62 (PBS-136): it is appended in plaintext, and fetch exits 0).
 - 'transplant_encryption': the 'encryption' member is replaced by the
   previous binlog's. What the next 'fetch' appends must not be encrypted
-  with the previous binlog's keystream (ticket 63: it is, so the keystream
+  with the previous binlog's keystream (ticket 63 (PBS-137): it is, so the keystream
   the previous binlog's known plaintext gives decrypts the appended data).
 - 'size': 'size' of the last binlog's metadata is lowered to the start of
   its second transaction (a copy of the ciphertext is kept first). Start-up
@@ -542,7 +542,7 @@ def serve_and_dump(binsrv, config: Path, first_binlog: str,
                 pull.send_signal(signal.SIGTERM)
                 try:
                     # with an idle source 'pull' may take up to
-                    # connection.read_timeout to notice (ticket 43)
+                    # connection.read_timeout to notice (ticket 43, PBS-116)
                     pull.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     pull.kill()

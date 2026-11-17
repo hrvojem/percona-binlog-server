@@ -44,7 +44,7 @@ descriptors and threads (/proc), its log size and the storage size. Cases
                     those of the second quarter by at most FD_SLACK;
   threads           likewise, by at most THREAD_SLACK;
   log               the log grows by at most LOG_MB_PER_HOUR and holds no
-                    error line other than the known ones of ticket 42
+                    error line other than the known ones of ticket 42 (PBS-115)
                     (PBS-115: a disconnect logged at error level, as EOF
                     when reading or as EPIPE, system:32, when a client
                     dies during a dump), which are counted; the most

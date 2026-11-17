@@ -28,29 +28,29 @@ States ('--cases' selects by substring of '<state>/<repair>'):
 
   nul_existing_binlog, nul_metadata, nul_index, newline
                     hostile_source_test.py: a binlog name from the source
-                    with a NUL byte or a line feed (ticket 59)
+                    with a NUL byte or a line feed (ticket 59, PBS-131)
   long_name_pull    a ROTATE with a 3000-byte name, against a running 'pull'
-                    (hostile_source_pull_test.py's proxy; ticket 59)
+                    (hostile_source_pull_test.py's proxy; ticket 59, PBS-131)
   gtid_bloat_pull   a PREVIOUS_GTIDS_LOG of 900,000 intervals, against a
                     running 'pull' (--no-rewrite only)
   reannounce, reannounce_midstream
-                    the open binlog announced again (ticket 69)
+                    the open binlog announced again (ticket 69, PBS-144)
   lower_sequence    a binlog with a lower sequence number than the first
-                    stored one (ticket 70)
+                    stored one (ticket 70, PBS-158)
   cutoff_stub       truncated_transaction_test.py 'lie_after_begin': the
                     first events of a transaction stored as all of it
-                    (ticket 82)
+                    (ticket 82, PBS-148)
   fragments_pull    the proxy ends the dump after GTID + BEGIN, every time,
                     against a running 'pull', which is then killed (ticket
                     83; --all: on 2026-11-17 the storage this leaves was
                     exact after the next 'fetch')
   short_tail        the last binlog's data file is shorter than its metadata
-                    says (lost page cache, a cut-off upload; like ticket 19)
+                    says (lost page cache, a cut-off upload; like ticket 19, PBS-85)
   source_reset      the source was initialised again and has fewer binlogs
-                    than the storage (ticket 25)
+                    than the storage (ticket 25, PBS-141)
   source_reset_longer
                     ... and by now has more binlogs and GTIDs than the
-                    storage (ticket 25)
+                    storage (ticket 25, PBS-141)
   source_gap        the source purged binlogs that were not fetched yet
   interrupted_rotation
                     the newest binlog holds the binlog magic only and is not

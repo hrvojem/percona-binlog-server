@@ -40,7 +40,7 @@ and a MySQL replica applies it from 'pull'. Kinds:
   xa           XA transactions: committed, rolled back after PREPARE, and
                COMMIT ONE PHASE;
   large        a transaction of 20000 rows and an 8 MB row (below the 16 MB
-               event limit of ticket 10);
+               event limit of ticket 10, PBS-76);
   savepoints   SAVEPOINT / ROLLBACK TO, a rolled-back transaction, and a
                non-transactional MyISAM table;
   charsets     latin1, utf8mb4 and binary columns with their collations;

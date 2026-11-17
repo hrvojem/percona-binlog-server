@@ -34,7 +34,7 @@
 # build directory, configuring it the first time, and runs its unit tests and
 # every property test case like the C++ stage (profile nightly_release), but
 # each case under a short wall-clock limit (RELEASE_CASE_TIMEOUT): without the
-# assertions some known bugs loop forever instead of aborting (ticket 7), and
+# assertions some known bugs loop forever instead of aborting (ticket 7, PBS-73), and
 # a hang must come out as a TIMEOUT failure, not a stuck nightly. Then a short
 # fetch_crash_test run uses the release binary. Release-only behaviour of a
 # known failure is listed in known_failures.txt as 'release_gcc14:<case>'.
@@ -69,7 +69,7 @@
 set -uo pipefail
 export PATH=/usr/local/bin:/usr/bin:/bin
 # this host is outside EC2: without this, every S3 backend the tests create
-# waits about 1.4 s on instance metadata lookups (ticket 16)
+# waits about 1.4 s on instance metadata lookups (ticket 16, PBS-84)
 export AWS_EC2_METADATA_DISABLED=true
 
 WS=${WS:-$HOME/ws}
@@ -81,7 +81,7 @@ CASE_TIMEOUT=3600
 # examples takes seconds to a few minutes, so anything near this is a hang
 RELEASE_CASE_TIMEOUT=${RELEASE_CASE_TIMEOUT:-600}
 # and its address-space limit per case (ulimit -v, MB): with the assertions
-# compiled out, ticket 7 makes indexed_event_block grow its index until
+# compiled out, ticket 7 (PBS-73) makes indexed_event_block grow its index until
 # std::bad_alloc, 8+ GB on this 16 GB host shared with other jobs
 RELEASE_CASE_MEMORY_MB=${RELEASE_CASE_MEMORY_MB:-4096}
 # property test cases run several at a time; each one is a separate process
@@ -952,7 +952,7 @@ if want qa || want rotation; then
       listener_command_fuzz_test)
         # what a logged-in client can send: every command with malformed
         # bodies, a 16 MB statement, tiny heartbeat periods, 300 random
-        # connections, then the long runs of ticket 72 (about 4 min)
+        # connections, then the long runs of ticket 72 (PBS-140) (about 4 min)
         qa_run listener_command_fuzz_test \
           "listener_command_fuzz_test ($mode)" \
           "${common[@]}" --workdir "$out/qa/lc-$mode" \

@@ -26,13 +26,13 @@ by someone who holds no key, and its data is compared with the source's.
   event's CRC32 footer with crc32(delta) XOR crc32(zeros), which keeps the
   checksum valid without the plaintext (CRC32 is affine). The replica must
   not end up with the new value: either 'pull' refuses the binlog, or the
-  replica stops with an error (ticket 53: the replica applies the forged
+  replica stops with an error (ticket 53 (PBS-126): the replica applies the forged
   row, with no error anywhere).
 - 'forged_row_bad_checksum': the same change without the footer patch. A
   replica verifies event checksums by default, so it must stop, and its
   data must not change; recorded: whether 'pull' noticed first (it does not,
-  ticket 53).
-- 'doubled_preamble': the storage a hostile source leaves in ticket 69 (the
+  ticket 53, PBS-126).
+- 'doubled_preamble': the storage a hostile source leaves in ticket 69 (PBS-144) (the
   next binlog's preamble and events appended to the binlog that was just
   closed, made with the renaming proxy of hostile_source_test.py), served to
   a replica while the source is down. The replica's data is compared with
@@ -204,7 +204,7 @@ def pull_errors(binsrv) -> list:
     return [line.strip()[-170:] for line in
             binsrv.log_path.read_text(errors="replace").splitlines()
             if "[  error]" in line and
-            # a client closing its connection is logged as an error (ticket 42)
+            # a client closing its connection is logged as an error (ticket 42, PBS-115)
             "system error caught in session" not in line and
             "establish connection" not in line and
             "did not reach EOF" not in line][-3:]
@@ -395,7 +395,7 @@ def case_doubled_preamble(args, source, replica) -> dict:
         return labelled(args, {
             "case": "doubled_preamble", "ok": True,
             "skipped": "the hostile source's rename left no doubled "
-                       "preamble (ticket 69 fixed?)" if attack == "reannounce"
+                       "preamble (ticket 69 (PBS-144) fixed?)" if attack == "reannounce"
                        else "in GTID mode fetch refuses the hostile rename, "
                        "and the current binlog announced again in the "
                        "middle of the stream ('reannounce_midstream') left "

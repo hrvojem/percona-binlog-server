@@ -211,7 +211,7 @@ def write_config(keyring: "Path | None", encrypt: "dict | None", *,
         # checkpointed: every event at once
         config["storage"]["checkpoint_size"] = "1"
         config["connection"]["connect_timeout"] = 2
-        # an idle pull notices SIGTERM after read_timeout (ticket 43)
+        # an idle pull notices SIGTERM after read_timeout (ticket 43, PBS-116)
         config["connection"]["read_timeout"] = 5
         config["replication_source"] = {
             "port": pull_port, "server_id": 142,
@@ -380,7 +380,7 @@ def pull_log_errors() -> list:
             binsrv.log_path.read_text(errors="replace").splitlines()
             if ("[  error]" in line or "exception caught" in line) and
             # a client closing its connection is logged as an error
-            # (ticket 42)
+            # (ticket 42, PBS-115)
             "system error caught in session" not in line and
             "did not reach EOF" not in line and
             # the source is stopped while a storage is only served
@@ -1542,7 +1542,7 @@ def case_rotate_kek() -> dict:
                     f"whole storage ({len(old_names)} of its binlogs need "
                     f"it), purge_binlogs included: the old "
                     f"KEK can only be dropped after its binlogs were "
-                    f"purged WITH it in the keyring (ticket 35 for the "
+                    f"purged WITH it in the keyring (ticket 35 (PBS-108) for the "
                     f"query commands)"] if half_usable else []) +
                   ([f"the refusal does not name the KEK id or the binlog: "
                     f"{sorted(set(unclear))[:2]}"] if unclear else []) +
@@ -1744,7 +1744,7 @@ def case_encryption_on() -> dict:
     table.add(step, "(storage)",
               f"metadata.json before: {metadata_0.strip()}; after list: "
               f"{metadata_listed.strip()}" +
-              (" (list wrote to the storage: ticket 28)"
+              (" (list wrote to the storage: ticket 28, PBS-100)"
                if metadata_listed != metadata_0 else ""))
     rows("SECRETAFTERON", 12)
     fetched = table.command(step, run("fetch", config))

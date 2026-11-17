@@ -109,7 +109,7 @@ comparison accept ticket 14's (PBS-80) effects and nothing else: a closed
 binlog stored without the ROTATE event that ends it on the source, and
 binlogs without transactions missing before the last stored one. It prints
 how often it accepted them. Mandatory `rewrite` mode (upstream `4717df9`)
-fixes ticket 14, so only `upgrade_test` still needs it, for the storage the
+fixes ticket 14, PBS-80, so only `upgrade_test` still needs it, for the storage the
 old binary writes. The other harnesses
 reuse these pieces, so they share its config shape and its integrity checks.
 
@@ -121,8 +121,8 @@ JSON and exits non-zero on a failure.
 | Script | What it does | Found |
 | --- | --- | --- |
 | `fetch_crash_test.py` | randomized workload + crash/resume state machine (above) | — |
-| `concurrent_storage_test.py` | runs several `fetch` instances against **one** storage at once (a cron `fetch` overrunning into the next run); checks the storage is not corrupted and heals. Two writers on one storage are an unsupported scenario (ticket 24, closed as not a bug in PBS-87), so its failures document misuse, not defects | ticket 24 (PBS-87) |
-| `source_change_test.py` | changes the source under a running backup: `RESET BINARY LOGS`, a different server (failover), binlogs purged before fetch, a mid-stream restart | ticket 25 |
+| `concurrent_storage_test.py` | runs several `fetch` instances against **one** storage at once (a cron `fetch` overrunning into the next run); checks the storage is not corrupted and heals. Two writers on one storage are an unsupported scenario (ticket 24, PBS-87, closed as not a bug in PBS-87), so its failures document misuse, not defects | ticket 24 (PBS-87) |
+| `source_change_test.py` | changes the source under a running backup: `RESET BINARY LOGS`, a different server (failover), binlogs purged before fetch, a mid-stream restart | ticket 25 (PBS-141) |
 | `event_variety_test.py` | drives less common event types — transaction compression, `binlog_row_image=MINIMAL`, partial JSON, XA, tagged GTIDs — through a full fetch and a kill/resume | — (no bug) |
 | `pull_replica_fault_test.py` | network faults (Toxiproxy) between `pull` and a MySQL replica — resets, cuts at 1 KB / 100 KB / inside an 8 MB event / during the login, a stall past `replica_net_timeout`, refused connections, 1-byte pieces, latency, low bandwidth — while the source writes; the replica must reconnect and end with the source's data | — (no bug) |
 | `pull_restart_test.py` | a MySQL replica of `pull` (auto-positioning in GTID mode) across restarts of `pull` — SIGTERM or SIGKILL while idle, while the source writes, inside an 8 MB event, while the source rotates into binlogs without transactions, while a lagging replica catches up, and five quick kill/restart cycles; the replica must reconnect to the new `pull` and end with the source's data | — (no bug) |
@@ -269,7 +269,7 @@ mode 0600 and outside the telemetry directory, ends up holding a report with
 mode 0644 (ticket 66). `s3_buffer` runs `pull` on the local S3 server (only
 with `--s3-bucket-dir`): without `fs_buffer_directory` the backend's local
 buffer under `$TMPDIR` is a 0755 directory with a 0644 file under umask 022,
-and an existing `fs_buffer_directory` of mode 0777 is accepted (ticket 65).
+and an existing `fs_buffer_directory` of mode 0777 is accepted (ticket 65, PBS-138).
 
 `s3_buffer_swap` (2026-11-16, also only with `--s3-bucket-dir`) does what
 that directory allows. The backend downloads the binlog object into the
@@ -284,7 +284,7 @@ truncated when the swap hits the start-up resize, and its content is
 uploaded to the bucket. In the debug build the plain `symlink` variant ends
 in an assertion (`s3_storage_backend.cpp:366`, the size of the path against
 the downloaded length), which release builds do not have. The case fails
-(ticket 65).
+(ticket 65, PBS-138).
 
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/file_security_test.py \
@@ -298,11 +298,11 @@ Between two `fetch` runs, someone who can write to the storage but has no
 keyring edits the metadata of the last stored binlog; the configuration and
 the keyring stay as they are. On 2026-11-16 both cases fail. With the
 `encryption` record removed (`strip_encryption`), the next `fetch` exits 0
-and appends plaintext to the encrypted storage (ticket 62). With the record
+and appends plaintext to the encrypted storage (ticket 62, PBS-136). With the record
 replaced by the previous binlog's (`transplant_encryption`), the appended
 data is encrypted with that binlog's AES-CTR keystream: XORed with the
 keystream the previous binlog's known plaintext gives, every appended byte
-decrypts (ticket 63). A `fetch` that refuses the edited metadata passes
+decrypts (ticket 63, PBS-137). A `fetch` that refuses the edited metadata passes
 either case.
 
 A sweep added later that day edits one member at a time (82 cases in
@@ -317,18 +317,18 @@ reused, the other binlogs keep their bytes, and, if `fetch` exits 0, that
 wrong types, GTID edits and index edits are refused cleanly. 27 cases fail
 (28 in GTID mode), the same on file storage, on S3 and with the ASan build:
 
-- `"encryption": null` gives plaintext like a removed record (ticket 62).
+- `"encryption": null` gives plaintext like a removed record (ticket 62, PBS-136).
 - Lowering the block counter in the stored data IV makes the appended data
   reuse the keystream of the same binlog's start, and in GTID mode with
   rewrite a lowered `size` does the same over the truncated transactions
-  (`size_rewrite`; both ticket 63).
+  (`size_rewrite`; both ticket 63, PBS-137).
 - A `kek_id` of another KEK, or a changed IV or wrapped key, is accepted:
   `fetch` exits 0 and appends data nobody can read. A first index entry that
-  is removed makes `fetch` delete that binlog (ticket 53).
+  is removed makes `fetch` delete that binlog (ticket 53, PBS-126).
 - Sixteen edits that make the final flush fail (a cipher name that is not a
   CTR cipher, an IV or key of the wrong length, a GCM tag that no longer
   verifies) end with "successfully fetched everything" and exit 0 while
-  nothing is stored: the storage destructor swallows the error (ticket 73).
+  nothing is stored: the storage destructor swallows the error (ticket 73, PBS-143).
 
 Since upstream `4717df9` GTID mode is always rewrite mode, whose binlogs are
 the Binlog Server's own files. In GTID mode the harness therefore sets an 8K
@@ -340,14 +340,14 @@ rather than its bytes. On 2026-11-17 (the merge build) 35 of 84 GTID cases
 fail. Besides the cases above, which fail in GTID mode too (`strip_encryption`
 and `transplant_encryption` included), these are new in rewrite mode:
 - a lowered `size` makes the next transactions reuse the cut-off ones'
-  keystream on the sweep's storage too (`size`, ticket 63);
+  keystream on the sweep's storage too (`size`, ticket 63, PBS-137);
 - an emptied or foreign `previous_gtids` / `added_gtids` makes `fetch` store
   transactions again, an extended `added_gtids` makes it skip one, with exit
   0 (ticket 81, PBS-147);
 - a `size` lowered into the last event lets rewrite mode append behind the
   broken event, which `pull` cannot serve past (`size_lowered`), and a
   swapped index pair makes `fetch` append to the wrong binlog before it
-  refuses (`index_reordered_pair`; both ticket 53).
+  refuses (`index_reordered_pair`; both ticket 53, PBS-126).
 The nightly runs GTID mode on Saturdays.
 
 ```sh
@@ -367,11 +367,11 @@ the replica reports anything (ticket 53, PBS-126, now shown end to end).
 Without the footer patch (`forged_row_bad_checksum`) the replica's receiver
 stops with error 13122 and applies nothing, so the replica's own checksum
 verification is the only check; `pull` serves the event either way. In
-`doubled_preamble` the binlog a hostile source leaves in ticket 69 is served
+`doubled_preamble` the binlog a hostile source leaves in ticket 69 (PBS-144) is served
 to a replica: the replica ends with exactly the source's data, so that
 malformed binlog does not corrupt a replica (recorded, not judged).
 
-`plaintext_swap` (2026-11-16) is the read side of ticket 62: the data file
+`plaintext_swap` (2026-11-16) is the read side of ticket 62 (PBS-136): the data file
 of an encrypted binlog is replaced with plaintext events (the source's own
 binlog with one row value changed and the CRC32 recomputed) and the
 `encryption` member is deleted from its metadata. `pull` serves it and the
@@ -408,13 +408,13 @@ with nothing recorded (`pull_sigterm/*`, `pull_sigint/*`). With
 reported, but the flush at exit still is not, so the tail after the last
 checkpoint is lost silently (`checkpoint/*/final_flush/*`); the same when
 only one write of the final flush fails once (`partial/*`). All of these
-are ticket 73. Reported correctly: a failing flush at a rotation or after a
+are ticket 73 (PBS-143). Reported correctly: a failing flush at a rotation or after a
 read timeout in a running `pull`, every fault while a first `fetch` creates
 the storage, `purge_binlogs` (status "warning" when a binlog cannot be
 deleted, "error" when the index cannot be rewritten), and a log file that
 cannot be created. One more defect is separate: `list` and
 `search_by_timestamp` leave out a binlog whose metadata cannot be parsed and
-still answer "success" (`query/*`, ticket 80). 23 of 44 cases fail on file
+still answer "success" (`query/*`, ticket 80, PBS-146). 23 of 44 cases fail on file
 storage and 15 of 33 with `--s3-fault-proxy` (cases `.../on_s3`; the
 `s3_buffer/write` case needs `--fsfault-lib` as well). `--cases` selects
 cases by substring.
@@ -432,9 +432,9 @@ Talks to the `pull` listener with the raw client of `listener_fuzz_test.py`.
 the configured user name and once with another: after one successful login
 the configured name gets ERR 1045 at once and any other name "perform full
 authentication", so the first reply tells whether a name is the replication
-user (ticket 67). `long_statement` logs in and sends `SET` followed by 1,000
+user (ticket 67, PBS-142). `long_statement` logs in and sends `SET` followed by 1,000
 to 1,000,000 spaces: at 100,000 `pull` ends with a segmentation fault, in the
-debug and the release build (ticket 72). Both fail on 2026-11-16.
+debug and the release build (ticket 72, PBS-140). Both fail on 2026-11-16.
 
 Three more cases (`--cases` selects some; `long_statement` stays last, as it
 ends `pull`):
@@ -470,7 +470,7 @@ requires `pull` to run, to serve a new login within 10 s and to stay under
 failures are new: one COM_QUERY of 16 MB keeps every client waiting for 25 s
 (3 s with the release build; ticket 74, PBS-156), and a heartbeat period of 1 ns or
 1,000 ns makes an idle dump send and log thousands of heartbeats a second
-(ticket 75, PBS-155). The other nine are ticket 72 again, with other statements: any
+(ticket 75, PBS-155). The other nine are ticket 72 (PBS-140) again, with other statements: any
 run of 40,000 or more characters that one of the handshake patterns matches
 ends `pull`; they run last (`--no-long-runs` leaves them out).
 
@@ -543,7 +543,7 @@ measured).
 Three more names were added on 2026-11-16, and all fail in position mode.
 `reannounce` renames the next binlog to the current one: `fetch` exits 0 and
 the stored binlog gets a second FORMAT_DESCRIPTION and the next binlog's
-events after its ROTATE (ticket 69; in GTID mode `fetch` refuses it).
+events after its ROTATE (ticket 69 (PBS-144); in GTID mode `fetch` refuses it).
 `lower_sequence` uses `binlog.000002` on a storage that starts at
 `binlog.000004`: `fetch` exits 0, and every later start fails with "binlog
 index contains a reference to a non-existing object" (ticket 70, PBS-158, also in
@@ -554,7 +554,7 @@ placed: the stored `binlog.000001` is replaced (ticket 71, PBS-157). The nightly
 no such mount, so it does not run this case.
 
 `reannounce_midstream` (2026-11-16, GTID mode only) is the variant of
-ticket 69 that GTID mode does not refuse: after a complete transaction the
+ticket 69 (PBS-144) that GTID mode does not refuse: after a complete transaction the
 proxy injects an artificial ROTATE that names the open binlog at position 4
 and copies of its FORMAT_DESCRIPTION and PREVIOUS_GTIDS_LOG, and lowers the
 log_pos of what follows. `fetch` exits 0 and the stored binlog has a second
@@ -605,7 +605,7 @@ checkpointing the loss is recorded only. On 2026-11-16 all 20 cases pass on
 file storage (median loss after a kill: 7 MB without checkpoints, 12 KB at
 64K, 150 KB at 1M, 0.9 MB at 1s). With `--storage s3` two fail: at 64K
 `pull` cannot keep up, because every checkpoint uploads the whole binlog
-again (ticket 17; 375 MB uploaded for an 8.5 MB binlog), and a kill or even
+again (ticket 17 (PBS-82); 375 MB uploaded for an 8.5 MB binlog), and a kill or even
 SIGTERM loses 3 to 7 MB. The numbers depend on the host's load. With
 `--no-s3-proxy` some kills at 64K leave the local gateway with a cut-off
 object shorter than its metadata says, which the next start refuses; that is
@@ -630,15 +630,15 @@ are dropped. What fails:
   it is stored twice, two swapped transactions are stored swapped, and
   edits of `added_gtids` / `previous_gtids` in the last binlog's metadata
   make `fetch` skip transactions for good or store them again, with exit 0
-  (ticket 81; without rewrite a position check refuses these);
+  (ticket 81 (PBS-147); without rewrite a position check refuses these);
 - a `transaction_length` lowered on the way: `fetch` exits 1, but GTID and
   BEGIN are stored and the GTID recorded; the next `fetch` exits 0 without
-  the rows, and a MySQL 8.4 replica of `pull` aborts (ticket 82);
+  the rows, and a MySQL 8.4 replica of `pull` aborts (ticket 82, PBS-148);
 - the encryption-record and `size` edits of tickets 62 and 63 behave as
   without rewrite;
 - after a kill the bytes past the recorded size are written again with the
   same key and IV, and because the generated events carry a new timestamp
-  the two plaintexts differ (ticket 32, here without any attacker).
+  the two plaintexts differ (ticket 32, PBS-104, here without any attacker).
 
 `--random-kills` sets the number of kills of the last case (default 10).
 
@@ -669,8 +669,8 @@ error in its status. In GTID mode `pull` also accepts the plain
 re-announcement that `fetch` refuses. With rewrite, an EOF after GTID +
 BEGIN leaves fragments in the stored binlog that `pull` can no longer serve
 (ticket 83, PBS-150), and duplicated, swapped or replayed transactions are stored
-(ticket 81). A lowered `transaction_length` leaves a stub in every mode
-(ticket 82). `pull` reconnects once a second without back-off; an ERR
+(ticket 81, PBS-147). A lowered `transaction_length` leaves a stub in every mode
+(ticket 82, PBS-148). `pull` reconnects once a second without back-off; an ERR
 packet from the source ends it with exit 1. Since rewrite mode is
 mandatory, the GTID-mode cases without it are gone: rewrite mode names its
 own binlogs, so the hostile names no longer reach the storage in GTID mode.
@@ -691,7 +691,7 @@ then after one edit of the metadata or the index at a time. Where a search
 returns a wrong list, the test replays that list with `mysqlbinlog | mysql`
 into a scratch server and compares the rows. On 2026-11-16, 22 of 64 cases
 fail in GTID mode and 18 of 54 in position mode, all consequences of
-unauthenticated metadata (ticket 53): with the head of `binlog.index`
+unauthenticated metadata (ticket 53, PBS-126): with the head of `binlog.index`
 removed, any purge, also a refused one, deletes the binlogs no longer
 listed; with a reordered index a purge removes the index prefix, the
 newest binlog included; a lowered `size` of the newest binlog makes any
@@ -716,7 +716,7 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/purge_search_tamper_test.py \
 
 ### A transaction cut off by its declared length — `truncated_transaction_test.py`
 
-Follows up ticket 82 in position mode, GTID mode and GTID mode with rewrite
+Follows up ticket 82 (PBS-148) in position mode, GTID mode and GTID mode with rewrite
 (`--rewrite`), for `fetch` and a running `pull`. A proxy lowers
 `transaction_length` in one GTID event so the transaction seems to end
 after the GTID, after BEGIN, after TABLE_MAP or after the first ROWS event
@@ -743,8 +743,8 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/truncated_transaction_test.py \
 ### Who can still read a damaged binlog — `damaged_binlog_consumers_test.py`
 
 Produces the malformed binlogs the attack tests leave in a storage (a
-second preamble, ticket 69; duplicated, swapped, foreign or missing
-GTIDs, ticket 81; a cut-off transaction, ticket 82; a forged row and a
+second preamble, ticket 69 (PBS-144); duplicated, swapped, foreign or missing
+GTIDs, ticket 81 (PBS-147); a cut-off transaction, ticket 82 (PBS-148); a forged row and a
 plaintext swap, tickets 53 and 62; a lower sequence number, ticket 70 (PBS-158); the
 rewrite-mode layouts) and gives each to every consumer: `mysqlbinlog` on
 the files with position and GTID options, a replay into a scratch server,
@@ -775,7 +775,7 @@ unwraps the file key with a given keyring), so it can say which bytes the
 operator, an attacker or nobody can read. On 2026-11-17, 5 of 19 cases fail
 in both modes, the same on the ASan and release builds and on the build
 with mandatory rewrite mode. A KEK id is not bound to its key bytes
-(ticket 85): with the bytes of the active CTR KEK overwritten in the
+(ticket 85, PBS-161): with the bytes of the active CTR KEK overwritten in the
 keyring (write access is enough), `list` and `fetch` exit 0 and everything
 stored afterwards is readable with the attacker's key only; a GCM KEK
 catches that on the open binlog, but not once the operator rotates to a
@@ -783,7 +783,7 @@ KEK whose bytes were already replaced; a cipher name changed from CBC to
 CTR is accepted too. A wrong keyring backup (right id, other bytes) is the
 same by accident: three `fetch` runs exit 0 and store data the right
 keyring cannot read. Turning encryption on for a plain storage leaves the
-open binlog in plaintext until the next rotation (ticket 86). What works:
+open binlog in plaintext until the next rotation (ticket 86, PBS-162). What works:
 rotation to a new KEK (the open binlog stays under the old one, nothing is
 re-wrapped; with the old KEK removed every command refuses the whole
 storage until its binlogs are purged), 93 malformed keyrings (clean exits,
@@ -807,14 +807,14 @@ address-space cap (`--memory-cap-mib`), and a run needs about 1.3 GB of
 disk. On 2026-11-17, 7 of 18 cases fail in position mode and 8 in GTID
 mode. An unfinished transaction is buffered whole, about one byte of
 memory per byte streamed, whatever the checkpoint settings, until
-`std::bad_alloc` ends `fetch` or `pull` (ticket 87); without checkpoint
+`std::bad_alloc` ends `fetch` or `pull` (ticket 87, PBS-163); without checkpoint
 settings the whole binlog being received is held the same way.
 Transactions whose GTIDs skip numbers make every new rewrite-mode binlog
 carry the whole GTID set: 0.4 MiB of stream became 14 MiB in about 1,000
 binlogs, and with 6,000 such transactions `list` fails with
-`std::bad_alloc` at 3 GiB (ticket 88). `binlog.index` is rewritten in full
+`std::bad_alloc` at 3 GiB (ticket 88, PBS-164). `binlog.index` is rewritten in full
 at every rotation (ticket 91), and the info log outgrows the stream
-(ticket 45). Bounded: an event header that claims 3.5 GiB allocates
+(ticket 45, PBS-118). Bounded: an event header that claims 3.5 GiB allocates
 nothing ahead of the data, a transaction longer than declared is refused
 at once, sequence number 1,000,000 is refused, and a stalled replica costs
 about 4 MiB.
@@ -863,10 +863,10 @@ rewrite mode, after an interrupted rotation (a kill at the wrong moment is
 enough: 22 of 40 random kills), the next `fetch` appends transactions
 behind the closing ROTATE of the previous binlog, and deleting the last
 binlog and fetching again does the same and moves transactions to other
-positions (ticket 89); only an in-place trim, an emptied last binlog or a
-fresh storage are clean there. A reset or replaced source (ticket 25) has
+positions (ticket 89, PBS-165); only an in-place trim, an emptied last binlog or a
+fresh storage are clean there. A reset or replaced source (ticket 25, PBS-141) has
 no in-place repair. Rebuilding `binlog.index` from a directory listing is
-wrong when a binlog with a lower number was planted (ticket 70).
+wrong when a binlog with a lower number was planted (ticket 70, PBS-158).
 
 What worked, by the message `fetch` and `pull` exit with (stop the writer
 and copy the storage first; verify with two `fetch` runs, `list`, and a
@@ -1067,7 +1067,7 @@ source does (the replica reports 13114, 'the source purged required binary
 logs'). The replica that is ahead is accepted by design (PBS never
 originates transactions, so its own UUID never appears in a GTID): the case
 expects its I/O thread to stay up with no error and to receive the next
-transaction the source writes. Before PBS-120 (ticket 20) the purged replica
+transaction the source writes. Before PBS-120 (ticket 20, PBS-120) the purged replica
 was silently streamed what was left. The nightly runs it every night (`QA_PORT`+230, about 3 min).
 
 `pull_gtid_set_test.py` checks where `pull` starts an auto-positioned dump
@@ -1452,7 +1452,7 @@ server rather than starting one.
      `ubsan_gcc14:unit_tests` line of `known_failures.txt`. First run on
      2026-11-16: one report, a signed overflow in
      `util::microseconds_to_high_resolution_time_point` for a 2^60 µs
-     timestamp in `event_test` (ticket 79; only tests call the getters that
+     timestamp in `event_test` (ticket 79 (PBS-145); only tests call the getters that
      use it). The QA harnesses were run once by hand against this build's
      `binlog_server` on the same day (25 runs, no report); the nightly does
      not repeat that.
@@ -1569,7 +1569,7 @@ server rather than starting one.
   ticket 14 (PBS-80; a closed binlog stored without its closing ROTATE,
   binlogs without transactions skipped), so they accept only those effects
   in the storage it writes and any other GTID-mode failure is new. Mandatory
-  `rewrite` mode (upstream `4717df9`) fixes ticket 14 in the current binary,
+  `rewrite` mode (upstream `4717df9`) fixes ticket 14 (PBS-80) in the current binary,
   so `fetch_crash_test` no longer needs the option and the MTR test
   `gtid_resume_after_rotation` was removed.
 - **`ci_property_tests.sh`** — what the CI job *GCC 14 Debug Property Tests*

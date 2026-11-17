@@ -36,7 +36,7 @@ storage through a running 'pull', which gets SIGKILL at a random moment
 - recovery: the next 'fetch' must exit 0 and leave an exact copy;
 - on S3: the bytes uploaded in PUT requests for the binlog object, counted
   by an s3_fault_proxy.py this harness starts in front of --s3-endpoint
-  (every checkpoint uploads the whole binlog again, ticket 17).
+  (every checkpoint uploads the whole binlog again, ticket 17, PBS-82).
 
 'pull/term/<setting>' is the same with SIGTERM, for comparison (the loss is
 what the source committed up to the signal and 'pull' did not record before
@@ -120,7 +120,7 @@ SETTINGS = {"none": (None, None), "size_64K": ("64K", None),
 TRANSACTION_BYTES = (10_000, 100_000)
 # what the bounds allow for data on its way from the source
 LATENCY_SECONDS = 1.0
-# 'pull' notices SIGTERM when its read from the source returns (ticket 43)
+# 'pull' notices SIGTERM when its read from the source returns (ticket 43, PBS-116)
 READ_TIMEOUT = 5
 SAMPLE_SECONDS = 0.02
 # the sample key of the MTR suite, for the listener of 'pull'

@@ -24,7 +24,7 @@ of listener_fuzz_test.py. Cases:
   caching_sha2_password response, once with the configured user name and
   once with another name, before any client has logged in and again after
   one successful login. The first reply must be of the same kind for both
-  names (ticket 67: after a login the configured name gets ERR 1045 at once,
+  names (ticket 67 (PBS-142): after a login the configured name gets ERR 1045 at once,
   any other name 'perform full authentication', so one connection tells
   whether a name is the replication user).
 - 'guess_rate': how fast wrong passwords can be tried. For about 10 s each,
@@ -75,7 +75,7 @@ of listener_fuzz_test.py. Cases:
 - 'long_statement': a logged-in client sends COM_QUERY with 'SET' followed
   by 1,000 to 1,000,000 spaces, then 'SET @master_heartbeat_period=' with a
   long run of digits. After each, 'pull' must still run and serve a new
-  login (ticket 72: the statement is matched with std::regex, which recurses
+  login (ticket 72 (PBS-140): the statement is matched with std::regex, which recurses
   per character; 100,000 spaces end 'pull' with a segmentation fault).
 
 A JSON line per case, then a summary; exit 1 if any case failed. Example:

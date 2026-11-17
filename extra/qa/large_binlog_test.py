@@ -24,9 +24,9 @@ binlog (max_binlog_size 1 GiB here) only after the transaction that crosses
 max_binlog_size. The large transaction is built from UPDATEs of a table of
 ROWS rows of ROW_SIZE bytes (each UPDATE logs a before and an after image of
 every row), which keeps every event at about 2 MiB, below the 16 MiB a
-replica of 'pull' can receive (ticket 10). Cases:
+replica of 'pull' can receive (ticket 10, PBS-76). Cases:
 
-  transaction_over_4gib  one transaction of about 4.7 GB (ticket 41: the
+  transaction_over_4gib  one transaction of about 4.7 GB (ticket 41 (PBS-114): the
                          collector refuses a transaction_length above 32
                          bits);
   binlog_over_4gib       about 1 GB of 1 MiB transactions, then one of about

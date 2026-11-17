@@ -32,7 +32,7 @@ runs with a persistent fault on what that final flush does:
 
 A case passes when the failure is reported (a non-zero exit code) or the
 data is stored after all; it fails when 'fetch' exits 0 while the new data
-is not recorded in the storage (ticket 73: the flush runs in the storage
+is not recorded in the storage (ticket 73 (PBS-143): the flush runs in the storage
 destructor, which drops the error, and the log ends with "successfully
 fetched everything"). Each result also shows what the next 'fetch' without a
 fault does.
@@ -219,7 +219,7 @@ def s3_case(machine, proxy, match: str, action: str) -> dict:
 # ---------------------------------------------------------------------------
 
 # 'pull' notices a signal when its read from the source returns, which with
-# an idle source takes up to 'connection.read_timeout' (ticket 43)
+# an idle source takes up to 'connection.read_timeout' (ticket 43, PBS-116)
 PULL_READ_TIMEOUT = 8
 CHECKPOINT_SIZE = "64K"
 SMALL = {"rows": [2000], "ddl": False}

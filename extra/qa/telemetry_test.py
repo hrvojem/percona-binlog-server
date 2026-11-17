@@ -40,7 +40,7 @@ report as 'effective' and the clamping cases check; reports therefore come
                        user name or the storage path;
   scrape_zero          grace and scrape_interval 0: clamped to 20 s and
                        10 s (logged), so 2 to 4 reports in 45 s, not a
-                       tight loop (ticket 49, fixed by PBS-122);
+                       tight loop (ticket 49, PBS-122, fixed by PBS-122);
   scrape_negative      a scrape_interval past INT64_MAX seconds
                        ('106751991167301d', ~292 million years) is clamped
                        to the 7-day maximum, not wrapped to a negative or

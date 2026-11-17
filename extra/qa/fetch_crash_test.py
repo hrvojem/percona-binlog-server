@@ -56,7 +56,7 @@ transactions: the stored ones must be a prefix of the server's during the
 run, and all of them after a complete fetch.
 
 With '--tolerate-ticket-14' (GTID mode, file comparison), the checks accept the two known
-effects of ticket 14 and nothing else: a closed binlog stored without the
+effects of ticket 14 (PBS-80) and nothing else: a closed binlog stored without the
 ROTATE event that ends it on the server, server binlogs that hold no
 transactions missing from the storage and from 'binlog.index', and such a
 binlog stored with only the binlog magic (indexed while it was the server's
@@ -356,7 +356,7 @@ def transactions_of(data: bytes) -> list:
 
 def ticket_14_skippable(name: str) -> bool:
     """With --tolerate-ticket-14: a server binlog without transactions,
-    which a GTID-mode resume never receives (ticket 14)."""
+    which a GTID-mode resume never receives (ticket 14, PBS-80)."""
     return TOLERATE_TICKET_14 and \
         not holds_transactions(SERVER.binlog_as_sent(name))
 
@@ -918,7 +918,7 @@ def main():
     parser.add_argument("--tolerate-ticket-14", action="store_true",
                         help="GTID mode: accept a closed binlog stored "
                              "without its closing ROTATE and missing binlogs "
-                             "without transactions (ticket 14)")
+                             "without transactions (ticket 14, PBS-80)")
     args = parser.parse_args()
 
     gtid_mode = args.mode == "gtid"
@@ -963,7 +963,7 @@ def main():
         return 0
     finally:
         if TOLERATE_TICKET_14:
-            print(f"ticket 14 accepted: {TICKET_14_HITS['missing_rotate']} "
+            print(f"ticket 14 (PBS-80) accepted: {TICKET_14_HITS['missing_rotate']} "
                   f"binlog(s) without their closing ROTATE, "
                   f"{TICKET_14_HITS['skipped_binlog']} binlog(s) without "
                   f"transactions skipped, "

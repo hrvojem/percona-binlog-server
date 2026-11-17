@@ -31,15 +31,15 @@ States (a state that needs the other --mode is skipped with the reason):
   S0_control             an untouched storage (both modes): what every
                          consumer does with a good storage
   S0_rewrite_control     the same in rewrite mode (GTID)
-  S1_reannounce          ticket 69, position mode: the next binlog's preamble
+  S1_reannounce          ticket 69, PBS-144, position mode: the next binlog's preamble
                          and events appended to the binlog just closed
                          (hostile_source_test.py 'reannounce')
-  S1_midstream           ticket 69, GTID mode: a second FORMAT_DESCRIPTION +
+  S1_midstream           ticket 69, PBS-144, GTID mode: a second FORMAT_DESCRIPTION +
                          PREVIOUS_GTIDS_LOG in the middle of a binlog, and
                          after them events whose end positions are lower
                          than their file offsets ('reannounce_midstream')
   S2_gtid_twice / S2_gtid_swapped / S2_gtid_other_uuid
-                         ticket 81, rewrite mode: a transaction stored twice,
+                         ticket 81, PBS-147, rewrite mode: a transaction stored twice,
                          two transactions in swapped order, a transaction
                          under a foreign UUID (rewrite_attack_test.py
                          'source_gtid_*')
@@ -49,12 +49,12 @@ States (a state that needs the other --mode is skipped with the reason):
                          of a transaction is no duplicate-key error
   S2_tail_added_emptied / S2_tail_previous_emptied /
   S2_tail_added_other_uuid / S2_tail_added_extended
-                         ticket 81, encrypted rewrite storage whose last
+                         ticket 81, PBS-147, encrypted rewrite storage whose last
                          binlog's metadata was edited before a 'fetch'
                          ('storage_tail_*'): transactions stored twice,
                          PREVIOUS_GTIDS_LOG events that contradict the
                          binlogs before them, a GTID range missing
-  S3_length_smaller      ticket 82: a transaction stored as GTID + BEGIN only
+  S3_length_smaller      ticket 82 (PBS-148): a transaction stored as GTID + BEGIN only
                          ('source_length_smaller')
   S4_forged_row / S4_plaintext_swap
                          tickets 53 / 62: a row changed in the ciphertext, a

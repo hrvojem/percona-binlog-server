@@ -14,7 +14,7 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 
-"""A transaction that is cut short on its way into the storage (ticket 82).
+"""A transaction that is cut short on its way into the storage (ticket 82, PBS-148).
 
 The Binlog Server takes the end of a transaction from one number: the
 'transaction_length' of its GTID_LOG / ANONYMOUS_GTID_LOG event. Once the
@@ -712,7 +712,7 @@ def act(action: str, process: subprocess.Popen, proxy: CutProxy) -> None:
         harness.SERVER.process.wait()
         harness.SERVER.process = None
     if action != "timeout":
-        # a signal is only noticed once the blocked read returns (ticket 43)
+        # a signal is only noticed once the blocked read returns (ticket 43, PBS-116)
         time.sleep(1)
         proxy.release.set()
 

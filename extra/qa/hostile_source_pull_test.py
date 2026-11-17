@@ -111,7 +111,7 @@ With '--storage s3' the storage is the key prefix '<prefix>/st' of a bucket
 of an S3-compatible server whose objects are files under '--s3-bucket-dir'
 (where the checks read them); 'pull' reaches the server through an
 s3_fault_proxy.py of the run, which counts what it uploads: every flush
-uploads the whole object again (ticket 17), so 's3_traffic' of a result
+uploads the whole object again (ticket 17, PBS-82), so 's3_traffic' of a result
 and 's3_put_bytes' of its 'attack' say what a hostile source makes 'pull'
 upload. Canary objects under the sibling prefixes '<prefix>/',
 '<prefix>/canary/' and '<prefix>/stx/' fail a case if they are touched,
@@ -595,13 +595,13 @@ class Pull:
         lines = [line.strip().split("] ", 2)[-1][:230]
                  for line in self.log().splitlines()
                  if ("[  error]" in line or "exception caught" in line) and
-                 # a client that closes its connection (ticket 42)
+                 # a client that closes its connection (ticket 42, PBS-115)
                  "system error caught in session" not in line]
         return lines[-limit:]
 
     def stop(self, proxy, grace: float = 10) -> dict:
         """SIGTERM; 'proxy' (if any) closes the source connection, on which
-        'pull' otherwise waits up to connection.read_timeout (ticket 43)."""
+        'pull' otherwise waits up to connection.read_timeout (ticket 43, PBS-116)."""
         result = {"exit_before_signal": self.process.poll()}
         if result["exit_before_signal"] is None:
             started = time.monotonic()
@@ -782,7 +782,7 @@ STUCK_REPLICA = []
 
 def bounded_replica_sql(statements: str) -> str:
     """REPLICA.sql() with a limit. A MySQL 8.0 applier that was sent a
-    cut-off transaction (ticket 82) never finishes STOP REPLICA: the
+    cut-off transaction (ticket 82, PBS-148) never finishes STOP REPLICA: the
     coordinator waits for the end of the group, rpl_stop_replica_timeout
     is a year. Such a server is killed (the next case sets it up again);
     returns what happened, or ''."""
@@ -1394,7 +1394,7 @@ def run_case(name: str, proxy_port: int) -> dict:
                                       "lacks": served_missing}
         if recovered is not None:
             # killed after 2 s: without events from the source it stops
-            # only at connection.read_timeout (ticket 43)
+            # only at connection.read_timeout (ticket 43, PBS-116)
             recovery["pull_stop"] = recovered.stop(None, 2)
             problems += crashed(recovery["pull_stop"],
                                 "after the clean restart")
@@ -1461,7 +1461,7 @@ def run_case(name: str, proxy_port: int) -> dict:
         proxy.close()
         for process in (pull, recovered):
             if process is not None and process.exit_code() is None:
-                # connection.read_timeout later at the latest (ticket 43)
+                # connection.read_timeout later at the latest (ticket 43, PBS-116)
                 process.process.send_signal(signal.SIGTERM)
                 try:
                     process.process.wait(timeout=2)

@@ -330,6 +330,26 @@ wrong types, GTID edits and index edits are refused cleanly. 27 cases fail
   verifies) end with "successfully fetched everything" and exit 0 while
   nothing is stored: the storage destructor swallows the error (ticket 73).
 
+Since upstream `4717df9` GTID mode is always rewrite mode, whose binlogs are
+the Binlog Server's own files. In GTID mode the harness therefore sets an 8K
+`rewrite.file_size` and makes each of the first two source binlogs one
+transaction larger than that, so the stored binlogs still switch where the
+source's do. It takes the plaintext of a stored binlog from what `pull`
+serves, and the served copies must hold the source's first transactions
+rather than its bytes. On 2026-11-17 (the merge build) 35 of 84 GTID cases
+fail. Besides the cases above, which fail in GTID mode too (`strip_encryption`
+and `transplant_encryption` included), these are new in rewrite mode:
+- a lowered `size` makes the next transactions reuse the cut-off ones'
+  keystream on the sweep's storage too (`size`, ticket 63);
+- an emptied or foreign `previous_gtids` / `added_gtids` makes `fetch` store
+  transactions again, an extended `added_gtids` makes it skip one, with exit
+  0 (ticket 81, PBS-147);
+- a `size` lowered into the last event lets rewrite mode append behind the
+  broken event, which `pull` cannot serve past (`size_lowered`), and a
+  swapped index pair makes `fetch` append to the wrong binlog before it
+  refuses (`index_reordered_pair`; both ticket 53).
+The nightly runs GTID mode on Saturdays.
+
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/metadata_tamper_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/metadata-tamper
@@ -1347,7 +1367,7 @@ server rather than starting one.
      | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min); `rewrite_attack_test.py` (gtid, about 7 min) and `truncated_transaction_test.py` (position, about 3 min, and gtid with `--storage s3`, about 5 min); `resource_exhaustion_test.py` (position, about 5 min) | ASan; debug |
      | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) and `replica_tamper_test.py` (position, about 4 min); `keyring_test.py` (gtid, about 4 min) | ASan; debug |
      | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 7 min, with the local S3 server), `s3_upload_tamper_test.py` (position, about 1 min) and `listener_command_fuzz_test.py --tls` (gtid, about 5 min); `truncated_transaction_test.py` (gtid, about 3 min) and `damaged_binlog_consumers_test.py` (position, about 3 min); `stuck_storage_recovery_test.py` (gtid, about 9 min) | ASan; debug |
-     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min); `final_flush_test.py` (position, about 3 min); `hostile_source_pull_test.py --rewrite` (gtid, about 9 min); `resource_exhaustion_test.py` (gtid, about 9 min) | debug / ASan; debug |
+     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min); `final_flush_test.py` (position, about 3 min); `hostile_source_pull_test.py --rewrite` (gtid, about 9 min); `resource_exhaustion_test.py` (gtid, about 9 min); `metadata_tamper_test.py` (gtid, about 9 min) | debug / ASan; debug |
      | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) and `replica_tamper_test.py` (gtid, about 4 min); `truncated_transaction_test.py --rewrite` (gtid, about 5 min) and `damaged_binlog_consumers_test.py` (gtid, about 11 min); `pull_two_sided_attack_test.py` (gtid, about 5 min) and `purge_search_tamper_test.py --storage s3` (gtid, about 22 min) | ASan / debug; debug |
 
      `pull_versions/<series>` runs the replica harnesses of the nightly 8.4

@@ -33,19 +33,18 @@ they are. Cases:
   the previous binlog's known plaintext gives decrypts the appended data).
 - 'size': 'size' of the last binlog's metadata is lowered to the start of
   its second transaction (a copy of the ciphertext is kept first). Start-up
-  recovery truncates the binlog to it. In GTID mode fetch resumes from the
-  stored GTID set, which the edit left alone, so the source sends only NEW
-  transactions and they land on offsets that already were encrypted once:
-  old ciphertext XOR new ciphertext must not equal old plaintext XOR new
-  plaintext there. Without 'replication.rewrite' it cannot come to that:
-  every event carries its end position, which no longer matches the
-  storage's, so fetch stops with an error (after the truncation, and so
-  does every later fetch: the case reports that as 'fetch_again'). In
+  recovery truncates the binlog to it. In GTID mode (always rewrite mode
+  since PBS-80 / PBS-98, upstream 4717df9) fetch resumes from the stored
+  GTID set, which the edit left alone, so the source sends only NEW
+  transactions and the Binlog Server writes them from the lowered size on,
+  over offsets that already were encrypted once: old ciphertext XOR new
+  ciphertext must not equal old plaintext XOR new plaintext there (the new
+  plaintext is what 'pull' serves after the fetch). In
   position mode fetch asks the source for the binlog from the lowered
   position and gets the same bytes again, so the same ciphertext comes
   back and the case passes when the binlog ends as an exact copy.
-- 'size_rewrite' (GTID mode only): the same edit on a storage in rewrite
-  mode ('replication.rewrite' in the configuration from the start), where
+- 'size_rewrite' (GTID mode only): the same edit on a single-binlog
+  storage with a 1M 'rewrite.file_size', where
   the Binlog Server sets the event positions itself, so the new
   transactions are written over the cut-off offsets (ticket 63's other
   variant: with the keystream used there before, and fetch exits 0 with
@@ -76,6 +75,13 @@ they are. Cases:
         have stored something of what the source got.
   A failed case names the invariants in 'failed_invariants', with the
   numbers in 'why'.
+
+In GTID mode the storage is in rewrite mode, which writes its own binlog
+files: the harness sets an 8K 'rewrite.file_size' and makes each of the
+first two source binlogs one transaction larger than that, so the stored
+binlogs switch where the source's do; the plaintext of a stored binlog is
+what 'pull' serves of it, and (f) compares the served transactions with
+the source's instead of the bytes.
 
 With '--storage s3' the storage is a prefix in a bucket of an S3-compatible
 server whose objects are files under '--s3-bucket-dir' (where the checks
@@ -177,6 +183,38 @@ def fetch(binsrv, config: Path) -> "tuple[int, str]":
         return -1, "timeout"
     return completed.returncode, completed.stderr.decode(
         errors="replace")[-400:]
+
+
+# GTID mode is always rewrite mode (PBS-80 / PBS-98, upstream 4717df9), in
+# which the Binlog Server cuts its own binlogs by size: with this file size
+# and BIG_ROWS rows in each of the first two source binlogs (one transaction
+# each, larger than the file size), the stored binlogs switch where the
+# source's do, and the last one (three small transactions plus what a case
+# appends) stays below it
+GTID_FILE_SIZE = "8K"
+BIG_ROWS = 120
+
+
+def big_rows(rows: int) -> int:
+    """The rows of a transaction that must fill a binlog of its own."""
+    return BIG_ROWS if harness.BINSRV.gtid_mode else rows
+
+
+def served_plaintext(binsrv, config: Path, names: list, label: str) -> dict:
+    """GTID (rewrite) mode: the stored binlogs are the Binlog Server's own
+    files, not the source's, so their plaintext is what 'pull' serves of
+    them. Each must be served with its stored size."""
+    served = serve_and_dump(binsrv, config, names[0], label)
+    plain = served["served"]
+    for name in names:
+        stored = (binsrv.storage / name).stat().st_size
+        if len(plain.get(name, b"")) != stored:
+            raise harness.Failure(
+                f"{name} is not served as stored ({stored} bytes stored, "
+                f"{len(plain.get(name, b''))} served, pull exit "
+                f"{served['pull_exit']}, mysqlbinlog {served['dump_exit']} "
+                f"{served['dump_error'][-200:]}), so the case cannot run")
+    return plain
 
 
 def insert(marker: str, rows: int):
@@ -571,7 +609,7 @@ def case_transplant_encryption() -> dict:
     harness.SERVER.reset()
     binsrv.reset()
     config = write_config(binsrv)
-    insert("OLDBINLOG", 60)
+    insert("OLDBINLOG", big_rows(60))
     harness.SERVER.sql("FLUSH BINARY LOGS")
     insert("TAILFIRST", 2)
     first_fetch(binsrv, config)
@@ -580,7 +618,10 @@ def case_transplant_encryption() -> dict:
         raise harness.Failure(f"expected two stored binlogs, got {indexed}")
     previous, tail = indexed[-2], indexed[-1]
     previous_cipher = (binsrv.storage / previous).read_bytes()
-    previous_plain = harness.SERVER.binlog_as_sent(previous)
+    previous_plain = (served_plaintext(binsrv, config, indexed,
+                                       "transplant-0")[previous]
+                      if binsrv.gtid_mode else
+                      harness.SERVER.binlog_as_sent(previous))
     tail_before = (binsrv.storage / tail).read_bytes()
     previous_metadata = json.loads(
         (binsrv.storage / (previous + ".json")).read_text())
@@ -596,20 +637,36 @@ def case_transplant_encryption() -> dict:
     insert("TAILSECOND", 10)
     code, _ = fetch(binsrv, config)
     tail_after = (binsrv.storage / tail).read_bytes()
-    tail_plain = harness.SERVER.binlog_as_sent(tail)
     start = len(tail_before)
-    end = min(len(tail_after), len(previous_cipher), len(previous_plain),
-              len(tail_plain))
+    if binsrv.gtid_mode:
+        # rewrite mode writes its own events, so the source's binlog is not
+        # the plaintext of what was appended, and 'pull' cannot serve the
+        # binlog either (its start no longer decrypts): the marker rows
+        # that the previous binlog's keystream turns the appended bytes
+        # into show the reuse
+        tail_plain = b""
+        end = min(len(tail_after), len(previous_cipher),
+                  len(previous_plain))
+    else:
+        tail_plain = harness.SERVER.binlog_as_sent(tail)
+        end = min(len(tail_after), len(previous_cipher),
+                  len(previous_plain), len(tail_plain))
     # the previous binlog's keystream, from its known plaintext: what an
     # attacker who knows that binlog's content can compute without the key
     keystream = bytes(c ^ p for c, p in zip(previous_cipher[start:end],
                                             previous_plain[start:end]))
     recovered = bytes(c ^ k for c, k in zip(tail_after[start:end], keystream))
-    matching = sum(1 for a, b in zip(recovered, tail_plain[start:end])
-                   if a == b)
     compared = max(end - start, 0)
+    if binsrv.gtid_mode:
+        # each marker row is 'TAILSECOND-NNNN-' and 64 'x'
+        matching = recovered.count(b"TAILSECOND") * 80
+    else:
+        matching = sum(1 for a, b in zip(recovered, tail_plain[start:end])
+                       if a == b)
     # by chance one byte in 256 matches
-    reused = compared >= 64 and matching > compared // 2
+    reused = compared >= 64 and (b"TAILSECOND" in recovered
+                                 if binsrv.gtid_mode else
+                                 matching > compared // 2)
     result = {"case": "transplant_encryption", "previous_binlog": previous,
               "binlog": tail, "fetch_exit_after_the_edit": code,
               "binlog_size_before_and_after": [len(tail_before),
@@ -640,9 +697,9 @@ class Environment:
         harness.SERVER.reset()
         binsrv.reset()
         self.config = write_config(binsrv, kek_id)
-        insert("OLDBINLOG", 60)
+        insert("OLDBINLOG", big_rows(60))
         harness.SERVER.sql("FLUSH BINARY LOGS")
-        insert("MIDBINLOG", 20)
+        insert("MIDBINLOG", big_rows(20))
         harness.SERVER.sql("FLUSH BINARY LOGS")
         for _ in range(3):
             insert("TAILFIRST", 8)
@@ -662,10 +719,16 @@ class Environment:
                        for data in self.before.values()):
             raise harness.Failure("the binlogs were not stored encrypted, "
                                   "so the case cannot run")
-        # what the source holds of every stored binlog: the plaintext of
-        # the stored ciphertext
-        self.plain_before = {name: harness.SERVER.binlog_as_sent(name)
-                             for name in self.names}
+        # the plaintext of the stored ciphertext: what the source holds of
+        # every stored binlog, or in GTID (rewrite) mode what 'pull' serves
+        self.source_before = {name: harness.SERVER.binlog_as_sent(name)
+                              for name in harness.SERVER.binlog_names()}
+        self.plain_before = (
+            served_plaintext(binsrv, self.config, self.names, "before")
+            if self.gtid_mode else
+            {name: self.source_before[name] for name in self.names})
+        # GTID mode: what 'pull' serves after the fetch (run_sweep_case)
+        self.served_after = {}
         # the keystream reuse check also tries these distances between a
         # file offset and the offset of the keystream used for it
         self.shifts = [0]
@@ -762,7 +825,10 @@ def find_keystream_reuse(before: dict, after: dict, plain_before: dict,
 
 
 def check_served(environment, dump: dict, plain_after: dict) -> tuple:
-    """Invariant (f): returns (failures, numbers)."""
+    """Invariant (f): returns (failures, numbers). In GTID (rewrite) mode
+    the served binlogs are the Binlog Server's own files, so their
+    transactions, in order, must be the first transactions of the
+    source's."""
     failures = []
     numbers = {}
     if dump["pull_exit"] is not None:
@@ -771,6 +837,30 @@ def check_served(environment, dump: dict, plain_after: dict) -> tuple:
     if dump["dump_exit"] != 0:
         failures.append(f"mysqlbinlog ended with {dump['dump_exit']}: "
                         f"{dump['dump_error'][-200:]}")
+    if environment.gtid_mode:
+        for name in environment.names:
+            if name not in dump["served"]:
+                failures.append(f"{name}, stored before the edit, is not "
+                                "served")
+        served = []
+        for name in sorted(dump["served"]):
+            served += harness.transactions_of(dump["served"][name])
+        source = []
+        for name in sorted(plain_after):
+            source += harness.transactions_of(plain_after[name])
+        before = sum(len(harness.transactions_of(data))
+                     for data in environment.plain_before.values())
+        same = next((i for i in range(len(served))
+                     if i >= len(source) or served[i] != source[i]),
+                    len(served))
+        numbers["transactions"] = (
+            f"served {len(served)}, source {len(source)}, same up to "
+            f"{same}, stored before the edit {before}")
+        if same < len(served):
+            failures.append(
+                f"served transaction {same} of {len(served)} differs from "
+                f"the source's ({len(source)} transactions)")
+        return failures, numbers
     for name in sorted(set(environment.names) | set(dump["served"])):
         source = plain_after.get(name)
         served = dump["served"].get(name)
@@ -864,7 +954,7 @@ def run_sweep_case(name: str, spec: dict) -> dict:
                     f"{first_difference(before[binlog], after[binlog])}"))
         if fetch_exit == 0:
             grown = sum(len(data) for data in plain_after.values()) - \
-                sum(len(data) for data in environment.plain_before.values())
+                sum(len(data) for data in environment.source_before.values())
             stored = sum(
                 max(len(data) - len(edited.get(binlog, b"")), 0)
                 for binlog, data in data_files(after).items())
@@ -880,6 +970,9 @@ def run_sweep_case(name: str, spec: dict) -> dict:
                                   indexed[0] if indexed else
                                   environment.names[0], name)
             failures, numbers = check_served(environment, dump, plain_after)
+            if environment.gtid_mode:
+                # the plaintext of what is stored now, for the checks
+                environment.served_after = dump["served"]
             result["served"] = numbers
             result["served_copies_are_prefixes_of_the_source's"] = \
                 not failures
@@ -1044,14 +1137,19 @@ def size_check(environment, result, after, plain_after, violation) -> None:
     old_cipher = environment.before[tail]
     new_cipher = after.get(tail, b"")
     old_plain = environment.plain_before[tail]
-    source = plain_after[tail]
     end = min(len(old_cipher), len(new_cipher))
     overlap = max(end - lowered, 0)
     ciphertext_xor = xor(old_cipher[lowered:end], new_cipher[lowered:end])
     differing = sum(1 for byte in ciphertext_xor if byte)
-    # where only new transactions are sent (GTID mode), the byte at
-    # lowered + i is the source's at old size + i
-    moved = xor(old_plain[lowered:end], source[environment.size:])
+    if environment.gtid_mode:
+        # rewrite mode writes the new transactions from the lowered size
+        # on: the new plaintext there is what 'pull' serves now
+        new_plain = environment.served_after.get(tail, b"")
+        moved = xor(old_plain[lowered:end], new_plain[lowered:end])
+    else:
+        # position mode: the source sends the same bytes again
+        source = plain_after[tail]
+        moved = xor(old_plain[lowered:end], source[environment.size:])
     matching_moved = sum(1 for a, b in zip(ciphertext_xor, moved) if a == b)
     recovered = xor(ciphertext_xor, old_plain[lowered:end])
     same_bytes_again = new_cipher[:end] == old_cipher[:end] and \
@@ -1499,6 +1597,8 @@ def main():
     harness.BINSRV = harness.BinlogServer(args.binsrv.expanduser(),
                                           args.workdir / "binsrv", args.port,
                                           gtid_mode, s3)
+    if gtid_mode:
+        harness.BINSRV.rewrite_file_size = GTID_FILE_SIZE
     cases = args.cases or all_cases(gtid_mode)
     results = []
     started = time.monotonic()

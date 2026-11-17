@@ -203,7 +203,11 @@ OTHER_UUID = "11111111-2222-4333-8444-555555555555"
 FETCH_TIMEOUT = 120
 LIST_TIMEOUT = 60
 DUMP_TIMEOUT = 60
-CATCH_UP_SECONDS = 30
+# a replica is waited for as long as its GTID_EXECUTED keeps growing, up to
+# this cap: on a loaded host a replica that catches up through hundreds of
+# binlogs (rotation_gtid_intervals) needs more than the half minute a fixed
+# limit gave it, while one that stalls is still let go after STABLE_SECONDS
+CATCH_UP_SECONDS = 300
 # how long a replica's GTID_EXECUTED must stand still before it is taken for
 # all the replica will get
 STABLE_SECONDS = 4

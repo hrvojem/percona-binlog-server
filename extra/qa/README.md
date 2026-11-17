@@ -648,7 +648,7 @@ truncated while a replica reads it, and the replica then stalls without an
 error in its status. In GTID mode `pull` also accepts the plain
 re-announcement that `fetch` refuses. With rewrite, an EOF after GTID +
 BEGIN leaves fragments in the stored binlog that `pull` can no longer serve
-(ticket 83), and duplicated, swapped or replayed transactions are stored
+(ticket 83, PBS-150), and duplicated, swapped or replayed transactions are stored
 (ticket 81). A lowered `transaction_length` leaves a stub in every mode
 (ticket 82). `pull` reconnects once a second without back-off; an ERR
 packet from the source ends it with exit 1. Since rewrite mode is
@@ -685,7 +685,7 @@ upstream `4717df9`), which cuts binlogs by size: the harness sets an 8K
 source's do and the source's binlogs stay the truth; the time range of a
 stored binlog is that of its transactions, as rewrite mode writes its own
 preamble and ROTATE events. `clean_metadata` fails in GTID mode because of
-ticket 84: the `max_timestamp` of every closed binlog is the time of the
+ticket 84 (PBS-151): the `max_timestamp` of every closed binlog is the time of the
 fetch, which the generated closing ROTATE carries.
 
 ```sh
@@ -738,7 +738,7 @@ through `pull` keeps only what follows it, and position-based starts and
 stops lose transactions. Swapped transactions give every consumer other
 row values without an error. In rewrite mode `--stop-datetime` can stop
 before any transaction, because the generated events carry the time of the
-fetch (ticket 84); that cell of the rewrite control state depends on
+fetch (ticket 84, PBS-151); that cell of the rewrite control state depends on
 timing. `--replica-basedirs` adds replicas of other MySQL versions.
 
 ```sh

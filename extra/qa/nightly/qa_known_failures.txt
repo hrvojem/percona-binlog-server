@@ -136,7 +136,7 @@ purge_search_tamper_test position/search_index_entry_dropped  ticket 80: a binlo
 purge_search_tamper_test position/search_index_head_dropped  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
 purge_search_tamper_test position/search_index_swapped  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
 purge_search_tamper_test position/search_index_reversed  ticket 53 (PBS-126): after an edit of timestamps, GTID sets or the index order, the search returns a wrong list with exit 0
-purge_search_tamper_test gtid/clean_metadata  ticket 84: on a rewrite-mode storage (every GTID-mode storage since PBS-80 / PBS-98) the generated closing ROTATE carries the time of the fetch, so the max_timestamp of every closed binlog in its metadata (and in 'list') is the fetch time, not the time of its last transaction
+purge_search_tamper_test gtid/clean_metadata  ticket 84 (PBS-151): on a rewrite-mode storage (every GTID-mode storage since PBS-80 / PBS-98) the generated closing ROTATE carries the time of the fetch, so the max_timestamp of every closed binlog in its metadata (and in 'list') is the fetch time, not the time of its last transaction
 hostile_source_pull_test position/nul_existing_binlog  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
 hostile_source_pull_test position/nul_metadata  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
 hostile_source_pull_test position/nul_index  ticket 59 (PBS-131): a hostile binlog name or oversized preamble from the source damages the storage or stays in it, and pull keeps serving
@@ -151,7 +151,7 @@ hostile_source_pull_test gtid/gtid_swapped/rewrite  ticket 81: in rewrite mode a
 hostile_source_pull_test gtid/gtid_other_uuid/rewrite  ticket 81: in rewrite mode a duplicated, swapped, foreign or replayed transaction is stored and served
 hostile_source_pull_test gtid/length_smaller/rewrite  ticket 82: a lowered transaction_length leaves a cut-off transaction in the storage
 hostile_source_pull_test gtid/replay_after_reconnect/rewrite  ticket 81: in rewrite mode a duplicated, swapped, foreign or replayed transaction is stored and served
-hostile_source_pull_test gtid/eof_mid_transaction/rewrite  ticket 83: an EOF after GTID + BEGIN leaves fragments in the rewritten binlog, which pull can then no longer serve
+hostile_source_pull_test gtid/eof_mid_transaction/rewrite  ticket 83 (PBS-150): an EOF after GTID + BEGIN leaves fragments in the rewritten binlog, which pull can then no longer serve
 truncated_transaction_test position/lie_after_gtid  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
 truncated_transaction_test position/lie_after_begin  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
 truncated_transaction_test position/lie_after_table_map  ticket 82: a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
@@ -301,4 +301,4 @@ damaged_binlog_consumers_test gtid/S4_plaintext_swap/C4_gtid_replica  ticket 53 
 damaged_binlog_consumers_test gtid/S4_plaintext_swap/C5_resume  ticket 53 (PBS-126) / ticket 62 (PBS-136): the forged or plaintext row reaches this consumer
 damaged_binlog_consumers_test gtid/S5_lower_sequence/C5_list  ticket 70 / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
 damaged_binlog_consumers_test gtid/S5_lower_sequence/C5_search_by_timestamp  ticket 70 / ticket 80: list and search_by_timestamp answer success without the binlog with the lower sequence number
-damaged_binlog_consumers_test gtid/*/C2_replay_stop_datetime  ticket 84: on a rewrite-mode storage the generated events carry the time of the fetch, so --stop-datetime can stop before the transactions; since rewrite mode became mandatory in GTID mode (PBS-80 / PBS-98) every GTID-mode storage is one; depends on timing except in the S6 states (and ticket 81 for S2_tail_added_extended)
+damaged_binlog_consumers_test gtid/*/C2_replay_stop_datetime  ticket 84 (PBS-151): on a rewrite-mode storage the generated events carry the time of the fetch, so --stop-datetime can stop before the transactions; since rewrite mode became mandatory in GTID mode (PBS-80 / PBS-98) every GTID-mode storage is one; depends on timing except in the S6 states (and ticket 81 for S2_tail_added_extended)

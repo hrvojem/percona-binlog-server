@@ -35,6 +35,7 @@ Uses the helpers of fetch_crash_test.py. Example:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -159,8 +160,14 @@ def run_case(args, gtid_mode: bool) -> dict:
             log = binsrv.log_path.read_text(errors="replace").splitlines()
             rejected = []
             for index, line in enumerate(log):
-                if "statement       :" in line:
-                    statement = line.split("statement       :", 1)[1].strip()
+                # since PBS-118 a query is one line, 'net    : parsed
+                # "<command>" client command from <peer>: <statement>';
+                # before it the statement had a line of its own
+                single = re.search(r'net    : parsed "[^"]*" client command '
+                                   r'from \S+?: (.*)$', line)
+                if single or "statement       :" in line:
+                    statement = (single.group(1) if single else
+                                 line.split("statement       :", 1)[1]).strip()
                     following = " ".join(log[index + 1:index + 4])
                     if "syntax error" in following and \
                             statement not in rejected:

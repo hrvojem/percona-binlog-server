@@ -301,6 +301,9 @@ class Lab:
         config["replication_source"]["port"] = self.args.pull_port
         config["replication_source"]["auth_rsa_private_key"] = \
             str(AUTH_RSA_PRIVATE_KEY)
+        # the '[end_of_transaction]' line of every received transaction is
+        # how the harness counts them; since PBS-118 it is a debug message
+        config["logger"]["level"] = "debug"
         binsrv.config_path.write_text(json.dumps(config, indent=2))
         return subprocess.Popen(
             [str(binsrv.binary), operation, str(binsrv.config_path)],

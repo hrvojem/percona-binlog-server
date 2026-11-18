@@ -336,6 +336,9 @@ def start_binsrv(lab, operation: str, *arguments, environment=None,
         config["replication_source"]["port"] = lab.pull_port
         config["replication_source"]["auth_rsa_private_key"] = \
             str(AUTH_RSA_PRIVATE_KEY)
+    # wait_for_log counts the '[end_of_transaction]' line of every received
+    # transaction, a debug message since PBS-118
+    config["logger"]["level"] = "debug"
     if patch is not None:
         patch(config)
     binsrv.config_path.write_text(json.dumps(config, indent=2))

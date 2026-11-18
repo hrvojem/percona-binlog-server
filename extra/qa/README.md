@@ -814,7 +814,8 @@ carry the whole GTID set: 0.4 MiB of stream became 14 MiB in about 1,000
 binlogs, and with 6,000 such transactions `list` fails with
 `std::bad_alloc` at 3 GiB (ticket 88, PBS-164). `binlog.index` is rewritten in full
 at every rotation (ticket 91), and the info log outgrows the stream
-(ticket 45, PBS-118). Bounded: an event header that claims 3.5 GiB allocates
+(ticket 45, PBS-118; measured before upstream `dd6b598` moved the
+per-event messages to debug level). Bounded: an event header that claims 3.5 GiB allocates
 nothing ahead of the data, a transaction longer than declared is refused
 at once, sequence number 1,000,000 is refused, and a stalled replica costs
 about 4 MiB.
@@ -1284,7 +1285,9 @@ known ones of ticket 42, PBS-115); `copies`, `replica`, `still_serving` (exact d
 the end). The first 15-minute run (2026-10-29, debug build) was flat (about
 23 MB, 16 descriptors, 2 threads) and exact, but the log grew 67 MB per hour:
 at info level `pull` logs every event it streams, per client (89% of the
-lines; ticket 45, PBS-118), and a client that dies during a dump is logged as an
+lines; ticket 45, PBS-118, fixed upstream by `dd6b598`, which moves the
+per-event messages to debug level: `position/log` passes since), and a
+client that dies during a dump is logged as an
 error (EPIPE, part of ticket 42, PBS-115). A 15-minute run with TLS clients
 (2026-11-02, upstream `6b0960f`: 36 of 65 connections over TLS) was flat and
 exact as well, and the TLS clients killed during a dump added no new error
@@ -1560,7 +1563,6 @@ server rather than starting one.
   `pull_heartbeat_test quiet_after_rotation` (ticket 40, PBS-113),
   `large_binlog_test position/transaction_over_4gib` (ticket 41, PBS-114),
   `pull_load_test position/shutdown` (ticket 43, PBS-116),
-  `pull_soak_test position/log` (ticket 45, PBS-118: info-level log volume),
   `pull_tls_test position/plain_refused_when_required` (ticket 48: no error
   packet for a plain client under `require_secure_transport`),
   `telemetry_test position/settings_in_storage` (ticket 50:

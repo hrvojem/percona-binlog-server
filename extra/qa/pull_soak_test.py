@@ -49,7 +49,8 @@ descriptors and threads (/proc), its log size and the storage size. Cases
                     when reading or as EPIPE, system:32, when a client
                     dies during a dump), which are counted; the most
                     frequent message is reported (ticket 45, PBS-118: at info level
-                    every event streamed to every client is logged);
+                    every event streamed to every client was logged, until
+                    upstream dd6b598 moved those messages to debug level);
   copies            every long-lived client's copy of every closed binlog,
                     and every completed churn client's copies of the
                     binlogs closed before it started, equal the source's;

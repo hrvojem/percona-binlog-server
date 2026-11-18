@@ -274,7 +274,7 @@ logs and metadata are UTC. Found:
 - with only `checkpoint_interval`, the transaction that ends a quiet period
   is not checkpointed until the next event arrives or the source connection
   times out: the interval is checked when an event arrives, and covers only
-  what came before it (`checkpoint/idle_tail`, ticket 94);
+  what came before it (`checkpoint/idle_tail`, ticket 94, PBS-167);
 - in GTID mode the generated events carry PBS's clock (ticket 84, PBS-151):
   with PBS a day behind the source, `min_timestamp` is a day early and 7 of
   11 `search_by_timestamp` probes answer wrongly;
@@ -589,7 +589,7 @@ statement, the dump's file name and the GTID set are logged raw and whole:
 a line feed forges a log line, CR / ESC / NUL reach the log, a 4 MB
 statement is a 4 MB line, and a 900,000-interval GTID set is decoded and
 printed for the log before any check, which holds the listener thread for
-11 s (over 60 s on ASan), in position mode too (ticket 92). Every query or
+11 s (over 60 s on ASan), in position mode too (ticket 92, PBS-166). Every query or
 ping adds two info lines with no limit: one connection grows the log by
 about 0.5 MB/s, 40-60 GB a day (ticket 93). The adapter itself has a
 property test, `tests/logger_repeat_adapter_property_test.cpp` (6 cases

@@ -64,7 +64,12 @@ descriptors and threads (/proc), its log size and the storage size. Cases
   replica           the replica ends with the source's data;
   still_serving     at the end a new client still gets every closed binlog.
 
-Position mode. Uses the helpers of fetch_crash_test.py and
+Position mode, or GTID mode (--mode gtid): the source and the replica use
+GTIDs, the replica follows pull with SOURCE_AUTO_POSITION, and the storage
+is in rewrite mode (mandatory in GTID mode since PBS-80 / PBS-98) with a
+GTID_FILE_SIZE file size, so pull cuts its own binlogs and the clients copy
+the storage's closed binlogs: each copy must equal the stored file, and the
+stored transactions must be the source's first ones. Uses the helpers of fetch_crash_test.py and
 pull_replica_test.py. Example (a short trial):
 
   PYTHONPATH=~/ws/qa/pylib python3 pull_soak_test.py \\
@@ -102,6 +107,8 @@ LARGE_TRANSACTION = [{"rows": [200_000], "ddl": False}]
 LARGE_EVERY = 100
 TRANSACTION_SECONDS = 0.5
 ROTATE_EVERY = 60
+# GTID mode: the rewrite file size of the storage
+GTID_FILE_SIZE = "32K"
 CHURN_SECONDS = 15
 ABORTED_SHARE = 0.3
 REPLICA_RESTART_SECONDS = 600
@@ -163,16 +170,43 @@ def start_client(args, port: int, first_binlog: str, directory: Path,
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
+def expected_binlog(source, name: str) -> bytes:
+    """What a client must get for a closed binlog: the source's binlog in
+    position mode; in GTID mode (always rewrite mode since PBS-80 / PBS-98)
+    the Binlog Server's own stored file, which closed_binlogs names and
+    storage_holds_source_transactions checks against the source."""
+    if harness.BINSRV.gtid_mode:
+        return (harness.BINSRV.storage / name).read_bytes()
+    return source.binlog_as_sent(name)
+
+
+def closed_binlogs(source) -> list:
+    """The closed binlogs clients copy: the source's in position mode, the
+    storage's in GTID mode (rewrite mode names and cuts its own)."""
+    if harness.BINSRV.gtid_mode:
+        return harness.BINSRV.indexed_binlogs()[:-1]
+    return source.binlog_names()[:-1]
+
+
+def storage_holds_source_transactions() -> "str | None":
+    """GTID mode: the stored transactions are the source's first ones."""
+    try:
+        harness.FetchCrashMachine.rewrite_storage_holds_prefix(complete=False)
+    except harness.Failure as error:
+        return str(error)
+    return None
+
+
 def mismatches(source, names: list, directory: Path) -> list:
     result = []
     for name in names:
         copy = directory / name
+        expected = expected_binlog(source, name)
         if not copy.exists():
             result.append(f"{directory.name}/{name}: missing")
-        elif copy.read_bytes() != source.binlog_as_sent(name):
+        elif copy.read_bytes() != expected:
             result.append(f"{directory.name}/{name}: {copy.stat().st_size} "
-                          f"bytes, expected "
-                          f"{len(source.binlog_as_sent(name))}")
+                          f"bytes, expected {len(expected)}")
     return result
 
 
@@ -216,13 +250,18 @@ def replica_lag(source, replica) -> "int | None":
 def run(args) -> list:
     work = args.workdir
     rng = random.Random(args.seed)
+    gtid_mode = args.mode == "gtid"
     source = harness.MySQLServer(args.mysql_basedir, work / "source",
-                                 args.port, False, server_id=1)
+                                 args.port, gtid_mode, server_id=1)
     replica = harness.MySQLServer(args.mysql_basedir, work / "replica",
-                                  args.port + 10, False, server_id=10)
+                                  args.port + 10, gtid_mode, server_id=10)
     harness.SERVER = source
     harness.BINSRV = binsrv = harness.BinlogServer(
-        args.binsrv, work / "binsrv", args.port, False)
+        args.binsrv, work / "binsrv", args.port, gtid_mode)
+    if gtid_mode:
+        # rewrite mode cuts the stored binlogs by size: small enough that
+        # pull rotates its own binlogs many times during the run
+        binsrv.rewrite_file_size = GTID_FILE_SIZE
     pull_port = args.port + 2
     cases = ("alive", "memory", "file_descriptors", "threads", "log",
              "copies", "replica_lag", "replica", "still_serving")
@@ -238,11 +277,22 @@ def run(args) -> list:
         machine.start_from_scratch()
         binsrv.checkpoint_size = "64K"
         machine.run_workload(TRANSACTION)
-        first_binlog = source.binlog_names()[0]
         pull = start_pull(binsrv, pull_port)
+        if gtid_mode:
+            # the storage names its own binlogs: wait for pull to store one
+            deadline = time.monotonic() + 60
+            while not binsrv.indexed_binlogs() and pull.poll() is None \
+                    and time.monotonic() < deadline:
+                time.sleep(0.2)
+            if not binsrv.indexed_binlogs():
+                raise harness.Failure("pull stored no binlog within 60 s\n"
+                                      + binsrv.log_tail())
+        first_binlog = (binsrv.indexed_binlogs()[0] if gtid_mode else
+                        source.binlog_names()[0])
         replication.replicate_from_pull(
-            replica, pull_port, False,
-            f"SOURCE_LOG_FILE='{first_binlog}', SOURCE_LOG_POS=4, "
+            replica, pull_port, gtid_mode,
+            "SOURCE_AUTO_POSITION=1, SOURCE_HEARTBEAT_PERIOD=1" if gtid_mode
+            else f"SOURCE_LOG_FILE='{first_binlog}', SOURCE_LOG_POS=4, "
             "SOURCE_HEARTBEAT_PERIOD=1", source_ssl=True)
         for index in range(LONG_LIVED):
             long_lived.append(start_client(
@@ -270,13 +320,14 @@ def run(args) -> list:
                     log_bytes=(binsrv.log_path.stat().st_size
                                if binsrv.log_path.exists() else 0),
                     storage_bytes=directory_size(binsrv.storage),
-                    binlogs=len(source.binlog_names()))
+                    binlogs=len(source.binlog_names()),
+                    stored_binlogs=len(binsrv.indexed_binlogs()))
                 if now - replica_started >= REPLICA_SETTLE:
                     sample["replica_lag_rows"] = replica_lag(source, replica)
                 samples.append(sample)
                 next_sample += SAMPLE_SECONDS
             if now >= next_churn:
-                closed = source.binlog_names()[:-1]
+                closed = closed_binlogs(source)
                 if closed:
                     start_name = rng.choice(closed)
                     aborted = rng.random() < ABORTED_SHARE
@@ -389,8 +440,8 @@ def run(args) -> list:
             ok=log_mb_per_hour <= LOG_MB_PER_HOUR and not unknown_errors)
 
         # everyone catches up with the closed binlogs
-        closed = source.binlog_names()[:-1]
-        expected_size = sum(len(source.binlog_as_sent(name))
+        closed = closed_binlogs(source)
+        expected_size = sum(len(expected_binlog(source, name))
                             for name in closed)
         long_dirs = [work / "copies" / f"long{index}"
                      for index in range(LONG_LIVED)]
@@ -415,6 +466,10 @@ def run(args) -> list:
                         if client["process"].returncode != 0]
         for client in completed:
             wrong += mismatches(source, client["closed"], client["directory"])
+        if gtid_mode:
+            problem = storage_holds_source_transactions()
+            if problem:
+                wrong.insert(0, f"storage: {problem}")
         exited_long = [index for index, client in enumerate(long_lived)
                        if client.poll() is not None]
         results["copies"].update(
@@ -470,7 +525,8 @@ def main():
     parser.add_argument("--binsrv", type=Path, required=True)
     parser.add_argument("--workdir", type=Path, required=True)
     parser.add_argument("--port", type=int, default=23600)
-    parser.add_argument("--mode", choices=["position"], default="position")
+    parser.add_argument("--mode", choices=["position", "gtid"],
+                        default="position")
     parser.add_argument("--duration", type=int, default=7200,
                         help="seconds of load")
     parser.add_argument("--seed", type=int, default=1)

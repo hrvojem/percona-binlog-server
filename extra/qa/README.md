@@ -250,6 +250,51 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/listener_exhaustion_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/listener-exhaustion
 ```
 
+### A clock that jumps, drifts or sits in the future — `clock_test.py`
+
+Fakes the clock of the binlog_server process only (libfaketime v0.9.14 by
+LD_PRELOAD, built from source without root with `make -C src
+libfaketime.so.1` into `~/ws/clock/libfaketime` on the QA host), so the
+source and the replicas keep real time. The offset comes from a control
+file, so the clock can jump while `pull` runs: a wall jump moves
+CLOCK_REALTIME only, a mono jump CLOCK_MONOTONIC too (monotonic jumps do
+not happen on a real system and run only by hand). Cases: heartbeats to an
+idle replica, read_timeout and idle_time reconnects, `checkpoint_interval`,
+telemetry scheduling and cleanup, each with jumps of +1 day, -2 h and
+-10 min; a PBS clock a day ahead of or behind the source's for `fetch`, the
+stored timestamps and `search_by_timestamp`; six time zones (including
+Pacific/Chatham and Australia/Lord_Howe) and the end of DST; and a PBS clock
+at 2100, 2106 and 2300.
+
+On 2026-11-18 (the merge of `dd6b598`, debug build) no wall-clock jump
+moved anything: heartbeats came once a second with no gap over 1.2 s,
+reconnect delays stayed at 5.0 s and 8.1 s, checkpoints and telemetry
+reports came on time, all on `steady_clock`. Time zones changed no answer;
+logs and metadata are UTC. Found:
+- with only `checkpoint_interval`, the transaction that ends a quiet period
+  is not checkpointed until the next event arrives or the source connection
+  times out: the interval is checked when an event arrives, and covers only
+  what came before it (`checkpoint/idle_tail`, ticket 94);
+- in GTID mode the generated events carry PBS's clock (ticket 84, PBS-151):
+  with PBS a day behind the source, `min_timestamp` is a day early and 7 of
+  11 `search_by_timestamp` probes answer wrongly;
+- past 2262 `system_clock` overflows: the listener answers a negative
+  `UNIX_TIMESTAMP()` and telemetry writes `-8032952053-<tag>.json`, which
+  is never cleaned up; after 2106 the generated event timestamps wrap
+  (ticket 79, PBS-145);
+- telemetry ages its reports by the wall-clock time in their names, so a
+  forward jump past `history_keep_interval` deletes a report it has just
+  written (ticket 96).
+Use a build without a sanitizer. The nightly runs it on Saturdays
+(position) and Sundays (gtid) without the monotonic jumps.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/clock_test.py \
+  --mysql-basedir <dist> --binsrv <debug binary> \
+  --faketime-lib ~/ws/clock/libfaketime/src/libfaketime.so.1 \
+  --workdir ~/ws/qa/clock --mode position [--cases 'skew/*,tz/*']
+```
+
 ### Storage file modes, symlinks and the S3 buffer — `file_security_test.py`
 
 Records the modes of everything `fetch` creates under umask 022 and 000, and
@@ -516,6 +561,45 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/tls_config_test.py \
 ```sh
 PYTHONPATH=~/ws/qa/pylib python3 extra/qa/listener_login_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/listener-login
+```
+
+### What `pull` logs at info level — `log_hygiene_test.py`
+
+Upstream `dd6b598` (PBS-118, ticket 45) moved the per-event messages to
+debug level, logs an idle replica's `fetched EOF` and `waiting for first
+binlog in empty storage` once per idle period (`logger_repeat_adapter`), and
+writes each client command on one info line. This harness checks that
+against a real `pull` at the default level, and what a logged-in client can
+make it log:
+- `no_per_event_lines`: a MySQL replica and a raw dump client get 150 and
+  300 transactions; the info log may grow only per binlog file;
+- `idle_eof_once`: `fetched EOF` once per idle period, again after new
+  events, across a rotation and with 1 s heartbeats, and `waiting for first
+  binlog in empty storage` once while the source is down;
+- `log_injection`: line feeds, CR, ANSI escapes and NUL in statements and
+  binlog dump file names, 1 MB and 4 MB statements, large and malformed GTID
+  sets in COM_BINLOG_DUMP_GTID;
+- `log_flood`: 30 s of queries and 10 s each of pings and 64 KB statements
+  from one logged-in client; log bytes per second and per command.
+
+On 2026-11-18 (the merge of `dd6b598`, debug and ASan builds, both modes)
+the first two pass: 300 transactions add 14 info lines, all per binlog
+file, and every idle line comes once per period. The other two fail. The
+statement, the dump's file name and the GTID set are logged raw and whole:
+a line feed forges a log line, CR / ESC / NUL reach the log, a 4 MB
+statement is a 4 MB line, and a 900,000-interval GTID set is decoded and
+printed for the log before any check, which holds the listener thread for
+11 s (over 60 s on ASan), in position mode too (ticket 92). Every query or
+ping adds two info lines with no limit: one connection grows the log by
+about 0.5 MB/s, 40-60 GB a day (ticket 93). The adapter itself has a
+property test, `tests/logger_repeat_adapter_property_test.cpp` (6 cases
+pass; a disabled seventh shows that group id `SIZE_MAX` overflows
+`group_id + 1`, ticket 95, which no caller reaches today).
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/log_hygiene_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/log-hygiene \
+  [--mode gtid]
 ```
 
 ### Hostile source binlog names — `hostile_source_test.py`
@@ -1293,6 +1377,18 @@ error (EPIPE, part of ticket 42, PBS-115). A 15-minute run with TLS clients
 exact as well, and the TLS clients killed during a dump added no new error
 lines.
 
+`--mode gtid` runs the same soak with GTIDs: the replica follows `pull` with
+`SOURCE_AUTO_POSITION`, and the storage is in rewrite mode (mandatory in GTID
+mode since upstream `4717df9`) with a 32K `rewrite.file_size`, so `pull` cuts
+its own binlogs and the clients copy the storage's closed binlogs; a copy
+must equal the stored file and the stored transactions the source's first
+ones. The first 15-minute run (2026-11-18, the merge of upstream `dd6b598`)
+passed every case: 1,552 transactions in 139 stored binlogs, memory flat at
+about 24 MB, 16 descriptors, 2 threads, 2.4 MB of log per hour, exact
+copies for 3 long-lived and 43 churn clients (16 killed during a dump, 27
+over TLS), and the replica at most 26 rows behind with the source's data at
+the end. The nightly runs it on Fridays.
+
 The `replica_lag` case (2026-11-05) samples how many rows of `qa.t` the
 replica is behind the source (`MAX(id)` on both) once it has run 30 s since
 its last restart: the worst must stay within 200 rows (some 50 s of the
@@ -1367,11 +1463,11 @@ server rather than starting one.
      | --- | --- | --- |
      | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position and gtid, about 1 min each) and `tls_config_test.py` (position, about 5 min); `hostile_source_pull_test.py` (position, about 5 min, and again with `--storage s3`, cases `position/<case>/s3`); `stuck_storage_recovery_test.py` (position, about 4 min) | ASan; debug |
      | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 4 min) and `checkpoint_loss_test.py` (position, file storage, about 5 min); `purge_search_tamper_test.py` (gtid, about 2 min); `keyring_test.py` (position, about 4 min) and `pull_two_sided_attack_test.py` (position, about 5 min) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
-     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min); `rewrite_attack_test.py` (gtid, about 7 min) and `truncated_transaction_test.py` (position, about 3 min, and gtid with `--storage s3`, about 5 min); `resource_exhaustion_test.py` (position, about 5 min) | ASan; debug |
+     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min); `rewrite_attack_test.py` (gtid, about 7 min) and `truncated_transaction_test.py` (position, about 3 min, and gtid with `--storage s3`, about 5 min); `resource_exhaustion_test.py` (position, about 5 min); `log_hygiene_test.py` (position, about 6 min) | ASan; debug |
      | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) and `replica_tamper_test.py` (position, about 4 min); `keyring_test.py` (gtid, about 4 min) | ASan; debug |
-     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 7 min, with the local S3 server), `s3_upload_tamper_test.py` (position, about 1 min) and `listener_command_fuzz_test.py --tls` (gtid, about 5 min); `truncated_transaction_test.py` (gtid, about 3 min) and `damaged_binlog_consumers_test.py` (position, about 3 min); `stuck_storage_recovery_test.py` (gtid, about 9 min) | ASan; debug |
-     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min); `final_flush_test.py` (position, about 3 min); `hostile_source_pull_test.py --rewrite` (gtid, about 9 min); `resource_exhaustion_test.py` (gtid, about 9 min); `metadata_tamper_test.py` (gtid, about 9 min) | debug / ASan; debug |
-     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) and `replica_tamper_test.py` (gtid, about 4 min); `truncated_transaction_test.py --rewrite` (gtid, about 5 min) and `damaged_binlog_consumers_test.py` (gtid, about 11 min); `pull_two_sided_attack_test.py` (gtid, about 5 min) and `purge_search_tamper_test.py --storage s3` (gtid, about 22 min) | ASan / debug; debug |
+     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 7 min, with the local S3 server), `s3_upload_tamper_test.py` (position, about 1 min) and `listener_command_fuzz_test.py --tls` (gtid, about 5 min); `truncated_transaction_test.py` (gtid, about 3 min) and `damaged_binlog_consumers_test.py` (position, about 3 min); `stuck_storage_recovery_test.py` (gtid, about 9 min); `pull_soak_test.py` (gtid, `QA_SOAK_SECONDS`, 2 h by default) | ASan; debug |
+     | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min); `final_flush_test.py` (position, about 3 min); `hostile_source_pull_test.py --rewrite` (gtid, about 9 min); `resource_exhaustion_test.py` (gtid, about 9 min); `metadata_tamper_test.py` (gtid, about 9 min); `log_hygiene_test.py` (gtid, about 6 min); `clock_test.py` (position, about 35 min) | debug / ASan; debug |
+     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) and `replica_tamper_test.py` (gtid, about 4 min); `truncated_transaction_test.py --rewrite` (gtid, about 5 min) and `damaged_binlog_consumers_test.py` (gtid, about 11 min); `pull_two_sided_attack_test.py` (gtid, about 5 min) and `purge_search_tamper_test.py --storage s3` (gtid, about 22 min); `clock_test.py` (gtid, about 25 min) | ASan / debug; debug |
 
      `pull_versions/<series>` runs the replica harnesses of the nightly 8.4
      stage against another MySQL version of `MTR_DISTS`: `upgrade_test.py`,

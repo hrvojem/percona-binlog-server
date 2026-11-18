@@ -273,6 +273,15 @@ def ending_error(output: str) -> str:
     return error or " | ".join(texts[-3:])
 
 
+# clock_test cases of the nightly (shell patterns, see clock_test.py)
+CLOCK_TEST_NIGHTLY_CASES = {
+    "position": "heartbeat/wall_*,reconnect/*,checkpoint/idle_tail,"
+                "checkpoint/wall_*,telemetry/wall_*,skew/*,tz/*,future/*",
+    "gtid": "reconnect/*,checkpoint/idle_tail,checkpoint/wall_*,"
+            "telemetry/wall_*,skew/*,tz/*,future/*",
+}
+
+
 def harness_command(args, workdir: Path) -> list:
     qa = Path(args.qa_dir)
     script = [sys.executable, str(qa / f"{args.harness}.py")]
@@ -383,8 +392,14 @@ def harness_command(args, workdir: Path) -> list:
                         "damaged_binlog_consumers_test", "keyring_test",
                         "resource_exhaustion_test",
                         "pull_two_sided_attack_test",
-                        "stuck_storage_recovery_test"):
+                        "stuck_storage_recovery_test", "log_hygiene_test"):
         return script + common + mode
+    if args.harness == "clock_test":
+        # the binlog_server process runs under libfaketime; the nightly
+        # leaves out the monotonic-clock jumps, which no real clock makes
+        return script + common + mode + [
+            "--faketime-lib", str(args.faketime_lib),
+            "--cases", CLOCK_TEST_NIGHTLY_CASES[args.mode or "position"]]
     raise SystemExit(f"unknown harness {args.harness}")
 
 
@@ -414,7 +429,8 @@ def harness_cases(args, returncode: int, output: str, lines: list,
                         "damaged_binlog_consumers_test", "keyring_test",
                         "resource_exhaustion_test",
                         "pull_two_sided_attack_test",
-                        "stuck_storage_recovery_test"):
+                        "stuck_storage_recovery_test", "log_hygiene_test",
+                        "clock_test"):
         cases = []
         for result, _ in objects:
             if "case" not in result:
@@ -705,6 +721,9 @@ def precondition_failure(args) -> str:
     if args.harness in ("disk_fault_sweep", "final_flush_test") and not (
             args.fsfault_lib and Path(args.fsfault_lib).is_file()):
         return f"the fsfault library {args.fsfault_lib} does not exist"
+    if args.harness == "clock_test" and not (
+            args.faketime_lib and Path(args.faketime_lib).is_file()):
+        return f"the libfaketime library {args.faketime_lib} does not exist"
     return ""
 
 
@@ -1041,6 +1060,8 @@ def main():
                              "large_binlog_test's counting one) listens")
     parser.add_argument("--fsfault-lib", type=Path,
                         help="disk_fault_sweep's LD_PRELOAD library")
+    parser.add_argument("--faketime-lib", type=Path,
+                        help="clock_test's libfaketime library")
     parser.add_argument("--toxiproxy-api", default="http://127.0.0.1:8474")
     parser.add_argument("--tls", action="store_true",
                         help="listener_command_fuzz_test: log in over TLS")

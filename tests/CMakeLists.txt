@@ -283,6 +283,20 @@ if(WITH_PROPERTY_TESTS)
     CXX_EXTENSIONS NO
   )
 
+  add_executable(logger_repeat_adapter_property_test logger_repeat_adapter_property_test.cpp)
+  target_include_directories(logger_repeat_adapter_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(logger_repeat_adapter_property_test
+    PRIVATE
+      binlog_server_compiler_flags
+      binsrv::lib_binsrv
+      Boost::unit_test_framework
+      hegel
+  )
+  set_target_properties(logger_repeat_adapter_property_test PROPERTIES
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+  )
+
   add_executable(indexed_event_block_property_test indexed_event_block_property_test.cpp)
   target_include_directories(indexed_event_block_property_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
   target_link_libraries(indexed_event_block_property_test
@@ -513,6 +527,7 @@ if(WITH_PROPERTY_TESTS)
   add_test(NAME event_property_test COMMAND event_property_test ${test_run_options})
   add_test(NAME storage_property_test COMMAND storage_property_test ${test_run_options})
   add_test(NAME indexed_event_block_property_test COMMAND indexed_event_block_property_test ${test_run_options})
+  add_test(NAME logger_repeat_adapter_property_test COMMAND logger_repeat_adapter_property_test ${test_run_options})
   add_test(NAME cipher_context_property_test COMMAND cipher_context_property_test ${test_run_options})
   add_test(NAME minimysql_property_test COMMAND minimysql_property_test ${test_run_options})
   add_test(NAME replication_source_property_test COMMAND replication_source_property_test ${test_run_options})

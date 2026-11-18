@@ -1,5 +1,90 @@
 # Coverage gaps
 
+## 2026-11-18: after the merges of upstream `4717df9` and `dd6b598`
+
+A quicker measurement than the layered one below: one coverage build, one
+run of everything, one capture, so there are no per-layer numbers.
+
+- **Source:** `pbt-init` at `1fff44a` (`src/` identical to `8a11927`): the
+  upstream merges of PBS-80 / PBS-98 (`4717df9`, rewrite mode mandatory in
+  GTID mode) and PBS-118 (`dd6b598`, `logger_repeat_adapter`, per-event log
+  messages at debug level).
+- **Build:** preset `debug_gcc14`, `-DWITH_PROPERTY_TESTS=ON`, `--coverage
+  -fprofile-update=atomic` (`test-infra:~/ws/build-cov`).
+- **What ran, in this order:** `ctest -E property_test` (unit tests, all
+  pass); `ci_property_tests.sh --parallel 6` (every property case at
+  default Hegel settings apart from `known_failures.txt`, all pass); MTR
+  `binlog_streaming` on MySQL 8.4.8 (94 tests, the 9 known failures); the
+  nightly's QA stage (`STAGES=qa`, every daily harness) plus 28 rotation
+  harnesses (`s3_fault_sweep`, `disk_fault_sweep`, `network_fault_test`,
+  `listener_fuzz_test` at 200 connections, `source_change_test`,
+  `hostile_source_test` in both modes, `metadata_tamper_test` in both modes,
+  `purge_search_tamper_test`, `keyring_test`, `resource_exhaustion_test`,
+  `stuck_storage_recovery_test`, `rewrite_attack_test`,
+  `truncated_transaction_test`, `listener_command_fuzz_test`,
+  `listener_login_test`, `upstream_tls_test`, `secrets_exposure_test`,
+  `tls_config_test`, `checkpoint_loss_test`, `final_flush_test`,
+  `damaged_binlog_consumers_test`, `replica_tamper_test`,
+  `listener_replica_dos_test`, `file_security_test`,
+  `pull_two_sided_attack_test`, `pull_load_test`): 1115 cases passed, 359
+  known failures, 1 new failure (`upgrade_test/gtid`: its mysqld lost a port
+  to another job on the host, not a PBS failure).
+- **Capture:** gcovr 8.6 with gcov-14, `--filter src/
+  --exclude-throw-branches`. Output (QA host only):
+  `~/ws/merge-logs/cov.txt`, `cov-summary.json`, `cov-html/index.html`,
+  `cov-detail.json` (per function, without the two exception-helper
+  headers); `cov-before-qa.txt` / `cov-summary-before-qa.json` are the
+  numbers before the QA stage.
+
+| | Lines | Line % | Functions % | Branches % |
+|---|---|---|---|---|
+| unit + property + MTR 8.4 | 10985 / 12499 | 87.9 | 89.2 | |
+| everything (adds the QA stage) | 11455 / 12499 | 91.6 | 92.4 (2287 / 2476) | 81.6 |
+
+The layered measurement of 2026-11-03 below had 90.0 % of 12354 lines
+combined (base layers); its branch numbers also excluded unreachable
+branches, so they do not compare directly.
+
+**Most lines missed, by file:** `util/mixin_exception_adapter.hpp` (200)
+and `util/exception_location_helpers.hpp` (134), template instantiations
+for exception types that are never raised; `binsrv/s3_storage_backend.cpp`
+(62); `easymysql/connection.cpp` (42); `minimysql/connection_context.hpp`
+(37) and `.cpp` (27); `binsrv/storage_core.cpp` (36);
+`binsrv/events/event.hpp` (34); `opensslpp/evp_pkey.cpp` (29);
+`binsrv/events/gtid_tagged_log_body_impl.cpp` (29);
+`opensslpp/cipher_context.cpp` (24); `util/byte_span_extractors.hpp` (23).
+
+**55 functions no test reaches** (`cov-detail.json`). Most are printing and
+comparison helpers used only at trace level or by nothing (the
+`operator<<` of event parts, `size_unit`, `time_unit`, `gtids::tag`;
+`operator==` of `unknown_body` / `unknown_post_header`), copy and move
+members nothing uses (`search_response`, `telemetry`), and error-class
+constructors from a bare code (`s3_error(int)`, `core_error(int)`). The
+ones worth a test or a decision:
+- **The `version` operation** (`operations/version_operation.cpp`): no
+  test runs `binlog_server version`.
+- **S3 region detection** (`s3_storage_backend.cpp:210`, `aws_context`
+  with `bucket_tag`, and `get_bucket_region`): an `s3://<bucket>/...` URI
+  without a region and without a custom endpoint asks AWS for the bucket's
+  location. Every test passes an endpoint. It needs real AWS or an S3
+  server that answers GetBucketLocation (see the paused other-S3-servers
+  work).
+- **A demo query in the listener** (`minimysql/network_service.cpp:869`):
+  `select * from tbl` from a logged-in client is answered with two made-up
+  rows ("Alice Cooper", "Bob") through `connection_context::encode_resultset`
+  with `std::uint64_t` columns, the only user of those template
+  instantiations. It looks like example code left in production
+  (ticket 97).
+- **`easymysql::connection::ping`** and **`library::get_client_version`**:
+  never called by the tests (the client version is logged, so it may be
+  called through another path the capture did not attribute).
+- **The HEARTBEAT_LOG_V2 body's `get_parsed_binlog` and printing**: only
+  the trace-level event dump reaches them; no test runs `pull` or `fetch`
+  at trace level.
+- **`basic_logger::set_min_level`**: no test changes the level of a
+  running logger (the property test of `logger_repeat_adapter` does, on its
+  own test double).
+
 - **Date:** 2026-11-03 (previous measurement: 2026-10-30, commit `bd8e2f6`)
 - **Commit:** `b24e653` (branch `pbt-init`). Since 2026-10-30 this adds the upstream merges of PBS-31 parts 2–3 (`6b0960f`: the listener performs the TLS handshake, ticket 46, PBS-119 fixed) and of PBS-41 and PBS-29 part 3 (`2d7dc80`: telemetry reports of `pull`, the mandatory `instance` section and its instance_id file, GTID auto-positioning), TLS clients in the listener fuzzer, and the harnesses `pull_gtid_set_test.py` and `telemetry_test.py`. The measured tree is a clean worktree of that commit; md5 sums of `src/` before and after the run match.
 - **Host output (kept on the QA host only):** `test-infra:~/ws/coverage-20261103/` (the earlier data stays in `~/ws/coverage-20261030/`, `~/ws/coverage-20261029/` and `~/ws/coverage-20261028/`)

@@ -77,7 +77,9 @@ and CHECKSUM TABLE), views, routines and triggers must equal the source's,
 its threads must report no error and, in GTID mode, its GTID_EXECUTED must
 equal the source's. A kind whose statements this MySQL version refuses is
 reported as skipped. One JSON line per phase, then one per kind with the
-kind's own differences.
+kind's own differences: a difference fails its kind's line, and the
+phase's line (catch-up, thread errors, extra databases, GTID_EXECUTED)
+only lists the kinds that differ, so one difference is not counted twice.
 
 Uses the helpers of fetch_crash_test.py and pull_replica_test.py. Example:
 
@@ -702,9 +704,12 @@ def compare(source, replica, gtid_mode: bool, marker: int,
     if gtid_mode:
         phase["gtid_executed_equal"] = same_set(
             replica, executed(replica), executed(source))
+    # each kind's differences fail that kind's own case; the phase checks
+    # what is common to all of them, and lists which kinds differ
+    phase["kinds_with_differences"] = sorted(
+        name for name, found in per_kind.items() if found)
     phase["ok"] = (reached and not errors and not extra and
-                   phase.get("gtid_executed_equal", True) and
-                   not any(per_kind.values()))
+                   phase.get("gtid_executed_equal", True))
     return phase, per_kind
 
 

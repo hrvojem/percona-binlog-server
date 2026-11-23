@@ -369,6 +369,15 @@ BOOST_AUTO_TEST_CASE(ResetOfUnusedGroupIsHarmless) {
 // group ids that cannot be allocated (2^40 .. SIZE_MAX - 1) fail with an
 // exception and leave the adapter usable with its existing counters
 BOOST_AUTO_TEST_CASE(UnallocatableGroupIdFailsCleanly) {
+#if defined(__SANITIZE_ADDRESS__)
+  // AddressSanitizer's allocator aborts on a request this large
+  // ("requested allocation size ... exceeds maximum supported size")
+  // instead of letting operator new throw std::bad_alloc, so the property
+  // cannot hold there; the other builds run it
+  BOOST_TEST_MESSAGE("skipped under AddressSanitizer: huge allocations abort");
+  BOOST_CHECK(true);
+  return;
+#endif
   hegel::Settings settings{};
   settings.test_cases = 50U;
   run_property(

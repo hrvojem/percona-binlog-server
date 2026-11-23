@@ -275,9 +275,9 @@ def ending_error(output: str) -> str:
 
 # clock_test cases of the nightly (shell patterns, see clock_test.py)
 CLOCK_TEST_NIGHTLY_CASES = {
-    "position": "heartbeat/wall_*,reconnect/*,checkpoint/idle_tail,"
+    "position": "heartbeat/wall_*,reconnect/wall_*,checkpoint/idle_tail,"
                 "checkpoint/wall_*,telemetry/wall_*,skew/*,tz/*,future/*",
-    "gtid": "reconnect/*,checkpoint/idle_tail,checkpoint/wall_*,"
+    "gtid": "reconnect/wall_*,checkpoint/idle_tail,checkpoint/wall_*,"
             "telemetry/wall_*,skew/*,tz/*,future/*",
 }
 

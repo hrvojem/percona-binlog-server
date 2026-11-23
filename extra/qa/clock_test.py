@@ -129,6 +129,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -245,7 +246,13 @@ def from_iso(text: str) -> int:
 
 def setup(name: str, replica: bool = False):
     """A fresh source (and replica) and binlog server for one case."""
-    work = ARGS.workdir / ARGS.mode / name.replace("/", "_")
+    # a short directory per case: MySQL refuses a socket path of more than
+    # 107 characters, and the nightly's work directory is deep already;
+    # case_dirs.txt maps the directories back to the cases
+    short = f"{ARGS.mode[0]}-{zlib.crc32(name.encode()):08x}"
+    work = ARGS.workdir / short
+    with (ARGS.workdir / "case_dirs.txt").open("a") as index:
+        index.write(f"{short}  {ARGS.mode}/{name}\n")
     gtid = ARGS.mode == "gtid"
     source = harness.MySQLServer(ARGS.mysql_basedir, work / "source",
                                  ARGS.port, gtid, server_id=1)

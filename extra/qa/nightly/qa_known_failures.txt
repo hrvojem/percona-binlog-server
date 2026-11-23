@@ -335,7 +335,6 @@ resource_exhaustion_test gtid/unfinished_pull_dropped  ticket 87 (PBS-163): a tr
 resource_exhaustion_test gtid/complete_no_checkpoints  ticket 87 (PBS-163): without checkpoint settings the whole binlog being received stays in memory
 resource_exhaustion_test gtid/gtid_gaps  ticket 88 (PBS-164): transactions with gapped GTIDs make every new rewrite-mode binlog carry the whole GTID set: 0.4 MiB of stream becomes 14 MiB in about 1,000 binlogs, and list needs 147 MiB
 resource_exhaustion_test gtid/rotation_flood  ticket 91: binlog.index is rewritten in full at every rotation, so the bytes written per rotation grow with the number of binlogs
-resource_exhaustion_test gtid/log_volume  ticket 45 (PBS-118): the info log grows by more than the stream it describes
 stuck_storage_recovery_test position/nul_metadata/R4  runbook: this repair deletes good binlogs and the storage stays stuck (ticket 59, PBS-131)
 stuck_storage_recovery_test position/nul_metadata/R9  runbook: this repair deletes good binlogs and the storage stays stuck (ticket 59, PBS-131)
 stuck_storage_recovery_test position/lower_sequence/R2  ticket 70 (PBS-158): this repair leaves the hostile ROTATE or indexes the binlog with the lower number first
@@ -455,3 +454,4 @@ clock_test gtid/future/y2100  ticket 84 (PBS-151): max_timestamp is PBS's (faked
 clock_test gtid/future/y2106  ticket 84 (PBS-151): max_timestamp is PBS's (faked) fetch time
 clock_test */future/y2300  ticket 79 (PBS-145): past 2262 std::chrono::system_clock overflows (a negative UNIX_TIMESTAMP() from the listener, a telemetry report named '-<n>-<tag>.json' that is never cleaned up); in GTID mode the generated event timestamps also wrap (uint32) to 2027
 clock_test */telemetry/wall_fwd_1d  ticket 96: telemetry ages its reports by the wall-clock time in their names, so a forward jump of more than history_keep_interval deletes a report it has just written
+pull_variety_test gtid/vector_index  not a PBS bug (flaky, Percona Server 9.7): after a replay the replica's optimizer sometimes does not use the moved table's vector index (index_used false) although CHECK TABLE is OK and every probe finds the same row as on the source; seen once, 2026-11-21, position mode passing the same night

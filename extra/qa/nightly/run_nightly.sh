@@ -131,7 +131,7 @@ QA_S3_EXAMPLES=${QA_S3_EXAMPLES:-5}
 S3_BUCKET_DIR=${S3_BUCKET_DIR:-$WS/s3/data/pbs-mtr}
 # the rotation of the heavier QA harnesses: '<weekday>:<harness>/<mode>'
 # (weekday 1-7 is Monday-Sunday, date +%u); 4-15 min a night (README.md)
-QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 4:pull_versions/ps-8.4 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 6:pull_versions/ps-9.7 7:network_fault_test/gtid 7:pull_soak_test/position 5:pull_soak_test/gtid 3:log_hygiene_test/position 6:log_hygiene_test/gtid 6:clock_test/position 7:clock_test/gtid 2:listener_exhaustion_test/position 5:file_security_test/position 1:hostile_source_test/position 3:secrets_exposure_test/position 4:upstream_tls_test/position 6:listener_replica_dos_test/gtid 2:metadata_tamper_test/position 6:metadata_tamper_test/gtid 7:listener_login_test/position 3:listener_command_fuzz_test/position 1:tls_config_test/position 4:replica_tamper_test/position 6:final_flush_test/position 7:replica_tamper_test/gtid 1:hostile_source_test/gtid 5:s3_upload_tamper_test/position 5:listener_command_fuzz_test_tls/gtid 2:checkpoint_loss_test/position 3:rewrite_attack_test/gtid 1:hostile_source_pull_test/position 6:hostile_source_pull_test_rewrite/gtid 2:purge_search_tamper_test/gtid 3:truncated_transaction_test/position 5:truncated_transaction_test/gtid 7:truncated_transaction_test_rewrite/gtid 5:damaged_binlog_consumers_test/position 7:damaged_binlog_consumers_test/gtid 2:keyring_test/position 4:keyring_test/gtid 3:resource_exhaustion_test/position 6:resource_exhaustion_test/gtid 1:stuck_storage_recovery_test/position 5:stuck_storage_recovery_test/gtid 2:pull_two_sided_attack_test/position 7:pull_two_sided_attack_test/gtid 1:hostile_source_pull_test_s3/position 3:truncated_transaction_test_s3/gtid 7:purge_search_tamper_test_s3/gtid"}
+QA_ROTATION=${QA_ROTATION:-"1:s3_fault_sweep/position 1:pull_versions/9.7 2:disk_fault_sweep/position 2:pull_versions/8.0 3:network_fault_test/position 3:large_binlog_test/position 4:listener_fuzz_test/position 4:listener_fuzz_test/gtid 4:source_change_test/position 4:source_change_test/gtid 4:pull_versions/ps-8.4 5:s3_fault_sweep/gtid 5:large_binlog_test_s3/position 6:disk_fault_sweep/gtid 6:pull_load_test/position 6:pull_versions/ps-9.7 7:network_fault_test/gtid 7:pull_soak_test/position 5:pull_soak_test/gtid 3:log_hygiene_test/position 6:log_hygiene_test/gtid 6:clock_test/position 7:clock_test/gtid 2:source_reply_test/position 5:source_reply_test/gtid 2:listener_exhaustion_test/position 5:file_security_test/position 1:hostile_source_test/position 3:secrets_exposure_test/position 4:upstream_tls_test/position 6:listener_replica_dos_test/gtid 2:metadata_tamper_test/position 6:metadata_tamper_test/gtid 7:listener_login_test/position 3:listener_command_fuzz_test/position 1:tls_config_test/position 4:replica_tamper_test/position 6:final_flush_test/position 7:replica_tamper_test/gtid 1:hostile_source_test/gtid 5:s3_upload_tamper_test/position 5:listener_command_fuzz_test_tls/gtid 2:checkpoint_loss_test/position 3:rewrite_attack_test/gtid 1:hostile_source_pull_test/position 6:hostile_source_pull_test_rewrite/gtid 2:purge_search_tamper_test/gtid 3:truncated_transaction_test/position 5:truncated_transaction_test/gtid 7:truncated_transaction_test_rewrite/gtid 5:damaged_binlog_consumers_test/position 7:damaged_binlog_consumers_test/gtid 2:keyring_test/position 4:keyring_test/gtid 3:resource_exhaustion_test/position 6:resource_exhaustion_test/gtid 1:stuck_storage_recovery_test/position 5:stuck_storage_recovery_test/gtid 2:pull_two_sided_attack_test/position 7:pull_two_sided_attack_test/gtid 1:hostile_source_pull_test_s3/position 3:truncated_transaction_test_s3/gtid 7:purge_search_tamper_test_s3/gtid"}
 QA_ROTATION_DAY=${QA_ROTATION_DAY:-$(date -u +%u)}
 # pull_versions on Percona Server: '<label>:<series>:<distribution under
 # $WS/dist>' (8.4 is the release tarball, 9.7 a build of the 9.7 branch,
@@ -786,7 +786,8 @@ if want qa || want rotation; then
         [ "$harness" = truncated_transaction_test_s3 ] ||
         [ "$harness" = purge_search_tamper_test_s3 ] ||
         [ "$harness" = log_hygiene_test ] ||
-        [ "$harness" = clock_test ]; then
+        [ "$harness" = clock_test ] ||
+        [ "$harness" = source_reply_test ]; then
       build=debug_gcc14
       binsrv=$debug_binsrv
     fi
@@ -1061,6 +1062,12 @@ if want qa || want rotation; then
         qa_run log_hygiene_test "log_hygiene_test ($mode)" \
           "${common[@]}" --workdir "$out/qa/lh-$mode" \
           --port $((QA_PORT + 1360)) --timeout 1500 ;;
+      source_reply_test)
+        # odd answers from the source to the queries fetch sends before the
+        # binlog dump, through a proxy that answers them itself (10 s)
+        qa_run source_reply_test "source_reply_test ($mode)" \
+          "${common[@]}" --workdir "$out/qa/sr-$mode" \
+          --port $((QA_PORT + 1400)) --timeout 900 ;;
       clock_test)
         # binlog_server under libfaketime (built from source into
         # $WS/clock/libfaketime): wall-clock jumps, a skewed clock, time

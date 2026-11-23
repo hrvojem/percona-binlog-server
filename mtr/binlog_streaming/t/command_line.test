@@ -1,0 +1,64 @@
+#
+# Checks the command line of the Binlog Server utility without a MySQL
+# server or a storage: the 'version' operation prints the version and exits
+# with 0, and a missing or unknown operation, the wrong number of arguments
+# and the internal 'delimiter' value are refused with exit code 1 and the
+# usage message (src/app.cpp) instead of a crash.
+#
+
+--source ../include/have_binsrv.inc
+
+--let $version_regex = /[0-9]+\.[0-9]+\.[0-9]+[^ ]*/<VERSION>/
+--let $usage_regex = /usage: [^ ]+/usage: <BINSRV>/ /       [^ ]+binlog_server/       <BINSRV>/
+
+--echo *** 'version' prints the version and exits with 0.
+--replace_regex $version_regex
+--exec $BINSRV version
+
+--echo
+--echo *** 'version' takes no argument.
+--replace_regex $usage_regex
+--error 1
+--exec $BINSRV version extra 2>&1
+
+--echo
+--echo *** No operation at all.
+--replace_regex $usage_regex
+--error 1
+--exec $BINSRV 2>&1
+
+--echo
+--echo *** An unknown operation.
+--replace_regex $usage_regex
+--error 1
+--exec $BINSRV no_such_operation config.json 2>&1
+
+--echo
+--echo *** The name of the internal end-of-list value is not an operation.
+--replace_regex $usage_regex
+--error 1
+--exec $BINSRV delimiter 2>&1
+
+--echo
+--echo *** Operation names are case-sensitive.
+--replace_regex $usage_regex
+--error 1
+--exec $BINSRV VERSION 2>&1
+
+--echo
+--echo *** An operation without its configuration file.
+--replace_regex $usage_regex
+--error 1
+--exec $BINSRV fetch 2>&1
+
+--echo
+--echo *** An operation with one argument too many.
+--replace_regex $usage_regex
+--error 1
+--exec $BINSRV list config.json extra 2>&1
+
+--echo
+--echo *** A search without its search argument.
+--replace_regex $usage_regex
+--error 1
+--exec $BINSRV search_by_timestamp config.json 2>&1

@@ -563,6 +563,36 @@ PYTHONPATH=~/ws/qa/pylib python3 extra/qa/listener_login_test.py \
   --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/listener-login
 ```
 
+### Odd answers to the queries before the binlog dump — `source_reply_test.py`
+
+Before the binlog dump, `fetch` sends the source `SET
+@source_binlog_checksum = ...` and, in GTID mode on an empty storage, `SELECT
+@@GLOBAL.gtid_purged`. A real server answers both, so the error paths after
+them were reached by no test (the 2026-11-18 coverage measurement). A proxy
+between `fetch` and a real MySQL source answers one of them itself: an ERR
+packet to the SET query; to the SELECT an ERR packet, no rows, two rows, two
+columns, a NULL value or a value that is not a GTID set; or it resets the
+connection right after the SET query's answer, before the binlog dump
+command. `fetch` must exit 1, store nothing and log the reason. On
+2026-11-23 (MySQL 8.4.8, both modes) every case ends cleanly with exit 1 and
+an empty storage, but only the unparsable GTID set is logged with its
+reason ("cannot parse GTID set"). For every other case `collector_context`
+logs only "unable to switch to replication" (or, for the reset, "fetching
+binlog events loop did not reach EOF") and drops the server's error or the
+problem with the result: the gap ticket 47 (PBS-121) describes for a failed
+connect, in a second place.
+
+```sh
+PYTHONPATH=~/ws/qa/pylib python3 extra/qa/source_reply_test.py \
+  --mysql-basedir <dist> --binsrv <binary> --workdir ~/ws/qa/source-reply \
+  --mode gtid
+```
+
+The command line itself has an MTR test, `binlog_streaming.command_line`:
+`binlog_server version`, and a missing or unknown operation, the wrong
+number of arguments, the internal `delimiter` value and an upper-case
+operation name, each refused with exit code 1 and the usage message.
+
 ### What `pull` logs at info level — `log_hygiene_test.py`
 
 Upstream `dd6b598` (PBS-118, ticket 45) moved the per-event messages to
@@ -1464,10 +1494,10 @@ server rather than starting one.
      | Day | Harness (mode) | Build |
      | --- | --- | --- |
      | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position and gtid, about 1 min each) and `tls_config_test.py` (position, about 5 min); `hostile_source_pull_test.py` (position, about 5 min, and again with `--storage s3`, cases `position/<case>/s3`); `stuck_storage_recovery_test.py` (position, about 4 min) | ASan; debug |
-     | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 4 min) and `checkpoint_loss_test.py` (position, file storage, about 5 min); `purge_search_tamper_test.py` (gtid, about 2 min); `keyring_test.py` (position, about 4 min) and `pull_two_sided_attack_test.py` (position, about 5 min) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
+     | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 4 min) and `checkpoint_loss_test.py` (position, file storage, about 5 min); `purge_search_tamper_test.py` (gtid, about 2 min); `keyring_test.py` (position, about 4 min) and `pull_two_sided_attack_test.py` (position, about 5 min); `source_reply_test.py` (position, 10 s) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
      | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min); `rewrite_attack_test.py` (gtid, about 7 min) and `truncated_transaction_test.py` (position, about 3 min, and gtid with `--storage s3`, about 5 min); `resource_exhaustion_test.py` (position, about 5 min); `log_hygiene_test.py` (position, about 6 min) | ASan; debug |
      | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) and `replica_tamper_test.py` (position, about 4 min); `keyring_test.py` (gtid, about 4 min) | ASan; debug |
-     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 7 min, with the local S3 server), `s3_upload_tamper_test.py` (position, about 1 min) and `listener_command_fuzz_test.py --tls` (gtid, about 5 min); `truncated_transaction_test.py` (gtid, about 3 min) and `damaged_binlog_consumers_test.py` (position, about 3 min); `stuck_storage_recovery_test.py` (gtid, about 9 min); `pull_soak_test.py` (gtid, `QA_SOAK_SECONDS`, 2 h by default) | ASan; debug |
+     | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 7 min, with the local S3 server), `s3_upload_tamper_test.py` (position, about 1 min) and `listener_command_fuzz_test.py --tls` (gtid, about 5 min); `truncated_transaction_test.py` (gtid, about 3 min) and `damaged_binlog_consumers_test.py` (position, about 3 min); `stuck_storage_recovery_test.py` (gtid, about 9 min); `pull_soak_test.py` (gtid, `QA_SOAK_SECONDS`, 2 h by default); `source_reply_test.py` (gtid, 10 s) | ASan; debug |
      | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min); `final_flush_test.py` (position, about 3 min); `hostile_source_pull_test.py --rewrite` (gtid, about 9 min); `resource_exhaustion_test.py` (gtid, about 9 min); `metadata_tamper_test.py` (gtid, about 9 min); `log_hygiene_test.py` (gtid, about 6 min); `clock_test.py` (position, about 35 min) | debug / ASan; debug |
      | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) and `replica_tamper_test.py` (gtid, about 4 min); `truncated_transaction_test.py --rewrite` (gtid, about 5 min) and `damaged_binlog_consumers_test.py` (gtid, about 11 min); `pull_two_sided_attack_test.py` (gtid, about 5 min) and `purge_search_tamper_test.py --storage s3` (gtid, about 22 min); `clock_test.py` (gtid, about 25 min) | ASan / debug; debug |
 

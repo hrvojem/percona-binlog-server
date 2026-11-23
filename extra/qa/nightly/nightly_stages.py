@@ -392,7 +392,8 @@ def harness_command(args, workdir: Path) -> list:
                         "damaged_binlog_consumers_test", "keyring_test",
                         "resource_exhaustion_test",
                         "pull_two_sided_attack_test",
-                        "stuck_storage_recovery_test", "log_hygiene_test"):
+                        "stuck_storage_recovery_test", "log_hygiene_test",
+                        "source_reply_test"):
         return script + common + mode
     if args.harness == "clock_test":
         # the binlog_server process runs under libfaketime; the nightly
@@ -430,7 +431,7 @@ def harness_cases(args, returncode: int, output: str, lines: list,
                         "resource_exhaustion_test",
                         "pull_two_sided_attack_test",
                         "stuck_storage_recovery_test", "log_hygiene_test",
-                        "clock_test"):
+                        "clock_test", "source_reply_test"):
         cases = []
         for result, _ in objects:
             if "case" not in result:

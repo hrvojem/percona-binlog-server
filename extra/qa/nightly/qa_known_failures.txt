@@ -15,7 +15,8 @@
 # hostile_source_pull_test, purge_search_tamper_test,
 # truncated_transaction_test, damaged_binlog_consumers_test, keyring_test,
 # resource_exhaustion_test, stuck_storage_recovery_test,
-# pull_two_sided_attack_test, log_hygiene_test, clock_test) run
+# pull_two_sided_attack_test, log_hygiene_test, clock_test,
+# source_reply_test) run
 # about once a week,
 # so their known failures show up on those nights only.
 # A sanitizer report is never covered by a pattern line (its reason names
@@ -454,3 +455,10 @@ clock_test gtid/future/y2106  ticket 84 (PBS-151): max_timestamp is PBS's (faked
 clock_test */future/y2300  ticket 79 (PBS-145): past 2262 std::chrono::system_clock overflows (a negative UNIX_TIMESTAMP() from the listener, a telemetry report named '-<n>-<tag>.json' that is never cleaned up); in GTID mode the generated event timestamps also wrap (uint32) to 2027
 clock_test */telemetry/wall_fwd_1d  ticket 96: telemetry ages its reports by the wall-clock time in their names, so a forward jump of more than history_keep_interval deletes a report it has just written
 pull_variety_test gtid/vector_index  not a PBS bug (flaky, Percona Server 9.7): after a replay the replica's optimizer sometimes does not use the moved table's vector index (index_used false) although CHECK TABLE is OK and every probe finds the same row as on the source; seen once, 2026-11-21, position mode passing the same night
+source_reply_test */checksum_query_error  ticket 47 (PBS-121): when switching to replication fails, collector_context logs only 'unable to switch to replication' and drops the reason (here the server's ERR to SET @source_binlog_checksum); fetch exits 1 and stores nothing
+source_reply_test gtid/gtid_purged_error  ticket 47 (PBS-121): as checksum_query_error, for an ERR to SELECT @@GLOBAL.gtid_purged
+source_reply_test gtid/gtid_purged_no_rows  ticket 47 (PBS-121): as checksum_query_error; the dropped reason is 'query did not return exactly one row'
+source_reply_test gtid/gtid_purged_two_rows  ticket 47 (PBS-121): as gtid_purged_no_rows
+source_reply_test gtid/gtid_purged_two_columns  ticket 47 (PBS-121): as checksum_query_error; the dropped reason is 'query did not return exactly one column'
+source_reply_test gtid/gtid_purged_null  ticket 47 (PBS-121): as checksum_query_error; the dropped reason is 'query returned NULL value'
+source_reply_test */binlog_open_reset  ticket 47 (PBS-121): a connection reset right before the binlog dump is logged only as 'fetching binlog events loop did not reach EOF'

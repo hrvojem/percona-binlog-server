@@ -1,5 +1,23 @@
 # Coverage gaps
 
+## 2026-11-23: follow-up tests for the 2026-11-18 gaps
+
+- `binlog_streaming.command_line` (MTR) runs `binlog_server version` and
+  the refused command lines (no operation, an unknown one, the wrong number
+  of arguments, `delimiter`, an upper-case name): `version_operation.cpp`
+  and the usage branch of `app.cpp` are reached.
+- `source_reply_test.py` answers the source's side of `SET
+  @source_binlog_checksum` and `SELECT @@GLOBAL.gtid_purged` with an ERR
+  packet, odd result sets or a connection reset: the query and result
+  checks of `easymysql/connection.cpp` are reached. It found that the
+  reasons are not logged (ticket 47, PBS-121, extended).
+- Telemetry write failures were not a gap: `telemetry_test.py` has injected
+  failed opens, writes, fsyncs, renames and removals in the telemetry
+  directory (its `fault_*` cases, with `--fsfault-lib`), and the
+  2026-11-18 run reached all of those lines. The telemetry lines
+  left are a cancelled-timer return `pull` never takes, the catch for
+  non-standard exceptions and the unused move members.
+
 ## 2026-11-18: after the merges of upstream `4717df9` and `dd6b598`
 
 A quicker measurement than the layered one below: one coverage build, one
@@ -60,7 +78,7 @@ comparison helpers used only at trace level or by nothing (the
 `operator==` of `unknown_body` / `unknown_post_header`), copy and move
 members nothing uses (`search_response`, `telemetry`), and error-class
 constructors from a bare code (`s3_error(int)`, `core_error(int)`). The
-ones worth a test or a decision:
+ones worth a test or a decision (follow-up of 2026-11-23: the version operation, the usage message and the errors after the source's answers to the pre-dump queries now have tests, see below):
 - **The `version` operation** (`operations/version_operation.cpp`): no
   test runs `binlog_server version`.
 - **S3 region detection** (`s3_storage_backend.cpp:210`, `aws_context`

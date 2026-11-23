@@ -1,0 +1,73 @@
+*** 'version' prints the version and exits with 0.
+<VERSION>
+*** 'version' takes no argument.
+unexpected number of command line arguments for the 'version' operation
+usage: <BINSRV> (fetch|pull)) <json_config_file>
+       binlog_server list <json_config_file>
+       binlog_server search_by_timestamp <json_config_file> <timestamp>
+       binlog_server search_by_gtid_set <json_config_file> <gtid_set>
+       binlog_server purge_binlogs <json_config_file> <binlog_name>
+       binlog_server version
+
+*** No operation at all.
+insufficient number of command line arguments
+usage: <BINSRV> (fetch|pull)) <json_config_file>
+       binlog_server list <json_config_file>
+       binlog_server search_by_timestamp <json_config_file> <timestamp>
+       binlog_server search_by_gtid_set <json_config_file> <gtid_set>
+       binlog_server purge_binlogs <json_config_file> <binlog_name>
+       binlog_server version
+
+*** An unknown operation.
+invalid operation mode specified
+usage: <BINSRV> (fetch|pull)) <json_config_file>
+       binlog_server list <json_config_file>
+       binlog_server search_by_timestamp <json_config_file> <timestamp>
+       binlog_server search_by_gtid_set <json_config_file> <gtid_set>
+       binlog_server purge_binlogs <json_config_file> <binlog_name>
+       binlog_server version
+
+*** The name of the internal end-of-list value is not an operation.
+invalid operation mode specified
+usage: <BINSRV> (fetch|pull)) <json_config_file>
+       binlog_server list <json_config_file>
+       binlog_server search_by_timestamp <json_config_file> <timestamp>
+       binlog_server search_by_gtid_set <json_config_file> <gtid_set>
+       binlog_server purge_binlogs <json_config_file> <binlog_name>
+       binlog_server version
+
+*** Operation names are case-sensitive.
+invalid operation mode specified
+usage: <BINSRV> (fetch|pull)) <json_config_file>
+       binlog_server list <json_config_file>
+       binlog_server search_by_timestamp <json_config_file> <timestamp>
+       binlog_server search_by_gtid_set <json_config_file> <gtid_set>
+       binlog_server purge_binlogs <json_config_file> <binlog_name>
+       binlog_server version
+
+*** An operation without its configuration file.
+unexpected number of command line arguments for the 'fetch' operation
+usage: <BINSRV> (fetch|pull)) <json_config_file>
+       binlog_server list <json_config_file>
+       binlog_server search_by_timestamp <json_config_file> <timestamp>
+       binlog_server search_by_gtid_set <json_config_file> <gtid_set>
+       binlog_server purge_binlogs <json_config_file> <binlog_name>
+       binlog_server version
+
+*** An operation with one argument too many.
+unexpected number of command line arguments for the 'list' operation
+usage: <BINSRV> (fetch|pull)) <json_config_file>
+       binlog_server list <json_config_file>
+       binlog_server search_by_timestamp <json_config_file> <timestamp>
+       binlog_server search_by_gtid_set <json_config_file> <gtid_set>
+       binlog_server purge_binlogs <json_config_file> <binlog_name>
+       binlog_server version
+
+*** A search without its search argument.
+unexpected number of command line arguments for the 'search_by_timestamp' operation
+usage: <BINSRV> (fetch|pull)) <json_config_file>
+       binlog_server list <json_config_file>
+       binlog_server search_by_timestamp <json_config_file> <timestamp>
+       binlog_server search_by_gtid_set <json_config_file> <gtid_set>
+       binlog_server purge_binlogs <json_config_file> <binlog_name>
+       binlog_server version

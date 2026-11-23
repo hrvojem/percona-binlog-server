@@ -751,8 +751,10 @@ signal. The hostile names (tickets 59, 69, 70) do the same damage as with
 truncated while a replica reads it, and the replica then stalls without an
 error in its status. In GTID mode `pull` also accepts the plain
 re-announcement that `fetch` refuses. With rewrite, an EOF after GTID +
-BEGIN leaves fragments in the stored binlog that `pull` can no longer serve
-(ticket 83, PBS-150), and duplicated, swapped or replayed transactions are stored
+BEGIN left fragments in the stored binlog that `pull` could no longer serve
+(ticket 83, PBS-150; fixed upstream by `0e45db5`, which discards the
+incomplete transaction and flushes the complete ones on an EOF too, and
+`eof_mid_transaction` passes since 2026-11-23), and duplicated, swapped or replayed transactions are stored
 (ticket 81, PBS-147). A lowered `transaction_length` leaves a stub in every mode
 (ticket 82, PBS-148). `pull` reconnects once a second without back-off; an ERR
 packet from the source ends it with exit 1. Since rewrite mode is

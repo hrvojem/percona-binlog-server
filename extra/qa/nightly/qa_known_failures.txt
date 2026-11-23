@@ -160,7 +160,6 @@ hostile_source_pull_test gtid/gtid_swapped/rewrite  ticket 81 (PBS-147): in rewr
 hostile_source_pull_test gtid/gtid_other_uuid/rewrite  ticket 81 (PBS-147): in rewrite mode a duplicated, swapped, foreign or replayed transaction is stored and served
 hostile_source_pull_test gtid/length_smaller/rewrite  ticket 82 (PBS-148): a lowered transaction_length leaves a cut-off transaction in the storage
 hostile_source_pull_test gtid/replay_after_reconnect/rewrite  ticket 81 (PBS-147): in rewrite mode a duplicated, swapped, foreign or replayed transaction is stored and served
-hostile_source_pull_test gtid/eof_mid_transaction/rewrite  ticket 83 (PBS-150): an EOF after GTID + BEGIN leaves fragments in the rewritten binlog, which pull can then no longer serve
 truncated_transaction_test position/lie_after_gtid  ticket 82 (PBS-148): a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
 truncated_transaction_test position/lie_after_begin  ticket 82 (PBS-148): a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1
 truncated_transaction_test position/lie_after_table_map  ticket 82 (PBS-148): a transaction_length that ends at an event boundary leaves a stub in the storage, and every later run exits 1

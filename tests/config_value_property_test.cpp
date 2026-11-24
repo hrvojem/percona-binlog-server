@@ -1964,6 +1964,11 @@ BOOST_AUTO_TEST_CASE(ConfigFileRejectsEveryDefect) {
   }
   hegel::Settings settings{};
   settings.test_cases = 10U;
+  // forcing one particular defect can mean drawing until a generator yields
+  // an invalid value (an invalid unit text is rare among the generated
+  // ones), so with only 10 cases a defect can trip the filter health check
+  // by chance (ubsan_gcc14, 2026-11-24: 50 filtered, 9 valid)
+  settings.suppress_health_check = {hegel::HealthCheck::FilterTooMuch};
   for (const auto &defect : defects) {
     BOOST_TEST_CONTEXT("defect " << defect) {
       run_property(

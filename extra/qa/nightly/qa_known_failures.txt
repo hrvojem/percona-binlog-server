@@ -66,20 +66,11 @@ metadata_tamper_test */data_iv_zeroed  ticket 53 (PBS-126): as data_iv_changed, 
 metadata_tamper_test */file_key_changed  ticket 53 (PBS-126): a changed wrapped file key (CTR KEK) is accepted: fetch exits 0, appends under a wrong key, and the binlog is no longer served
 metadata_tamper_test */key_iv_changed  ticket 53 (PBS-126): as file_key_changed, through the key-wrapping IV
 metadata_tamper_test */index_first_entry_dropped  ticket 53 (PBS-126): with the first entry removed from binlog.index, the next fetch takes that binlog for the leftover of an interrupted purge and deletes it and its metadata
-metadata_tamper_test */kek_id_other_existing_gcm  ticket 73 (PBS-143): the final flush fails (the file key cannot be unwrapped), the storage destructor swallows the error, and fetch logs 'successfully fetched everything' and exits 0 with nothing stored
-metadata_tamper_test */cipher_*  ticket 73 (PBS-143): a data cipher name that is not a CTR cipher makes the final flush fail; fetch still exits 0 with nothing stored
-metadata_tamper_test */data_iv_shortened  ticket 73 (PBS-143): as cipher_*, through a data IV of the wrong length
-metadata_tamper_test */file_key_shortened  ticket 73 (PBS-143): as cipher_*, through a wrapped file key of the wrong length
-metadata_tamper_test */key_iv_*  ticket 73 (PBS-143): as cipher_*, through a key-wrapping IV of the wrong length or without one (key_iv_changed is ticket 53, PBS-126)
-metadata_tamper_test */key_tag_added  ticket 73 (PBS-143): as cipher_*, through a tag on a CTR-wrapped file key
-metadata_tamper_test */gcm_file_key_changed  ticket 73 (PBS-143): the GCM tag detects the changed wrapped key at the final flush, but fetch exits 0 with nothing stored
-metadata_tamper_test */gcm_key_*  ticket 73 (PBS-143): as gcm_file_key_changed, through the tag or the key-wrapping IV
 listener_login_test position/plain_password_without_tls  ticket 76 (PBS-152): a line feed in the user name of a failed login puts a line of the client's choosing into the pull log (the user name is logged raw, and without a length limit)
 listener_command_fuzz_test */query_max_frame  ticket 74 (PBS-156): one COM_QUERY of 16 MB is run through four std::regex searches on the listener's only thread: no client is served for 25 s (debug build; 3 s on a release build)
 listener_command_fuzz_test */heartbeat_1*ns_blocking_dump  ticket 75 (PBS-155): a heartbeat period of 1 ns or 1,000 ns is accepted, and an idle blocking dump then sends and logs thousands of heartbeats a second: one core busy and megabytes of log every second
 listener_command_fuzz_test */regex_run_*  ticket 72 (PBS-140): other statements with a run of 40,000 or more characters matched by one of the handshake patterns (digits after the heartbeat period, white space in any SET statement) end pull the same way
-final_flush_test */disk/*  ticket 73 (PBS-143): ENOSPC or EIO on the write or fsync of the binlog data, or on saving the binlog metadata, in the flush fetch runs at exit: the storage destructor drops the error, fetch logs 'successfully fetched everything' and exits 0, and the new data is not recorded
-final_flush_test */s3/*  ticket 73 (PBS-143): the same with every PUT of the binlog object or of its metadata failing (needs --s3-fault-proxy; not run by the nightly)
+final_flush_test */s3/*  ticket 73 (PBS-143): every PUT of the binlog object or of its metadata failing in the final flush of fetch (the file-storage cases pass since upstream 0e45db5; these were not re-run) (needs --s3-fault-proxy; not run by the nightly)
 replica_tamper_test */forged_row  ticket 53 (PBS-126): a row value changed in the encrypted storage without the key (ciphertext XOR, CRC32 footer patched) is served by pull and applied by a MySQL replica, with no error on either side
 replica_tamper_test */plaintext_swap  ticket 62 (PBS-136): the data file of an encrypted binlog replaced with plaintext events (a row value of the attacker's choice, correct CRC32) and the 'encryption' member deleted from its metadata: pull serves it and a MySQL replica applies the row, with no error on either side
 file_security_test position/s3_buffer_swap  ticket 65 (PBS-138): the S3 buffer file is opened again by path after the download: a file or symlink renamed over it by someone who can write an existing 0777 fs_buffer_directory is uploaded as the binlog object, and the symlink's target is appended to or truncated
@@ -88,10 +79,9 @@ s3_upload_tamper_test */get_body_changed  ticket 78 (PBS-154): the body of a GET
 listener_command_fuzz_test */query_max_frame/tls  ticket 74 (PBS-156): as without TLS
 listener_command_fuzz_test */heartbeat_1*ns_blocking_dump/tls  ticket 75 (PBS-155): as without TLS
 listener_command_fuzz_test */regex_run_*/tls  ticket 72 (PBS-140): as without TLS
-final_flush_test */pull_sig*/data*  ticket 73 (PBS-143): pull stopped by SIGTERM or SIGINT with a fault on the flush it runs at exit logs 'successfully shut down after receiving a termination signal' and exits 0 while the new data is not recorded
+final_flush_test */pull_sig*/data*  ticket 73 (PBS-143): still open for pull after upstream 0e45db5 fixed fetch: pull stopped by SIGTERM or SIGINT with a fault on the flush it runs at exit logs 'successfully shut down after receiving a termination signal' and exits 0 while the new data is not recorded
 final_flush_test */pull_sig*/metadata*  ticket 73 (PBS-143): the same with the fault on saving the binlog metadata
-final_flush_test */checkpoint/*/final_flush/*  ticket 73 (PBS-143): with checkpoint_size or checkpoint_interval the checkpoint flushes report a fault, but the flush at exit (fetch at EOF, pull on SIGTERM) still drops it: exit 0, the tail after the last checkpoint is not recorded
-final_flush_test */partial/fetch/final_flush/*  ticket 73 (PBS-143): only one write of the final flush fails once: the data is written, its metadata is not, fetch exits 0
+final_flush_test */checkpoint/pull/*/final_flush/*  ticket 73 (PBS-143): pull only since upstream 0e45db5 (fetch now flushes and fails at EOF); with checkpoint_size or checkpoint_interval the checkpoint flushes report a fault, but the flush at exit (fetch at EOF, pull on SIGTERM) still drops it: exit 0, the tail after the last checkpoint is not recorded
 final_flush_test */s3_buffer/write/on_s3  ticket 73 (PBS-143): a failing write to the S3 backend's local buffer file in the final flush (needs --s3-fault-proxy and --fsfault-lib; not run by the nightly)
 final_flush_test */query/*  ticket 80 (PBS-146): list and search_by_timestamp leave out a binlog whose metadata cannot be parsed and answer with status "success" and exit 0
 rewrite_attack_test gtid/source_gtid_twice  ticket 81 (PBS-147): in rewrite mode nothing compares a GTID from the source with what is stored: a GTID sent twice is stored twice, two swapped transactions are stored in that order, a GTID under another UUID is stored (fetch exits 0)

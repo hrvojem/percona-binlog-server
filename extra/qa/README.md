@@ -374,6 +374,10 @@ wrong types, GTID edits and index edits are refused cleanly. 27 cases fail
   CTR cipher, an IV or key of the wrong length, a GCM tag that no longer
   verifies) end with "successfully fetched everything" and exit 0 while
   nothing is stored: the storage destructor swallows the error (ticket 73, PBS-143).
+  Since upstream `0e45db5` (PBS-150) `fetch` flushes explicitly when the
+  source ends the stream, so these edits now end with exit 1 and the
+  error ("the specified cipher is not a CTR cipher", "cannot finalize
+  cipher context"); they pass since 2026-11-24.
 
 Since upstream `4717df9` GTID mode is always rewrite mode, whose binlogs are
 the Binlog Server's own files. In GTID mode the harness therefore sets an 8K
@@ -453,7 +457,12 @@ with nothing recorded (`pull_sigterm/*`, `pull_sigint/*`). With
 reported, but the flush at exit still is not, so the tail after the last
 checkpoint is lost silently (`checkpoint/*/final_flush/*`); the same when
 only one write of the final flush fails once (`partial/*`). All of these
-are ticket 73 (PBS-143). Reported correctly: a failing flush at a rotation or after a
+are ticket 73 (PBS-143). Since upstream `0e45db5` (PBS-150), which makes
+`fetch` flush explicitly when the source ends the stream, the `fetch` cases
+pass (2026-11-24: 37 of 44, the disk and partial-flush cases included);
+`pull` stopped by a signal (`pull_sigterm/*`, `pull_sigint/*`,
+`checkpoint/pull/*/final_flush/*`) still drops the error, and the S3 cases
+were not re-run. Reported correctly: a failing flush at a rotation or after a
 read timeout in a running `pull`, every fault while a first `fetch` creates
 the storage, `purge_binlogs` (status "warning" when a binlog cannot be
 deleted, "error" when the index cannot be rewritten), and a log file that

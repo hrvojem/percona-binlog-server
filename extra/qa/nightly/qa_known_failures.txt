@@ -451,4 +451,6 @@ source_reply_test gtid/gtid_purged_no_rows  ticket 47 (PBS-121): as checksum_que
 source_reply_test gtid/gtid_purged_two_rows  ticket 47 (PBS-121): as gtid_purged_no_rows
 source_reply_test gtid/gtid_purged_two_columns  ticket 47 (PBS-121): as checksum_query_error; the dropped reason is 'query did not return exactly one column'
 source_reply_test gtid/gtid_purged_null  ticket 47 (PBS-121): as checksum_query_error; the dropped reason is 'query returned NULL value'
+shadow_test position/crash  ticket 6 (PBS-72): the source killed right after FLUSH BINARY LOGS: on the reconnect pull closes the new binlog with its FORMAT_DESCRIPTION and PREVIOUS_GTIDS events buffered and opens the next one; the debug build aborts on the assertion 'incomplete_transaction_timestamps_.is_empty()' (storage.cpp:138), a release build records the dropped events' timestamp as the next binlog's min_timestamp
+shadow_test gtid/quiet  ticket 94 (PBS-167): the last transaction followed by silence is not written within the 1 s checkpoint_interval; in rewrite mode not even the source's ROTATE after it makes PBS write it (the event is skipped), only the reconnect after read_timeout does
 source_reply_test */binlog_open_reset  ticket 47 (PBS-121): a connection reset right before the binlog dump is logged only as 'fetching binlog events loop did not reach EOF'

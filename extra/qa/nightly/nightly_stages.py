@@ -401,6 +401,12 @@ def harness_command(args, workdir: Path) -> list:
         return script + common + mode + [
             "--faketime-lib", str(args.faketime_lib),
             "--cases", CLOCK_TEST_NIGHTLY_CASES[args.mode or "position"]]
+    if args.harness == "shadow_test":
+        # simulated hosts: --port is not used; a new seed every night, the
+        # seed in a failing case's JSON line replays it exactly
+        return script + base + mode + [
+            "--shadow", str(args.shadow), "--seed", str(args.seed),
+            "--jobs", "3"]
     raise SystemExit(f"unknown harness {args.harness}")
 
 
@@ -431,7 +437,7 @@ def harness_cases(args, returncode: int, output: str, lines: list,
                         "resource_exhaustion_test",
                         "pull_two_sided_attack_test",
                         "stuck_storage_recovery_test", "log_hygiene_test",
-                        "clock_test", "source_reply_test"):
+                        "clock_test", "source_reply_test", "shadow_test"):
         cases = []
         for result, _ in objects:
             if "case" not in result:
@@ -725,6 +731,10 @@ def precondition_failure(args) -> str:
     if args.harness == "clock_test" and not (
             args.faketime_lib and Path(args.faketime_lib).is_file()):
         return f"the libfaketime library {args.faketime_lib} does not exist"
+    if args.harness == "shadow_test" and not (
+            args.shadow and Path(args.shadow).is_file()):
+        return (f"the shadow binary {args.shadow} does not exist "
+                "(extra/qa/shadow/build_shadow.sh)")
     return ""
 
 
@@ -1063,13 +1073,15 @@ def main():
                         help="disk_fault_sweep's LD_PRELOAD library")
     parser.add_argument("--faketime-lib", type=Path,
                         help="clock_test's libfaketime library")
+    parser.add_argument("--shadow", type=Path,
+                        help="shadow_test's patched shadow binary")
     parser.add_argument("--toxiproxy-api", default="http://127.0.0.1:8474")
     parser.add_argument("--tls", action="store_true",
                         help="listener_command_fuzz_test: log in over TLS")
     parser.add_argument("--connections", type=int, default=3000,
                         help="listener_fuzz_test connections")
     parser.add_argument("--seed", type=int, default=1,
-                        help="listener_fuzz_test seed")
+                        help="listener_fuzz_test and shadow_test seed")
     parser.add_argument("--duration", type=int, default=7200,
                         help="pull_soak_test seconds of load")
     # fuzz

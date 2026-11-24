@@ -1,0 +1,277 @@
+diff --git a/src/main/host/descriptor/epoll.c b/src/main/host/descriptor/epoll.c
+index eca2a4b..e850827 100644
+--- a/src/main/host/descriptor/epoll.c
++++ b/src/main/host/descriptor/epoll.c
+@@ -113,6 +113,12 @@ struct _Epoll {
+     /* A counter for sorting watches, for guaranteeing determinism when reporting events. */
+     uint64_t watch_id_counter;
+ 
++    /* Set when a watched file closes. This epoll serves poll() and select(),
++     * so a file closed by another thread while a thread polls it must wake
++     * that thread (which then reports POLLNVAL for it), instead of the watch
++     * silently disappearing and the wakeup being treated as spurious. */
++    gboolean watchClosed;
++
+     MAGIC_DECLARE;
+ };
+ 
+@@ -314,6 +320,7 @@ void epoll_reset(Epoll* epoll) {
+     // Removing will also unref previously stored descriptors
+     g_hash_table_remove_all(epoll->ready);
+     g_hash_table_remove_all(epoll->watching);
++    epoll->watchClosed = FALSE;
+ }
+ 
+ static void _epoll_close(LegacyFile* descriptor, const Host* host) {
+@@ -729,7 +736,8 @@ gint epoll_getEvents(Epoll* epoll, struct epoll_event* eventArray, gint eventArr
+     /* if we consumed all the events that we had to report,
+      * then our parent descriptor can no longer read child epolls */
+     legacyfile_adjustStatus(
+-        &(epoll->super), FileState_READABLE, epoll_getNumReadyEvents(epoll) ? TRUE : FALSE, 0);
++        &(epoll->super), FileState_READABLE,
++        (epoll_getNumReadyEvents(epoll) || epoll->watchClosed) ? TRUE : FALSE, 0);
+ 
+     return 0;
+ }
+@@ -761,6 +769,7 @@ static void _epoll_fileStatusChanged(Epoll* epoll, const EpollKey* key) {
+ 
+             /* if it's closed, then remove it from the watching list */
+             if (watch->flags & EWF_CLOSED) {
++                epoll->watchClosed = TRUE;
+                 /* unref gets called on the watch when it is removed from these tables */
+                 g_hash_table_remove(epoll->watching, key);
+                 /* we should have removed it from the ready list earlier */
+@@ -771,5 +780,6 @@ static void _epoll_fileStatusChanged(Epoll* epoll, const EpollKey* key) {
+ 
+     /* check the status on the parent epoll fd and adjust as needed */
+     legacyfile_adjustStatus(
+-        &(epoll->super), FileState_READABLE, epoll_getNumReadyEvents(epoll) ? TRUE : FALSE, 0);
++        &(epoll->super), FileState_READABLE,
++        (epoll_getNumReadyEvents(epoll) || epoll->watchClosed) ? TRUE : FALSE, 0);
+ }
+diff --git a/src/main/host/descriptor/tcp.c b/src/main/host/descriptor/tcp.c
+index f1ed9fd..ed30fed 100644
+--- a/src/main/host/descriptor/tcp.c
++++ b/src/main/host/descriptor/tcp.c
+@@ -1764,6 +1764,11 @@ gint tcp_acceptServerPeer(TCP* tcp, const Host* host, in_addr_t* ip, in_port_t*
+         return -EINVAL;
+     }
+ 
++    /* the listening socket was shut down for reading */
++    if (tcp->flags & TCPF_LOCAL_CLOSED_RD) {
++        return -EINVAL;
++    }
++
+     /* if there are no pending connection ready to accept, dont block waiting */
+     if(g_queue_get_length(tcp->server->pending) <= 0) {
+         /* listen sockets should have no data, and should not be readable if no pending conns */
+@@ -2835,6 +2840,18 @@ static void _tcp_close(LegacyFile* descriptor, const Host* host) {
+ gint tcp_shutdown(TCP* tcp, const Host* host, gint how) {
+     MAGIC_ASSERT(tcp);
+ 
++    if (tcp->state == TCPS_LISTEN) {
++        /* As on Linux, shutting down a listening socket for reading stops it
++         * accepting connections and wakes the threads waiting on it (servers
++         * such as mysqld use this to stop their accept loops); accept then
++         * fails with EINVAL. */
++        if (how == SHUT_RD || how == SHUT_RDWR) {
++            tcp->flags |= TCPF_LOCAL_CLOSED_RD;
++            legacyfile_adjustStatus((LegacyFile*)tcp, FileState_READABLE, TRUE, 0);
++        }
++        return 0;
++    }
++
+     if(tcp->state == TCPS_SYNSENT || tcp->state == TCPS_SYNRECEIVED ||
+             tcp->state == TCPS_LISTEN || tcp->state == TCPS_CLOSED) {
+         return -ENOTCONN;
+diff --git a/src/main/host/syscall/handler/mod.rs b/src/main/host/syscall/handler/mod.rs
+index 49e91a6..254384f 100644
+--- a/src/main/host/syscall/handler/mod.rs
++++ b/src/main/host/syscall/handler/mod.rs
+@@ -46,11 +46,13 @@ mod sched;
+ mod select;
+ mod shadow;
+ mod signal;
++mod sigtimedwait;
+ mod socket;
+ mod stat;
+ mod sysinfo;
+ mod time;
+ mod timerfd;
++mod times;
+ mod uio;
+ mod unistd;
+ mod wait;
+@@ -476,6 +478,7 @@ impl SyscallHandler {
+             SyscallNum::NR_rseq => handle!(rseq),
+             SyscallNum::NR_rt_sigaction => handle!(rt_sigaction),
+             SyscallNum::NR_rt_sigprocmask => handle!(rt_sigprocmask),
++            SyscallNum::NR_rt_sigtimedwait => handle!(rt_sigtimedwait),
+             SyscallNum::NR_sched_getaffinity => handle!(sched_getaffinity),
+             SyscallNum::NR_sched_setaffinity => handle!(sched_setaffinity),
+             SyscallNum::NR_select => handle!(select),
+@@ -498,6 +501,7 @@ impl SyscallHandler {
+             SyscallNum::NR_syncfs => handle!(syncfs),
+             SyscallNum::NR_sysinfo => handle!(sysinfo),
+             SyscallNum::NR_tgkill => handle!(tgkill),
++            SyscallNum::NR_times => handle!(times),
+             SyscallNum::NR_timerfd_create => handle!(timerfd_create),
+             SyscallNum::NR_timerfd_gettime => handle!(timerfd_gettime),
+             SyscallNum::NR_timerfd_settime => handle!(timerfd_settime),
+@@ -581,6 +585,7 @@ impl SyscallHandler {
+             | SyscallNum::NR_statfs
+             | SyscallNum::NR_symlink
+             | SyscallNum::NR_truncate
++            | SyscallNum::NR_umask
+             | SyscallNum::NR_unlink
+             | SyscallNum::NR_utime
+             | SyscallNum::NR_utimes => {
+diff --git a/src/main/host/syscall/handler/sigtimedwait.rs b/src/main/host/syscall/handler/sigtimedwait.rs
+new file mode 100644
+index 0000000..b04ab8e
+--- /dev/null
++++ b/src/main/host/syscall/handler/sigtimedwait.rs
+@@ -0,0 +1,96 @@
++use linux_api::errno::Errno;
++use linux_api::signal::{Signal, siginfo_t, sigset_t};
++use shadow_shim_helper_rs::simulation_time::SimulationTime;
++use shadow_shim_helper_rs::syscall_types::ForeignPtr;
++
++use crate::core::worker::Worker;
++use crate::host::syscall::handler::{SyscallContext, SyscallHandler};
++use crate::host::syscall::types::SyscallError;
++
++/// How often a thread waiting without a timeout checks for its signals.
++///
++/// The signals waited for are normally blocked in the waiting thread, so
++/// Shadow's signal delivery never wakes it; instead the thread polls, in
++/// simulated time, for one of them to become pending.
++const POLL_INTERVAL_MS: u64 = 10;
++
++impl SyscallHandler {
++    log_syscall!(
++        rt_sigtimedwait,
++        /* rv */ std::ffi::c_int,
++        /* set */ *const std::ffi::c_void,
++        /* info */ *const std::ffi::c_void,
++        /* timeout */ *const std::ffi::c_void,
++        /* sigsetsize */ libc::size_t,
++    );
++    /// rt_sigtimedwait(2), used by sigwait(3), sigwaitinfo(2) and
++    /// sigtimedwait(2): takes a pending thread- or process-directed signal in
++    /// `set` and returns its number.
++    ///
++    /// Without a timeout the thread polls every `POLL_INTERVAL_MS` of
++    /// simulated time. With a timeout it checks once, sleeps for the whole
++    /// timeout and checks again, so a signal arriving during the wait is
++    /// noticed only when the timeout ends.
++    pub fn rt_sigtimedwait(
++        ctx: &mut SyscallContext,
++        set_ptr: ForeignPtr<sigset_t>,
++        info_ptr: ForeignPtr<siginfo_t>,
++        timeout_ptr: ForeignPtr<linux_api::time::timespec>,
++        sigsetsize: libc::size_t,
++    ) -> Result<std::ffi::c_int, SyscallError> {
++        if sigsetsize != size_of::<sigset_t>() {
++            return Err(Errno::EINVAL.into());
++        }
++        let set = ctx.objs.process.memory_borrow().read(set_ptr)?;
++
++        let taken: Option<(Signal, siginfo_t)> = {
++            let shmem_lock = ctx.objs.host.shim_shmem_lock_borrow().unwrap();
++            let thread_shmem = ctx.objs.thread.shmem();
++            let mut thread_protected = thread_shmem.protected.borrow_mut(&shmem_lock.root);
++            if let Some(signal) = (thread_protected.pending_signals & set).lowest() {
++                let info = *thread_protected.pending_standard_siginfo(signal).unwrap();
++                thread_protected.pending_signals.del(signal);
++                Some((signal, info))
++            } else {
++                let process_shmem = ctx.objs.process.shmem();
++                let mut process_protected =
++                    process_shmem.protected.borrow_mut(&shmem_lock.root);
++                if let Some(signal) = (process_protected.pending_signals & set).lowest() {
++                    let info = *process_protected.pending_standard_siginfo(signal).unwrap();
++                    process_protected.pending_signals.del(signal);
++                    Some((signal, info))
++                } else {
++                    None
++                }
++            }
++        };
++
++        if let Some((signal, info)) = taken {
++            if !info_ptr.is_null() {
++                ctx.objs
++                    .process
++                    .memory_borrow_mut()
++                    .write(info_ptr, &info)?;
++            }
++            return Ok(i32::from(signal));
++        }
++
++        let now = Worker::current_time().unwrap();
++        if timeout_ptr.is_null() {
++            return Err(SyscallError::new_blocked_until(
++                now + SimulationTime::from_millis(POLL_INTERVAL_MS),
++                false,
++            ));
++        }
++        // Woke up at the end of the timeout without a signal.
++        if ctx.objs.thread.syscall_condition().is_some() {
++            return Err(Errno::EAGAIN.into());
++        }
++        let timeout = ctx.objs.process.memory_borrow().read(timeout_ptr)?;
++        let timeout = SimulationTime::try_from(timeout).or(Err(Errno::EINVAL))?;
++        if timeout == SimulationTime::ZERO {
++            return Err(Errno::EAGAIN.into());
++        }
++        Err(SyscallError::new_blocked_until(now + timeout, false))
++    }
++}
+diff --git a/src/main/host/syscall/handler/times.rs b/src/main/host/syscall/handler/times.rs
+new file mode 100644
+index 0000000..1a054f0
+--- /dev/null
++++ b/src/main/host/syscall/handler/times.rs
+@@ -0,0 +1,41 @@
++use shadow_shim_helper_rs::emulated_time::EmulatedTime;
++use shadow_shim_helper_rs::syscall_types::ForeignPtr;
++
++use crate::core::worker::Worker;
++use crate::host::syscall::handler::{SyscallContext, SyscallHandler};
++use crate::host::syscall::types::SyscallError;
++
++/// USER_HZ: the unit of `clock_t` values returned by times(2) on Linux.
++const USER_HZ: u64 = 100;
++
++impl SyscallHandler {
++    log_syscall!(
++        times,
++        /* rv */ std::ffi::c_long,
++        /* buf */ *const std::ffi::c_void,
++    );
++    /// times(2): returns the simulated time since the start of the simulation
++    /// in clock ticks, so the value advances with simulated time like the
++    /// uptime that `sysinfo` reports. Shadow does not model CPU time, so the
++    /// process CPU times in `struct tms` are reported as zero.
++    pub fn times(
++        ctx: &mut SyscallContext,
++        buf_ptr: ForeignPtr<[std::ffi::c_long; 4]>,
++    ) -> Result<std::ffi::c_long, SyscallError> {
++        let since_start = Worker::current_time()
++            .unwrap()
++            .duration_since(&EmulatedTime::SIMULATION_START);
++        let ticks = since_start.as_nanos() / (1_000_000_000 / u128::from(USER_HZ));
++        let ticks = std::ffi::c_long::try_from(ticks).unwrap_or(std::ffi::c_long::MAX);
++
++        if !buf_ptr.is_null() {
++            // struct tms { clock_t tms_utime, tms_stime, tms_cutime, tms_cstime; }
++            ctx.objs
++                .process
++                .memory_borrow_mut()
++                .write(buf_ptr, &[0; 4])?;
++        }
++
++        Ok(ticks)
++    }
++}

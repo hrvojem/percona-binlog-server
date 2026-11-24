@@ -21,9 +21,30 @@
 #             lossy           - basic, with LOSS (default 0.02) packet loss
 #                               and LATENCY (default 20 ms) between the
 #                               source and the other hosts
+#             pbskill         - basic, with pull killed (SIGKILL) at
+#                               PBS_KILL_US (microseconds of simulated time)
+#                               and started again 1 s later: the storage must
+#                               still end up equal to the source
+#             replica         - basic, with a MySQL replica of pull's
+#                               listener on a fourth host, started at
+#                               REPLICA_AT (default 20 s): it must end with
+#                               the source's rows and no replication error
+#             replica_early   - replica, started at REPLICA_AT (default 12
+#                               s), after pull started but before it stored
+#                               any transaction (tickets 26 and 38, PBS-96
+#                               and PBS-111); position mode names the binlog
+#             heartbeat       - replica with SOURCE_HEARTBEAT_PERIOD 1 s:
+#                               during 20 quiet seconds after the closing
+#                               FLUSH BINARY LOGS it must receive heartbeats
+#                               (ticket 40, PBS-113)
+#             stop            - basic, with SIGTERM to pull at PBS_TERM_AT
+#                               (default 100 s) while the source is idle: it
+#                               must exit 0 within 5 s (ticket 43, PBS-116)
 # env: SEED (default 1), MODE (position|gtid, default position),
 #      STOP (simulated seconds, default by scenario), WALL (default 1500),
 #      PBS (binary), LOSS / LATENCY (any scenario), KILL_AT (crash),
+#      PBS_KILL_US (pbskill), REPLICA_AT (replica scenarios), PBS_TERM_AT
+#      (stop),
 #      SHADOW (the patched shadow binary, see README.md), EXP_DIR (where
 #      each run gets its directory <name>), MYSQL_BASEDIR
 # exit: 0 when Shadow ran, every process ended as expected, PBS's storage
@@ -42,7 +63,22 @@ SEED=${SEED:-1}
 LOSS=${LOSS:-0}
 LATENCY=${LATENCY:-1 ms}
 KILL_AT=${KILL_AT:-40}
+PBS_TERM_AT=${PBS_TERM_AT:-100}
+REPLICA=""
 case $SCENARIO in
+  replica|replica_early|heartbeat) REPLICA=$SCENARIO ;;
+esac
+DB_START=1 WORKLOAD_START=15
+case $SCENARIO in
+  # the source starts late, so pull (started at 10 s) has nothing, not even a
+  # binlog file, when the replica connects
+  replica_early) REPLICA_AT=${REPLICA_AT:-12}; DB_START=14; WORKLOAD_START=20 ;;
+  *) REPLICA_AT=${REPLICA_AT:-20} ;;
+esac
+case $SCENARIO in
+  pbskill) STOP=${STOP:-180} ;;
+  replica|replica_early|heartbeat) STOP=${STOP:-190} ;;
+  stop) STOP=${STOP:-$((PBS_TERM_AT + 70))} ;;
   # past the read timeout (60 s) after the last transaction: in GTID mode
   # the closing ROTATE does not make PBS write it (ticket 94), the reconnect
   # does
@@ -52,8 +88,12 @@ case $SCENARIO in
   idle) STOP=${STOP:-3700} ;;
   crash) STOP=${STOP:-$((KILL_AT + 60))} ;;
   lossy) STOP=${STOP:-180}; [ "$LOSS" = 0 ] && LOSS=0.02; [ "$LATENCY" = "1 ms" ] && LATENCY="20 ms" ;;
+  pbskill|replica|replica_early|heartbeat|stop) ;;
   *) echo "unknown scenario $SCENARIO"; exit 2 ;;
 esac
+if [ "$SCENARIO" = pbskill ] && [ -z "${PBS_KILL_US:-}" ]; then
+  echo "pbskill needs PBS_KILL_US"; exit 2
+fi
 E=$EXP/$NAME
 rm -rf "$E"; mkdir -p "$E/storage" "$E/local_settings" "$E/telemetry"
 cat > "$E/init.sql" <<'SQL'
@@ -70,9 +110,12 @@ if [ ! -d "$T" ]; then
 fi
 cp -a "$T" "$E/data"
 
-# PBS configuration
+# PBS configuration; the listener does caching_sha2_password full
+# authentication, which without TLS needs its RSA key (the replica asks for
+# it with GET_SOURCE_PUBLIC_KEY)
+RSA_KEY=${RSA_KEY:-$(cd "$HERE/../../.." && pwd)/mtr/binlog_streaming/std_data/caching_sha2_rsa_priv.pem}
 if [ "$MODE" = gtid ]; then
-  REWRITE='"rewrite": {"base_file_name": "binlog", "file_size": "64K"},'
+  REWRITE='"rewrite": {"base_file_name": "binlog", "file_size": "8K"},'
 else
   REWRITE=''
 fi
@@ -85,11 +128,12 @@ cat > "$E/binsrv.json" <<JSON
   "replication": {"server_id": 4242, "idle_time": 1, "verify_checksum": true,
                   $REWRITE
                   "mode": "$MODE"},
-  "replication_source": {"port": 65535, "server_id": 142,
+  "replication_source": {"port": 3307, "server_id": 142,
                  "server_uuid": "00000000-0000-0000-0000-00000000008e",
                  "read_timeout": 60, "write_timeout": 60,
                  "require_secure_transport": false,
-                 "authentication": {"user": "unused", "password": "unused",
+                 "auth_rsa_private_key": "$RSA_KEY",
+                 "authentication": {"user": "repl", "password": "replpass",
                                     "plugin": "caching_sha2_password"}},
   "storage": {"backend": "file", "uri": "file://$E/storage", "checkpoint_interval": "1s"},
   "telemetry": {"path": "$E/telemetry"}
@@ -101,7 +145,7 @@ M="$B/bin/mysql --no-defaults --host=db --port=3306 --user=rpl --ssl-mode=DISABL
 # the event after the last transaction makes PBS write it (ticket 94)
 FINAL_FLUSH="\$M -e 'FLUSH BINARY LOGS'"
 case $SCENARIO in
-  basic|restart|lossy) ROUNDS=30 ;;
+  basic|restart|lossy|pbskill|replica|replica_early|heartbeat|stop) ROUNDS=30 ;;
   quiet) ROUNDS=30; FINAL_FLUSH="" ;;
   idle) ROUNDS=5 ;;
   # ends with a rotation and then writes nothing until the source is killed
@@ -139,7 +183,47 @@ echo "workload2 done"
 \$M -e "SELECT COUNT(*) FROM w.t; SHOW BINARY LOGS"
 SH
 chmod +x "$E/workload2.sh"
+# the replica: configured at REPLICA_AT, checked from CHECK_AT on
+RM="$B/bin/mysql --no-defaults --host=replica --port=3306 --user=rpl --ssl-mode=DISABLED"
+if [ "$MODE" = gtid ]; then
+  START_OPTIONS="SOURCE_AUTO_POSITION=1"
+else
+  START_OPTIONS="SOURCE_LOG_FILE='binlog.000001', SOURCE_LOG_POS=4"
+fi
+# after pull's reconnect at the read timeout (60 s after the last event): in
+# GTID mode only that writes the last transaction (ticket 94)
+CHECK_AT=${CHECK_AT:-150}
+cat > "$E/replica_setup.sh" <<SH
+#!/bin/bash
+RM="$RM"
+# the replica's mysqld may still be starting
+until \$RM -e "SELECT 1" >/dev/null 2>&1; do sleep 0.2; done
+\$RM -e "SET GLOBAL replica_net_timeout = 10;
+  CHANGE REPLICATION SOURCE TO SOURCE_HOST='pbs', SOURCE_PORT=3307,
+    SOURCE_USER='repl', SOURCE_PASSWORD='replpass', GET_SOURCE_PUBLIC_KEY=1,
+    SOURCE_SSL=0, SOURCE_CONNECT_RETRY=1, SOURCE_RETRY_COUNT=1000,
+    SOURCE_HEARTBEAT_PERIOD=1, $START_OPTIONS;
+  START REPLICA;"
+echo "replica started"
+SH
+cat > "$E/replica_check.sh" <<SH
+#!/bin/bash
+RM="$RM"
+M="$M"
+out=$E/replica_check.txt
+hb() { \$RM -N -e "SELECT COUNT_RECEIVED_HEARTBEATS FROM performance_schema.replication_connection_status"; }
+h1=\$(hb); sleep 20; h2=\$(hb)
+echo "heartbeats \$h1 \$h2" > \$out
+echo "source_rows \$(\$M -N -e 'SELECT COUNT(*) FROM w.t')" >> \$out
+echo "replica_rows \$(\$RM -N -e 'SELECT COUNT(*) FROM w.t' 2>/dev/null || echo none)" >> \$out
+\$RM -e "SHOW REPLICA STATUS\\G" | grep -E " (Replica_IO_Running|Replica_SQL_Running|Last_IO_Errno|Last_IO_Error|Last_SQL_Errno|Last_SQL_Error):" | sed 's/^ *//' >> \$out
+SH
+chmod +x "$E/replica_setup.sh" "$E/replica_check.sh"
 
+# a position-mode PBS of a GTID source cannot serve a MySQL replica (ticket
+# 30, PBS-102), so the replica scenarios in position mode run without GTIDs
+SOURCE_GTID=ON
+[ -n "$REPLICA" ] && [ "$MODE" = position ] && SOURCE_GTID=OFF
 MYSQLD_ARGS=$(cat <<ARGS
       - "--no-defaults"
       - "--basedir=$B"
@@ -153,8 +237,8 @@ MYSQLD_ARGS=$(cat <<ARGS
       - "--server-id=1"
       - "--log-bin=binlog"
       - "--binlog-format=ROW"
-      - "--gtid-mode=ON"
-      - "--enforce-gtid-consistency=ON"
+      - "--gtid-mode=$SOURCE_GTID"
+      - "--enforce-gtid-consistency=$SOURCE_GTID"
       - "--max-binlog-size=64K"
 ARGS
 )
@@ -210,11 +294,72 @@ else
     - path: $B/bin/mysqld
       args:
 $MYSQLD_ARGS
-      start_time: 1s
+      start_time: ${DB_START}s
       expected_final_state: running
 YAML
 )
   SHUTDOWN_PROCESS=""
+fi
+
+PBS_PROCESS="    - path: $PBS
+      args: [\"pull\", \"$E/binsrv.json\"]
+      environment: { AWS_EC2_METADATA_DISABLED: \"true\" }"
+if [ "$SCENARIO" = pbskill ]; then
+  PBS_PROCESSES="$PBS_PROCESS
+      start_time: 10s
+      shutdown_time: $PBS_KILL_US us
+      shutdown_signal: SIGKILL
+      expected_final_state: {signaled: SIGKILL}
+$PBS_PROCESS
+      start_time: $((PBS_KILL_US + 1000000)) us
+      expected_final_state: running
+    - path: /bin/bash
+      args: [\"$E/kill_snapshot.sh\"]
+      start_time: $((PBS_KILL_US + 500000)) us
+      expected_final_state: {exited: 0}"
+  # what the killed pull left in the storage, before the restart repairs it
+  cat > "$E/kill_snapshot.sh" <<SH
+#!/bin/bash
+cd "$E/storage" || exit 0
+for f in \$(ls | sort); do echo "\$f \$(stat -c %s "\$f")"; done > "$E/kill_snapshot.txt"
+echo "index: \$(tr '\\n' ' ' < binlog.index 2>/dev/null)" >> "$E/kill_snapshot.txt"
+SH
+elif [ "$SCENARIO" = stop ]; then
+  PBS_PROCESSES="$PBS_PROCESS
+      start_time: 10s
+      shutdown_time: ${PBS_TERM_AT}s
+      shutdown_signal: SIGTERM
+      expected_final_state: {exited: 0}"
+else
+  PBS_PROCESSES="$PBS_PROCESS
+      start_time: 10s
+      expected_final_state: running"
+fi
+REPLICA_HOST=""
+REPLICA_CLIENTS=""
+if [ -n "$REPLICA" ]; then
+  cp -a "$T" "$E/rdata"
+  rm -f "$E/rdata/auto.cnf"   # a server UUID of its own
+  REPLICA_HOST="  replica:
+    network_node_id: 0
+    processes:
+    - path: $B/bin/mysqld
+      args: [\"--no-defaults\", \"--basedir=$B\", \"--datadir=$E/rdata\",
+             \"--port=3306\", \"--bind-address=0.0.0.0\", \"--socket=\",
+             \"--mysqlx=OFF\", \"--log-error=$E/replica.err\",
+             \"--innodb-use-native-aio=OFF\", \"--server-id=2\",
+             \"--skip-log-bin\", \"--gtid-mode=$SOURCE_GTID\",
+             \"--enforce-gtid-consistency=$SOURCE_GTID\", \"--skip-replica-start\"]
+      start_time: 1s
+      expected_final_state: running"
+  REPLICA_CLIENTS="    - path: /bin/bash
+      args: [\"$E/replica_setup.sh\"]
+      start_time: ${REPLICA_AT}s
+      expected_final_state: {exited: 0}
+    - path: /bin/bash
+      args: [\"$E/replica_check.sh\"]
+      start_time: ${CHECK_AT}s
+      expected_final_state: {exited: 0}"
 fi
 
 cat > "$E/shadow.yaml" <<YAML
@@ -268,19 +413,17 @@ $DB_PROCESSES
   pbs:
     network_node_id: 0
     processes:
-    - path: $PBS
-      args: ["pull", "$E/binsrv.json"]
-      environment: { AWS_EC2_METADATA_DISABLED: "true" }
-      start_time: 10s
-      expected_final_state: running
+$PBS_PROCESSES
+$REPLICA_HOST
   client:
     network_node_id: 0
     processes:
     - path: /bin/bash
       args: ["$E/workload.sh"]
-      start_time: 15s
+      start_time: ${WORKLOAD_START}s
       expected_final_state: {exited: 0}
 $SHUTDOWN_PROCESS
+$REPLICA_CLIENTS
 YAML
 
 cd "$E"
@@ -331,7 +474,42 @@ verdict=PASS
 [ "$code" = 0 ] || verdict=FAIL
 [ "$bad" = 0 ] || verdict=FAIL
 [ "$ts_code" = 0 ] || verdict=FAIL
-echo "-- verdict: $verdict (shadow exit $code, storage mismatches $bad, timestamp check $ts_code)"
+extra=""
+if [ -n "$REPLICA" ]; then
+  echo "-- replica:"
+  sed 's/^/  /' "$E/replica_check.txt" 2>/dev/null || echo "  no replica_check.txt"
+  r() { awk -v k="$1" '$1 == k {print $2}' "$E/replica_check.txt" 2>/dev/null; }
+  status() { grep -E "^$1:" "$E/replica_check.txt" 2>/dev/null | sed -E "s/^$1: ?//"; }
+  if [ "$REPLICA" = heartbeat ]; then
+    # 20 s at a heartbeat period of 1 s; the count restarts at a reconnect
+    read -r h1 h2 < <(awk '$1 == "heartbeats" {print $2, $3}' "$E/replica_check.txt" 2>/dev/null)
+    hb=$(( ${h2:-0} - ${h1:-0} ))
+    replica_ok=$([ "$hb" -ge 10 ] && echo ok || echo FAIL)
+    extra=", heartbeats in 20 quiet seconds $hb: $replica_ok"
+  else
+    replica_ok=ok
+    [ -n "$(r source_rows)" ] && [ "$(r source_rows)" = "$(r replica_rows)" ] || replica_ok=FAIL
+    [ "$(status Replica_IO_Running)" = Yes ] && [ "$(status Replica_SQL_Running)" = Yes ] || replica_ok=FAIL
+    [ "$(status Last_IO_Errno)" = 0 ] && [ "$(status Last_SQL_Errno)" = 0 ] || replica_ok=FAIL
+    extra=", replica rows $(r replica_rows) of $(r source_rows): $replica_ok"
+  fi
+  [ "$replica_ok" = ok ] || verdict=FAIL
+fi
+if [ "$SCENARIO" = pbskill ]; then
+  echo "-- storage left by the kill at $PBS_KILL_US us:"
+  sed 's/^/  /' "$E/kill_snapshot.txt" 2>/dev/null
+  echo "-- kill snapshot hash: $(sha256sum < "$E/kill_snapshot.txt" 2>/dev/null | cut -c1-16)"
+fi
+if [ "$SCENARIO" = stop ]; then
+  # the last line pull logs, against the SIGTERM at PBS_TERM_AT
+  last=$(tail -1 "$E/binsrv.log" | sed -E 's/^\[2000-01-01T([0-9:.]+)\].*/\1/')
+  delay=$(awk -v t="$last" -v s="$PBS_TERM_AT" 'BEGIN {split(t, a, ":"); printf "%.3f", a[1] * 3600 + a[2] * 60 + a[3] - s}')
+  echo "-- stop: SIGTERM at ${PBS_TERM_AT} s, last log line at $last: $(tail -1 "$E/binsrv.log" | cut -c30-150)"
+  stop_ok=$(awk -v d="$delay" 'BEGIN {print (d >= 0 && d <= 5) ? "ok" : "FAIL"}')
+  extra=", stop delay ${delay} s: $stop_ok"
+  [ "$stop_ok" = ok ] || verdict=FAIL
+fi
+echo "-- verdict: $verdict (shadow exit $code, storage mismatches $bad, timestamp check $ts_code$extra)"
 # what must repeat with the same seed: native preemption makes simulated
 # times jitter by microseconds between runs (README.md), so the bytes and
 # log times may differ, but not the binlogs, their sizes, the transactions
@@ -339,9 +517,9 @@ echo "-- verdict: $verdict (shadow exit $code, storage mismatches $bad, timestam
 outcome=$( (cd "$E/storage" 2>/dev/null && for f in $(ls | grep -E '^binlog\.[0-9]+$'); do echo "$f $(stat -c %s "$f")"; done)
   echo "transactions $(grep -c end_of_transaction "$E/binsrv.log" 2>/dev/null)"
   grep -E "expected end state" "$E/shadow.log" | sed -E 's/.*Error: //' | sort -u
-  echo "$verdict $code $bad $ts_code")
+  echo "$verdict $code $bad $ts_code$extra")
 echo "-- outcome hash: $(echo "$outcome" | sha256sum | cut -c1-16)"
-echo "-- storage hash:$(cd "$E/storage" && cat $(ls | grep -E '^binlog\.[0-9]+$') 2>/dev/null | sha256sum | cut -c1-16)"
+echo "-- storage hash: $(cd "$E/storage" && cat $(ls | grep -E '^binlog\.[0-9]+$') 2>/dev/null | sha256sum | cut -c1-16)"
 echo "-- PBS log hash, paths removed (determinism check): $(sed "s|$E||g" "$E/binsrv.log" | sha256sum | cut -c1-16)"
 echo "-- mysqld error log hash, paths removed: $(sed "s|$E||g" "$E/db.err" | sha256sum | cut -c1-16)"
 [ "$verdict" = PASS ]

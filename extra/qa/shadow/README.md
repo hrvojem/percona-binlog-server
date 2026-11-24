@@ -32,10 +32,21 @@ What it gives over the harnesses on real hosts:
   Without the last three, SQL `SHUTDOWN` leaves `mysqld` waiting forever.
 * `shadow_pbs.sh <name> <scenario>`: one simulation; prints a report and a
   verdict, exits 0 on PASS. Scenarios: `basic`, `restart`, `crash`, `lossy`,
-  `idle`, `quiet` (see the script's header). Environment: `SEED`, `MODE`
+  `idle`, `quiet`, `pbskill`, `replica`, `replica_early`, `heartbeat`,
+  `stop` (see the script's header). Environment: `SEED`, `MODE`
   (`position` / `gtid`), `PBS`, `SHADOW`, `EXP_DIR`, `MYSQL_BASEDIR`,
-  `KILL_AT`, `LOSS`, `LATENCY`, `STOP`, `WALL`, `STRACE=standard` (Shadow's
-  syscall log per process).
+  `KILL_AT`, `PBS_KILL_US`, `REPLICA_AT`, `PBS_TERM_AT`, `LOSS`, `LATENCY`,
+  `STOP`, `WALL`, `RSA_KEY` (the listener's key, default from
+  `mtr/binlog_streaming/std_data`), `STRACE=standard` (Shadow's syscall log
+  per process: it shows each file operation of a rotation with its
+  simulated time, which is how the kill points were placed).
+* A replica is a fourth host running a second `mysqld` (its own server
+  UUID); bash clients configure it (`CHANGE REPLICATION SOURCE TO` the
+  `pbs` host, `GET_SOURCE_PUBLIC_KEY=1`) and query it at 150 s.
+* Shadow kills a process at a syscall boundary, and `pull` makes one about
+  every 1–2 us of simulated time, so `PBS_KILL_US` places a kill between
+  two file operations; `pbskill` records what the killed process left in
+  the storage (`kill_snapshot.txt`) before the restart.
 * `check_binlog_timestamps.py`: the timestamp range PBS records for each
   binlog must lie within the binlog's own events (ticket 6); with
   `--gtids`, the GTIDs of the storage must be the source's, in order (GTID

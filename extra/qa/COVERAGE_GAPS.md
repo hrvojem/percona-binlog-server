@@ -2,6 +2,17 @@
 
 ## 2026-11-23: follow-up tests for the 2026-11-18 gaps
 
+Measured again on 2026-11-23 at `89cee1e` (upstream PBS-150 merged; the
+property tests with their S3 variants; the QA stage with 34 rotation
+harnesses, `clock_test.py` left out): 92.3 % of lines (11,564 of 12,524),
+92.9 % of functions, 82.6 % of branches, against 91.6 / 92.4 / 81.6 on
+2026-11-18. `version_operation.cpp` and `app.cpp` reached 100 %,
+`easymysql/connection.cpp` 86.2 %. `minimysql/connection_context.hpp` rose
+from 83 % to 98 % only because `listener_command_fuzz_test`, whose
+statements depend on the day of the year, drew the demo query (ticket 97)
+this time. Output on the QA host: `~/ws/merge-logs/cov3.txt`,
+`cov3-summary.json`, `cov3-html/`.
+
 - `binlog_streaming.command_line` (MTR) runs `binlog_server version` and
   the refused command lines (no operation, an unknown one, the wrong number
   of arguments, `delimiter`, an upper-case name): `version_operation.cpp`

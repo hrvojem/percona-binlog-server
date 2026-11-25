@@ -33,7 +33,13 @@ What it gives over the harnesses on real hosts:
 * `shadow_pbs.sh <name> <scenario>`: one simulation; prints a report and a
   verdict, exits 0 on PASS. Scenarios: `basic`, `restart`, `crash`, `lossy`,
   `idle`, `quiet`, `pbskill`, `replica`, `replica_early`, `heartbeat`,
-  `stop` (see the script's header). Environment: `SEED`, `MODE`
+  `stop`, `slow`, `cron` (see the script's header), and switches for any
+  scenario: `WITH_REPLICA=1`, `REPLICAS=N`, `REPLICA_KILL_AT`,
+  `REPLICA_LOSS` / `REPLICA_LATENCY`, `ENCRYPT=1` (an encrypted storage,
+  checked through a replica), `KILL_BASE=restart`, `BANDWIDTH` (the
+  source's link), `CRON_HOURS`, `KEEP_DATA=1` (keep the MySQL data
+  directories, which each run otherwise deletes at the end: they were
+  about 200 MB a run). Environment: `SEED`, `MODE`
   (`position` / `gtid`), `PBS`, `SHADOW`, `EXP_DIR`, `MYSQL_BASEDIR`,
   `KILL_AT`, `PBS_KILL_US`, `REPLICA_AT`, `PBS_TERM_AT`, `LOSS`, `LATENCY`,
   `STOP`, `WALL`, `RSA_KEY` (the listener's key, default from
@@ -50,7 +56,18 @@ What it gives over the harnesses on real hosts:
 * `check_binlog_timestamps.py`: the timestamp range PBS records for each
   binlog must lie within the binlog's own events (ticket 6); with
   `--gtids`, the GTIDs of the storage must be the source's, in order (GTID
-  mode is rewrite mode, whose binlogs are PBS's own files).
+  mode is rewrite mode, whose binlogs are PBS's own files); with
+  `--rewritten <copy> <storage> --encrypted`, the bytes a killed `pull`
+  left past each recorded size must not be written again differently
+  under the same encryption record (ticket 32, AES-CTR keystream reuse).
+* The Shadow changes are also on the fork `hrvojem/shadow`: branch
+  `mysql-support-v3.3.0` (this patch on v3.3.0, one commit) and branch
+  `mysql-support` (the same changes on shadow's main as five commits,
+  built and checked with MySQL 8.4 on 2026-11-24).
+* Simulated hosts share the real file system: every run has its own
+  directory, the replicas a fixed server UUID and their own `tmpdir` (a
+  UUID generated inside the simulation is the same in every run, and
+  concurrent replicas collided on `/tmp/SQL_LOAD-<uuid>`).
 
 ## How `mysqld` runs under Shadow
 

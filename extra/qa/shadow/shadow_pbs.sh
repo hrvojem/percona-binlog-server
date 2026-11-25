@@ -40,6 +40,25 @@
 #             stop            - basic, with SIGTERM to pull at PBS_TERM_AT
 #                               (default 100 s) while the source is idle: it
 #                               must exit 0 within 5 s (ticket 43, PBS-116)
+#             slow            - 3 rounds and one 20 MB transaction over a
+#                               link of BANDWIDTH (default 2 Mbit) to the
+#                               source
+#             cron            - 'fetch' every 5 minutes instead of 'pull',
+#                               for CRON_HOURS (default 3) of inserts every 5
+#                               minutes, the source restarted every hour: a
+#                               fetch may fail only while the source is down
+# switches for any scenario:
+#   WITH_REPLICA=1  a replica of pull (as in 'replica'), judged by its rows
+#   REPLICAS=N      N replicas (hosts replica, replica2, ...)
+#   REPLICA_KILL_AT=<s>  the first replica killed (SIGKILL) then and started
+#                   again 5 s later (it resumes with relay_log_recovery)
+#   REPLICA_LOSS / REPLICA_LATENCY  the link between pull and the replicas
+#   ENCRYPT=1       an encrypted storage (AES-256-CTR); it cannot be compared
+#                   with the source, so a replica checks the data instead;
+#                   with pbskill the bytes the kill left unrecorded are
+#                   compared with what is written there after the restart
+#                   (ticket 32, PBS-104)
+#   KILL_BASE=restart  pbskill on the restart scenario's source
 # env: SEED (default 1), MODE (position|gtid, default position),
 #      STOP (simulated seconds, default by scenario), WALL (default 1500),
 #      PBS (binary), LOSS / LATENCY (any scenario), KILL_AT (crash),
@@ -64,10 +83,26 @@ LOSS=${LOSS:-0}
 LATENCY=${LATENCY:-1 ms}
 KILL_AT=${KILL_AT:-40}
 PBS_TERM_AT=${PBS_TERM_AT:-100}
+REPLICAS=${REPLICAS:-1}
+REPLICA_LOSS=${REPLICA_LOSS:-0}
+REPLICA_LATENCY=${REPLICA_LATENCY:-1 ms}
+REPLICA_KILL_AT=${REPLICA_KILL_AT:-}
+ENCRYPT=${ENCRYPT:-}
+KILL_BASE=${KILL_BASE:-basic}
+CRON_HOURS=${CRON_HOURS:-3}
+BANDWIDTH=${BANDWIDTH:-1 Gbit}
 REPLICA=""
 case $SCENARIO in
   replica|replica_early|heartbeat) REPLICA=$SCENARIO ;;
 esac
+# an encrypted storage is checked through a replica
+[ -z "$REPLICA" ] && [ -n "${WITH_REPLICA:-}$ENCRYPT" ] && REPLICA=replica
+if [ "$SCENARIO" = slow ]; then
+  [ "$BANDWIDTH" = "1 Gbit" ] && BANDWIDTH="2 Mbit"
+  # the binlog stream fills the link for minutes: the workload's own logins
+  # need longer than the default 10 s to finish
+  MYSQLD_EXTRA="${MYSQLD_EXTRA:-} --connect-timeout=300"
+fi
 DB_START=1 WORKLOAD_START=15
 case $SCENARIO in
   # the source starts late, so pull (started at 10 s) has nothing, not even a
@@ -76,7 +111,9 @@ case $SCENARIO in
   *) REPLICA_AT=${REPLICA_AT:-20} ;;
 esac
 case $SCENARIO in
-  pbskill) STOP=${STOP:-180} ;;
+  pbskill) STOP=${STOP:-190} ;;
+  slow) STOP=${STOP:-420} ;;
+  cron) STOP=${STOP:-$((CRON_HOURS * 3600 + 600))} ;;
   replica|replica_early|heartbeat) STOP=${STOP:-190} ;;
   stop) STOP=${STOP:-$((PBS_TERM_AT + 70))} ;;
   # past the read timeout (60 s) after the last transaction: in GTID mode
@@ -88,14 +125,14 @@ case $SCENARIO in
   idle) STOP=${STOP:-3700} ;;
   crash) STOP=${STOP:-$((KILL_AT + 60))} ;;
   lossy) STOP=${STOP:-180}; [ "$LOSS" = 0 ] && LOSS=0.02; [ "$LATENCY" = "1 ms" ] && LATENCY="20 ms" ;;
-  pbskill|replica|replica_early|heartbeat|stop) ;;
+  pbskill|replica|replica_early|heartbeat|stop|slow|cron) ;;
   *) echo "unknown scenario $SCENARIO"; exit 2 ;;
 esac
 if [ "$SCENARIO" = pbskill ] && [ -z "${PBS_KILL_US:-}" ]; then
   echo "pbskill needs PBS_KILL_US"; exit 2
 fi
 E=$EXP/$NAME
-rm -rf "$E"; mkdir -p "$E/storage" "$E/local_settings" "$E/telemetry"
+rm -rf "$E"; mkdir -p "$E/storage" "$E/local_settings" "$E/telemetry" "$E/tmp"
 cat > "$E/init.sql" <<'SQL'
 CREATE USER 'rpl'@'%' IDENTIFIED BY '';
 GRANT ALL ON *.* TO 'rpl'@'%';
@@ -103,11 +140,19 @@ SQL
 # The data directory is initialized once, natively, and copied for every run,
 # so the server UUID (and with it the GTIDs) is the same in every run.
 T=$EXP/template-$(basename "$B")
+# runs side by side share the template: one makes it, under a lock, and
+# renames it into place when it is complete
+exec 8> "$EXP/.template.lock"
+flock 8
 if [ ! -d "$T" ]; then
-  "$B/bin/mysqld" --no-defaults --basedir="$B" --datadir="$T" \
+  rm -rf "$T.tmp"
+  "$B/bin/mysqld" --no-defaults --basedir="$B" --datadir="$T.tmp" \
     --initialize-insecure --init-file="$E/init.sql" \
-    --log-error="$E/init.err" || { echo "init failed"; tail -5 "$E/init.err"; rm -rf "$T"; exit 1; }
+    --log-error="$E/init.err" || { echo "init failed"; tail -5 "$E/init.err"; rm -rf "$T.tmp"; exit 1; }
+  mv "$T.tmp" "$T"
 fi
+flock -u 8
+exec 8>&-
 cp -a "$T" "$E/data"
 
 # PBS configuration; the listener does caching_sha2_password full
@@ -118,6 +163,16 @@ if [ "$MODE" = gtid ]; then
   REWRITE='"rewrite": {"base_file_name": "binlog", "file_size": "8K"},'
 else
   REWRITE=''
+fi
+KEYRING_JSON="" ENCRYPTION_JSON=""
+if [ -n "$ENCRYPT" ]; then
+  # a fixed key: the runs stay comparable
+  cat > "$E/keyring.json" <<KEYS
+{"version": 1, "keys": [{"id": "shadow", "cipher": "AES-256-CTR",
+  "data_hex": "6B1F8A3C5D2E4F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8"}]}
+KEYS
+  KEYRING_JSON="\"keyring\": {\"uri\": \"file://$E/keyring.json\"},"
+  ENCRYPTION_JSON=", \"encryption\": {\"format\": \"generic\", \"kek_id\": \"shadow\", \"cipher\": \"AES-256-CTR\"}"
 fi
 cat > "$E/binsrv.json" <<JSON
 {
@@ -135,7 +190,8 @@ cat > "$E/binsrv.json" <<JSON
                  "auth_rsa_private_key": "$RSA_KEY",
                  "authentication": {"user": "repl", "password": "replpass",
                                     "plugin": "caching_sha2_password"}},
-  "storage": {"backend": "file", "uri": "file://$E/storage", "checkpoint_interval": "1s"},
+  $KEYRING_JSON
+  "storage": {"backend": "file", "uri": "file://$E/storage", "checkpoint_interval": "1s"$ENCRYPTION_JSON},
   "telemetry": {"path": "$E/telemetry"}
 }
 JSON
@@ -144,7 +200,12 @@ JSON
 M="$B/bin/mysql --no-defaults --host=db --port=3306 --user=rpl --ssl-mode=DISABLED"
 # the event after the last transaction makes PBS write it (ticket 94)
 FINAL_FLUSH="\$M -e 'FLUSH BINARY LOGS'"
+SLEEP=2 BIG=""
 case $SCENARIO in
+  # 20 rows of 1 MiB in one transaction, generated by the server, so only
+  # the binlog stream crosses the slow link
+  slow) ROUNDS=3; BIG='$M -e "CREATE TABLE w.big (id INT AUTO_INCREMENT PRIMARY KEY, v LONGBLOB); INSERT INTO w.big (v) WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 20) SELECT REPEAT(CHAR(120), 1048576) FROM s"' ;;
+  cron) ROUNDS=$((CRON_HOURS * 12)); SLEEP=300 ;;
   basic|restart|lossy|pbskill|replica|replica_early|heartbeat|stop) ROUNDS=30 ;;
   quiet) ROUNDS=30; FINAL_FLUSH="" ;;
   idle) ROUNDS=5 ;;
@@ -162,8 +223,9 @@ while [ \$i -lt $ROUNDS ]; do
   # retry while the source is down (restart scenario)
   until \$M -e "INSERT INTO w.t (v) VALUES (REPEAT('a', 150)), (REPEAT('b', 150)), (REPEAT('c', 150))"; do sleep 1; done
   if [ \$((i % 7)) -eq 0 ]; then \$M -e "FLUSH BINARY LOGS" || true; fi
-  sleep 2
+  sleep $SLEEP
 done
+$BIG
 $FINAL_FLUSH
 echo "workload done: \$i rounds"
 \$M -e "SELECT COUNT(*) FROM w.t; SHOW BINARY LOGS"
@@ -183,8 +245,11 @@ echo "workload2 done"
 \$M -e "SELECT COUNT(*) FROM w.t; SHOW BINARY LOGS"
 SH
 chmod +x "$E/workload2.sh"
-# the replica: configured at REPLICA_AT, checked from CHECK_AT on
-RM="$B/bin/mysql --no-defaults --host=replica --port=3306 --user=rpl --ssl-mode=DISABLED"
+# the replicas: configured at REPLICA_AT, checked from CHECK_AT on
+RHOSTS="replica"
+for i in $(seq 2 "$REPLICAS"); do RHOSTS="$RHOSTS replica$i"; done
+RMC="$B/bin/mysql --no-defaults --port=3306 --user=rpl --ssl-mode=DISABLED"
+RM="$RMC --host=replica"
 if [ "$MODE" = gtid ]; then
   START_OPTIONS="SOURCE_AUTO_POSITION=1"
 else
@@ -195,16 +260,18 @@ fi
 CHECK_AT=${CHECK_AT:-150}
 cat > "$E/replica_setup.sh" <<SH
 #!/bin/bash
-RM="$RM"
-# the replica's mysqld may still be starting
-until \$RM -e "SELECT 1" >/dev/null 2>&1; do sleep 0.2; done
-\$RM -e "SET GLOBAL replica_net_timeout = 10;
-  CHANGE REPLICATION SOURCE TO SOURCE_HOST='pbs', SOURCE_PORT=3307,
-    SOURCE_USER='repl', SOURCE_PASSWORD='replpass', GET_SOURCE_PUBLIC_KEY=1,
-    SOURCE_SSL=0, SOURCE_CONNECT_RETRY=1, SOURCE_RETRY_COUNT=1000,
-    SOURCE_HEARTBEAT_PERIOD=1, $START_OPTIONS;
-  START REPLICA;"
-echo "replica started"
+for h in $RHOSTS; do
+  RM="$RMC --host=\$h"
+  # the replica's mysqld may still be starting
+  until \$RM -e "SELECT 1" >/dev/null 2>&1; do sleep 0.2; done
+  \$RM -e "SET PERSIST replica_net_timeout = 10;
+    CHANGE REPLICATION SOURCE TO SOURCE_HOST='pbs', SOURCE_PORT=3307,
+      SOURCE_USER='repl', SOURCE_PASSWORD='replpass', GET_SOURCE_PUBLIC_KEY=1,
+      SOURCE_SSL=0, SOURCE_CONNECT_RETRY=1, SOURCE_RETRY_COUNT=1000,
+      SOURCE_HEARTBEAT_PERIOD=1, $START_OPTIONS;
+    START REPLICA;"
+  echo "replica \$h started"
+done
 SH
 cat > "$E/replica_check.sh" <<SH
 #!/bin/bash
@@ -215,8 +282,11 @@ hb() { \$RM -N -e "SELECT COUNT_RECEIVED_HEARTBEATS FROM performance_schema.repl
 h1=\$(hb); sleep 20; h2=\$(hb)
 echo "heartbeats \$h1 \$h2" > \$out
 echo "source_rows \$(\$M -N -e 'SELECT COUNT(*) FROM w.t')" >> \$out
-echo "replica_rows \$(\$RM -N -e 'SELECT COUNT(*) FROM w.t' 2>/dev/null || echo none)" >> \$out
-\$RM -e "SHOW REPLICA STATUS\\G" | grep -E " (Replica_IO_Running|Replica_SQL_Running|Last_IO_Errno|Last_IO_Error|Last_SQL_Errno|Last_SQL_Error):" | sed 's/^ *//' >> \$out
+for h in $RHOSTS; do
+  RM="$RMC --host=\$h"
+  echo "replica_rows \$h \$(\$RM -N -e 'SELECT COUNT(*) FROM w.t' 2>/dev/null || echo none)" >> \$out
+  \$RM -e "SHOW REPLICA STATUS\\G" | grep -E " (Replica_IO_Running|Replica_SQL_Running|Last_IO_Errno|Last_IO_Error|Last_SQL_Errno|Last_SQL_Error):" | sed "s/^ */\$h /" >> \$out
+done
 SH
 chmod +x "$E/replica_setup.sh" "$E/replica_check.sh"
 
@@ -233,6 +303,7 @@ MYSQLD_ARGS=$(cat <<ARGS
       - "--socket="
       - "--mysqlx=OFF"
       - "--log-error=$E/db.err"
+      - "--tmpdir=$E/tmp"
       - "--innodb-use-native-aio=OFF"
       - "--server-id=1"
       - "--log-bin=binlog"
@@ -243,7 +314,7 @@ MYSQLD_ARGS=$(cat <<ARGS
 ARGS
 )
 for a in ${MYSQLD_EXTRA:-}; do MYSQLD_ARGS+=$'\n'"      - \"$a\""; done
-if [ "$SCENARIO" = restart ]; then
+if [ "$SCENARIO" = restart ] || { [ "$SCENARIO" = pbskill ] && [ "$KILL_BASE" = restart ]; }; then
   DB_PROCESSES=$(cat <<YAML
     - path: $B/bin/mysqld
       args:
@@ -289,6 +360,29 @@ YAML
       expected_final_state: {exited: 0}
 YAML
 )
+elif [ "$SCENARIO" = cron ]; then
+  # a clean restart at every full hour
+  DB_PROCESSES="" SHUTDOWN_PROCESS=""
+  start=1
+  for h in $(seq 1 $((CRON_HOURS - 1))); do
+    DB_PROCESSES+="    - path: $B/bin/mysqld
+      args:
+$MYSQLD_ARGS
+      start_time: ${start}s
+      expected_final_state: {exited: 0}
+"
+    SHUTDOWN_PROCESS+="    - path: $B/bin/mysql
+      args: [\"--no-defaults\", \"--host=db\", \"--port=3306\", \"--user=rpl\", \"--ssl-mode=DISABLED\", \"-e\", \"SHUTDOWN\"]
+      start_time: $((h * 3600))s
+      expected_final_state: {exited: 0}
+"
+    start=$((h * 3600 + 15))
+  done
+  DB_PROCESSES+="    - path: $B/bin/mysqld
+      args:
+$MYSQLD_ARGS
+      start_time: ${start}s
+      expected_final_state: running"
 else
   DB_PROCESSES=$(cat <<YAML
     - path: $B/bin/mysqld
@@ -321,9 +415,29 @@ $PBS_PROCESS
   cat > "$E/kill_snapshot.sh" <<SH
 #!/bin/bash
 cd "$E/storage" || exit 0
+cp -a "$E/storage" "$E/kill_copy"
 for f in \$(ls | sort); do echo "\$f \$(stat -c %s "\$f")"; done > "$E/kill_snapshot.txt"
 echo "index: \$(tr '\\n' ' ' < binlog.index 2>/dev/null)" >> "$E/kill_snapshot.txt"
 SH
+elif [ "$SCENARIO" = cron ]; then
+  # simulated time starts at 2000-01-01 00:00:00 UTC (946684800)
+  cat > "$E/cron_fetch.sh" <<SH
+#!/bin/bash
+export AWS_EC2_METADATA_DISABLED=true
+i=0
+while :; do
+  i=\$((i + 1))
+  t=\$(( \$(date +%s) - 946684800 ))
+  "$PBS" fetch "$E/binsrv.json" > /dev/null 2>&1
+  echo "fetch \$i at \$t s exit \$?" >> "$E/cron.txt"
+  [ \$t -ge $((CRON_HOURS * 3600 + 120)) ] && break
+  sleep 300
+done
+SH
+  PBS_PROCESSES="    - path: /bin/bash
+      args: [\"$E/cron_fetch.sh\"]
+      start_time: 10s
+      expected_final_state: {exited: 0}"
 elif [ "$SCENARIO" = stop ]; then
   PBS_PROCESSES="$PBS_PROCESS
       start_time: 10s
@@ -338,20 +452,49 @@ fi
 REPLICA_HOST=""
 REPLICA_CLIENTS=""
 if [ -n "$REPLICA" ]; then
-  cp -a "$T" "$E/rdata"
-  rm -f "$E/rdata/auto.cnf"   # a server UUID of its own
-  REPLICA_HOST="  replica:
-    network_node_id: 0
-    processes:
-    - path: $B/bin/mysqld
-      args: [\"--no-defaults\", \"--basedir=$B\", \"--datadir=$E/rdata\",
+  n=0
+  for h in $RHOSTS; do
+    n=$((n + 1))
+    suffix=$([ "$n" = 1 ] && echo "" || echo "$n")
+    cp -a "$T" "$E/rdata$suffix"
+    # a server UUID of its own, fixed: one generated inside the simulation
+    # comes out the same in every run (same simulated clock and seed), and
+    # names the replica's temporary files
+    printf '[auto]\nserver-uuid=00000000-0000-0000-0000-0000000000%02d\n' "$((n + 1))" \
+      > "$E/rdata$suffix/auto.cnf"
+    mkdir -p "$E/rtmp$suffix"
+    # relay_log_recovery: a replica killed with SIGKILL resumes safely; its
+    # own tmpdir: runs side by side share the real /tmp
+    rargs="\"--no-defaults\", \"--basedir=$B\", \"--datadir=$E/rdata$suffix\",
+             \"--tmpdir=$E/rtmp$suffix\",
              \"--port=3306\", \"--bind-address=0.0.0.0\", \"--socket=\",
-             \"--mysqlx=OFF\", \"--log-error=$E/replica.err\",
-             \"--innodb-use-native-aio=OFF\", \"--server-id=2\",
+             \"--mysqlx=OFF\", \"--log-error=$E/replica$suffix.err\",
+             \"--innodb-use-native-aio=OFF\", \"--server-id=$((n + 1))\",
              \"--skip-log-bin\", \"--gtid-mode=$SOURCE_GTID\",
-             \"--enforce-gtid-consistency=$SOURCE_GTID\", \"--skip-replica-start\"]
+             \"--enforce-gtid-consistency=$SOURCE_GTID\", \"--relay-log-recovery=ON\""
+    if [ "$n" = 1 ] && [ -n "$REPLICA_KILL_AT" ]; then
+      procs="    - path: $B/bin/mysqld
+      args: [$rargs, \"--skip-replica-start\"]
+      start_time: 1s
+      shutdown_time: ${REPLICA_KILL_AT}s
+      shutdown_signal: SIGKILL
+      expected_final_state: {signaled: SIGKILL}
+    - path: $B/bin/mysqld
+      args: [$rargs]
+      start_time: $((REPLICA_KILL_AT + 5))s
+      expected_final_state: running"
+    else
+      procs="    - path: $B/bin/mysqld
+      args: [$rargs, \"--skip-replica-start\"]
       start_time: 1s
       expected_final_state: running"
+    fi
+    REPLICA_HOST+="  $h:
+    network_node_id: 2
+    processes:
+$procs
+"
+  done
   REPLICA_CLIENTS="    - path: /bin/bash
       args: [\"$E/replica_setup.sh\"]
       start_time: ${REPLICA_AT}s
@@ -383,8 +526,31 @@ network:
         ]
         node [
           id 1
+          host_bandwidth_down "$BANDWIDTH"
+          host_bandwidth_up "$BANDWIDTH"
+        ]
+        node [
+          id 2
           host_bandwidth_down "1 Gbit"
           host_bandwidth_up "1 Gbit"
+        ]
+        edge [
+          source 2
+          target 2
+          latency "1 ms"
+          packet_loss 0.0
+        ]
+        edge [
+          source 0
+          target 2
+          latency "$REPLICA_LATENCY"
+          packet_loss $(LC_ALL=C printf %.4f "$REPLICA_LOSS")
+        ]
+        edge [
+          source 1
+          target 2
+          latency "1 ms"
+          packet_loss 0.0
         ]
         edge [
           source 0
@@ -439,7 +605,9 @@ echo "-- PBS log lines: $(wc -l < "$E/binsrv.log" 2>/dev/null)"
 echo "-- shadow: unsupported syscalls / process states:"
 grep -E "unsupported syscall|final state|panic" "$E/shadow.log" | sed -E 's/.*\] //' | sort -u | head -15 | cut -c1-200
 ok=0; bad=0
-if [ "$MODE" = gtid ]; then
+if [ -n "$ENCRYPT" ]; then
+  echo "-- storage vs source: encrypted, checked through the replica instead"
+elif [ "$MODE" = gtid ]; then
   # GTID mode is rewrite mode: PBS's binlogs are its own files, so only the
   # transactions can be compared
   echo "-- storage vs source transactions:"
@@ -467,9 +635,12 @@ done
 echo "  identical: $ok, without transactions yet (magic only in storage): $pending, missing or different: $bad"
 fi
 ls "$E/storage" | head -30 | tr '\n' ' '; echo
-echo "-- recorded timestamp ranges (ticket 6, PBS-72):"
-python3 "$HERE/check_binlog_timestamps.py" "$E/storage" | sed 's/^/  /'
-ts_code=${PIPESTATUS[0]}
+ts_code=0
+if [ -z "$ENCRYPT" ]; then
+  echo "-- recorded timestamp ranges (ticket 6, PBS-72):"
+  python3 "$HERE/check_binlog_timestamps.py" "$E/storage" | sed 's/^/  /'
+  ts_code=${PIPESTATUS[0]}
+fi
 verdict=PASS
 [ "$code" = 0 ] || verdict=FAIL
 [ "$bad" = 0 ] || verdict=FAIL
@@ -479,7 +650,9 @@ if [ -n "$REPLICA" ]; then
   echo "-- replica:"
   sed 's/^/  /' "$E/replica_check.txt" 2>/dev/null || echo "  no replica_check.txt"
   r() { awk -v k="$1" '$1 == k {print $2}' "$E/replica_check.txt" 2>/dev/null; }
-  status() { grep -E "^$1:" "$E/replica_check.txt" 2>/dev/null | sed -E "s/^$1: ?//"; }
+  # replica_rows <host> <rows>; <host> <field>: <value>
+  rows() { awk -v h="$1" '$1 == "replica_rows" && $2 == h {print $3}' "$E/replica_check.txt" 2>/dev/null; }
+  status() { grep -E "^$1 $2:" "$E/replica_check.txt" 2>/dev/null | sed -E "s/^$1 $2: ?//"; }
   if [ "$REPLICA" = heartbeat ]; then
     # 20 s at a heartbeat period of 1 s; the count restarts at a reconnect
     read -r h1 h2 < <(awk '$1 == "heartbeats" {print $2, $3}' "$E/replica_check.txt" 2>/dev/null)
@@ -488,10 +661,14 @@ if [ -n "$REPLICA" ]; then
     extra=", heartbeats in 20 quiet seconds $hb: $replica_ok"
   else
     replica_ok=ok
-    [ -n "$(r source_rows)" ] && [ "$(r source_rows)" = "$(r replica_rows)" ] || replica_ok=FAIL
-    [ "$(status Replica_IO_Running)" = Yes ] && [ "$(status Replica_SQL_Running)" = Yes ] || replica_ok=FAIL
-    [ "$(status Last_IO_Errno)" = 0 ] && [ "$(status Last_SQL_Errno)" = 0 ] || replica_ok=FAIL
-    extra=", replica rows $(r replica_rows) of $(r source_rows): $replica_ok"
+    all_rows=""
+    for h in $RHOSTS; do
+      [ -n "$(r source_rows)" ] && [ "$(r source_rows)" = "$(rows "$h")" ] || replica_ok=FAIL
+      [ "$(status "$h" Replica_IO_Running)" = Yes ] && [ "$(status "$h" Replica_SQL_Running)" = Yes ] || replica_ok=FAIL
+      [ "$(status "$h" Last_IO_Errno)" = 0 ] && [ "$(status "$h" Last_SQL_Errno)" = 0 ] || replica_ok=FAIL
+      all_rows="$all_rows${all_rows:+/}$(rows "$h")"
+    done
+    extra=", replica rows $all_rows of $(r source_rows): $replica_ok"
   fi
   [ "$replica_ok" = ok ] || verdict=FAIL
 fi
@@ -499,6 +676,29 @@ if [ "$SCENARIO" = pbskill ]; then
   echo "-- storage left by the kill at $PBS_KILL_US us:"
   sed 's/^/  /' "$E/kill_snapshot.txt" 2>/dev/null
   echo "-- kill snapshot hash: $(sha256sum < "$E/kill_snapshot.txt" 2>/dev/null | cut -c1-16)"
+  echo "-- bytes left unrecorded by the kill, written again (ticket 32, PBS-104):"
+  python3 "$HERE/check_binlog_timestamps.py" --rewritten "$E/kill_copy" "$E/storage" \
+    ${ENCRYPT:+--encrypted} | sed 's/^/  /'
+  if [ "${PIPESTATUS[0]}" != 0 ]; then
+    verdict=FAIL; extra="$extra, keystream reused: FAIL"
+  fi
+fi
+if [ "$SCENARIO" = cron ]; then
+  # a fetch may fail only while the source restarts (within 60 s of a full
+  # hour); the last one must succeed
+  echo "-- fetch runs:"
+  failed_ok=0 failed_bad=0
+  while read -r _ i _ t _ _ rc; do
+    [ "$rc" = 0 ] && continue
+    if [ $((t % 3600)) -lt 60 ] && [ "$t" -ge 3600 ]; then failed_ok=$((failed_ok + 1)); else
+      failed_bad=$((failed_bad + 1)); echo "  fetch $i at $t s exit $rc, not during a restart"; fi
+  done < "$E/cron.txt"
+  runs=$(wc -l < "$E/cron.txt" 2>/dev/null)
+  last_rc=$(tail -1 "$E/cron.txt" 2>/dev/null | awk '{print $NF}')
+  echo "  $runs runs, $failed_ok failed during a restart, $failed_bad failed otherwise, the last exit ${last_rc:-none}"
+  cron_ok=$([ "$failed_bad" = 0 ] && [ "$last_rc" = 0 ] && echo ok || echo FAIL)
+  extra=", fetch runs $runs, failed outside restarts $failed_bad, last exit ${last_rc:-none}: $cron_ok"
+  [ "$cron_ok" = ok ] || verdict=FAIL
 fi
 if [ "$SCENARIO" = stop ]; then
   # the last line pull logs, against the SIGTERM at PBS_TERM_AT
@@ -522,4 +722,9 @@ echo "-- outcome hash: $(echo "$outcome" | sha256sum | cut -c1-16)"
 echo "-- storage hash: $(cd "$E/storage" && cat $(ls | grep -E '^binlog\.[0-9]+$') 2>/dev/null | sha256sum | cut -c1-16)"
 echo "-- PBS log hash, paths removed (determinism check): $(sed "s|$E||g" "$E/binsrv.log" | sha256sum | cut -c1-16)"
 echo "-- mysqld error log hash, paths removed: $(sed "s|$E||g" "$E/db.err" | sha256sum | cut -c1-16)"
+# the data directories of the source and the replicas are most of a run's
+# size (about 200 MB each) and no check needs them any more; the storage,
+# the logs and Shadow's per-process output stay
+[ -n "${KEEP_DATA:-}" ] || rm -rf "$E/data" "$E"/rdata* "$E/tmp" "$E"/rtmp*
+echo "-- run directory: $(du -sh "$E" 2>/dev/null | cut -f1)"
 [ "$verdict" = PASS ]

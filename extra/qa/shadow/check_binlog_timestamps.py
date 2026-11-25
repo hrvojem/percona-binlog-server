@@ -12,6 +12,7 @@ transaction into the next binlog.
 usage: check_binlog_timestamps.py <storage dir> [-v]
        check_binlog_timestamps.py --gtids <source datadir> <storage dir>
        check_binlog_timestamps.py --header-only <binlog>
+       check_binlog_timestamps.py --rewritten <copy at the kill> <storage> [--encrypted]
 exit 0 when every range is inside the file's events (or, with --gtids, the
 storage holds the source's GTIDs in order), 1 otherwise.
 """
@@ -104,9 +105,57 @@ def header_only(path):
     return 0 if all(typ in (15, 35) for _ts, typ, _b in events(path)) else 1
 
 
+def rewritten(copy, storage, encrypted):
+    """the bytes a killed writer left past each binlog's recorded size (in
+    the copy taken before the restart) against what the storage holds at
+    those offsets now. The restart truncates the unrecorded tail and writes
+    again; in an encrypted storage, different bytes at the same offset under
+    the same encryption record mean the AES-CTR keystream was used twice
+    (ticket 32, PBS-104)"""
+    bad = 0
+    seen = 0
+    for name in sorted(os.listdir(copy)):
+        if not re.fullmatch(r"binlog\.\d+", name):
+            continue
+        meta_path = os.path.join(copy, name + ".json")
+        meta = json.load(open(meta_path)) if os.path.exists(meta_path) else {}
+        recorded = int(meta.get("size", 0))
+        with open(os.path.join(copy, name), "rb") as f:
+            before = f.read()
+        if len(before) <= recorded:
+            continue
+        seen += 1
+        final_path = os.path.join(storage, name)
+        after = open(final_path, "rb").read() if os.path.exists(final_path) else b""
+        after_meta_path = os.path.join(storage, name + ".json")
+        after_meta = (json.load(open(after_meta_path))
+                      if os.path.exists(after_meta_path) else {})
+        tail_before = before[recorded:]
+        tail_after = after[recorded:recorded + len(tail_before)]
+        span = f"{name} bytes {recorded}..{len(before)} (unrecorded at the kill)"
+        if tail_after == tail_before:
+            print(f"same  {span}: written again with the same bytes")
+            continue
+        differ = sum(1 for a, b in zip(tail_before, tail_after) if a != b)
+        same_record = meta.get("encryption") == after_meta.get("encryption")
+        if encrypted and same_record and meta.get("encryption"):
+            bad += 1
+            print(f"BAD   {span}: {differ} of {len(tail_after)} bytes now differ under the "
+                  f"same encryption record: the AES-CTR keystream at these offsets was used "
+                  f"for two different plaintexts")
+        else:
+            print(f"info  {span}: {differ} of {len(tail_after)} bytes now differ"
+                  f"{'' if encrypted else ' (plaintext storage: harmless)'}"
+                  f"{'' if same_record else ' (a new encryption record)'}")
+    print(f"unrecorded tails at the kill: {seen}; keystream reuse: {bad}")
+    return 1 if bad else 0
+
+
 def main():
     if sys.argv[1] == "--gtids":
         return compare_gtids(sys.argv[2], sys.argv[3])
+    if sys.argv[1] == "--rewritten":
+        return rewritten(sys.argv[2], sys.argv[3], "--encrypted" in sys.argv)
     if sys.argv[1] == "--header-only":
         return header_only(sys.argv[2])
     storage = sys.argv[1]

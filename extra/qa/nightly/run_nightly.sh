@@ -1074,13 +1074,15 @@ if want qa || want rotation; then
       shadow_test)
         # source, pull and a client under the Shadow simulator (built with
         # extra/qa/shadow/build_shadow.sh into $WS/shadow): restart, crash
-        # at a rotation, packet loss, an idle hour, pull killed at 8 points
-        # of a rotation, a MySQL replica of pull; a new seed (and so new
-        # kill points) every day of the year (about 12 min)
+        # at a rotation, packet loss, a slow link, an idle hour, a cron fetch
+        # over 3 hours, pull killed at 4 points of a rotation, a checkpoint
+        # and a reconnect (plain and encrypted), MySQL replicas of pull
+        # (crashed, lossy, three at once); a new seed (and so new kill
+        # points) every day of the year (about 20 min)
         qa_run shadow_test "shadow_test ($mode)" \
           "${common[@]}" --workdir "$out/qa/sh-$mode" \
           --shadow "$SHADOW_BIN" --seed "$((10#$(date -u +%j)))" \
-          --timeout 3000 ;;
+          --timeout 4200 ;;
       clock_test)
         # binlog_server under libfaketime (built from source into
         # $WS/clock/libfaketime): wall-clock jumps, a skewed clock, time

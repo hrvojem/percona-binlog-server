@@ -617,15 +617,27 @@ every binlog. Cases: `basic` (30 rounds of inserts, binlog rotations),
 (SIGKILL right after `FLUSH BINARY LOGS`, then a restart: ticket 6,
 PBS-72), `lossy` (2 % packet loss, 20 ms latency), `idle` (an hour of
 simulated idle time in about 3 minutes), `quiet` (the last transaction
-followed by silence: ticket 94, PBS-167), `pbs_kill/<offset>us` (`pull`
-killed with SIGKILL at a microsecond around its first binlog rotation,
-started again 1 s later; the nightly runs 8 of the 61 offsets, picked by
-the seed), `replica` (a MySQL replica of `pull`'s listener on a fourth
-host), `replica_early` (the replica connects while `pull` has stored
-nothing: tickets 26 and 38), `heartbeat` (heartbeats to a caught-up replica
-after a rotation: ticket 40) and `stop` (SIGTERM to `pull` with the source
-idle: ticket 43). The nightly passes the day of the year as the seed; a
-failing case's JSON line names its seed.
+followed by silence: ticket 94, PBS-167), `slow` (one 20 MB transaction
+over a 2 Mbit link), `cron` (`fetch` every 5 minutes for 3 simulated
+hours, the source restarted every hour), `replica` (a MySQL replica of
+`pull`'s listener on a fourth host), `replica_early` (the replica connects
+while `pull` has stored nothing: tickets 26 and 38), `heartbeat`
+(heartbeats to a caught-up replica after a rotation: ticket 40), `stop`
+(SIGTERM to `pull` with the source idle: ticket 43), `replica_restart`
+(the replica killed and started again), `replica_lossy` (2 % loss, 20 ms
+between `pull` and the replica) and `replicas3`. The kill sets kill `pull`
+with SIGKILL at a microsecond around an anchor line of a reference run's
+log and start it again 1 s later, one case per kill point
+(`<set>/<offset>us`; the nightly runs 4 of the 61 offsets per set, picked
+by the seed): `pbs_kill` (the first rotation), `pbs_kill_checkpoint` (the
+checkpoint at the 5th transaction), `pbs_kill_reconnect` (the reconnect
+after a source restart), `enc_pbs_kill` and `enc_pbs_kill_checkpoint` (the
+same on an encrypted storage, checked through a replica, plus the
+keystream check below) and `replica_pbs_kill` (one kill while a replica
+streams from `pull`). The nightly passes the day of the year as the seed;
+a failing case's JSON line names its seed. Each run deletes its MySQL data
+directories at the end (`KEEP_DATA=1` keeps them): they were about 200 MB a
+run, and the sweeps filled the QA host's disk on 2026-11-24.
 
 Results on 2026-11-24 (debug build, seeds 329 and 330): in position mode
 `crash` aborts `pull` on the assertion of ticket 6 for every kill after the
@@ -661,6 +673,40 @@ replica gets no heartbeat in 20 s and reconnects every
 second. `stop`: `pull` exits 35.5 s after SIGTERM in both modes, when its
 read of the idle source times out (ticket 43, PBS-116).
 
+Results on 2026-11-25 (every offset of each kill set, seed 1):
+
+* Ticket 32 (PBS-104) reproduced end to end. On an encrypted storage in
+  GTID mode (rewrite mode), 11 of the 61 kill points around the first
+  rotation, 14 to 4 us before the anchor, leave the last transaction and
+  the ROTATE that PBS writes itself (783 bytes) in `binlog.000001` while
+  its metadata still records the old size (the new metadata only as
+  `binlog.000001.json.tmp`). After the restart PBS writes the range again
+  under the same encryption record, and 5 of the 783 bytes differ: the low
+  byte of the ROTATE's timestamp, which comes from PBS's clock (ticket 84),
+  and its CRC32. The AES-CTR keystream at those offsets is used for two
+  plaintexts; XOR-ing the two ciphertexts gives the XOR of the plaintexts.
+  The replica still applies every row. `pbskill` keeps a copy of the
+  storage between the kill and the restart (`kill_copy`), and
+  `check_binlog_timestamps.py --rewritten` compares what the kill left past
+  each recorded size with what is there afterwards.
+* At the checkpoint (`enc_pbs_kill_checkpoint`, GTID mode; and
+  `pbs_kill_checkpoint`, position mode) every kill recovers: the
+  unrecorded tail is the transaction itself, written again byte for byte.
+  The kills left 3 states: before the data write, data written with the
+  metadata only as `.tmp`, and done.
+* `pbs_kill_reconnect` (position mode): every kill recovers; a reconnect
+  writes nothing to the storage, so all 61 kills find the same state.
+* `slow`: the 20 MB transaction arrives intact in both modes (the source
+  needs a longer `connect_timeout` for the workload's own logins on the
+  saturated link). `cron`: 38 runs of `fetch`, none failed, the storage
+  equal to the source. `replica_restart`, `replica_lossy`, `replicas3`
+  and `replica_pbs_kill`: every replica ends with every row.
+* Two fixes to the scenarios themselves: replicas get a fixed server UUID
+  and their own `tmpdir` (a UUID generated inside the simulation is the
+  same in every run, and concurrent replicas collided on
+  `/tmp/SQL_LOAD-<uuid>`), and runs side by side make the template data
+  directory under a lock.
+
 Runs with the same seed are not byte-identical: `mysqld` needs Shadow's
 native preemption (InnoDB spin-waits), which is driven by real CPU time, so
 simulated times differ by microseconds. The outcome (binlogs and sizes,
@@ -670,8 +716,8 @@ transactions, process end states, verdict) repeated in every run so far.
 python3 extra/qa/shadow_test.py --mysql-basedir <dist> --binsrv <binary> \
   --workdir ~/ws/shadow/h --mode position --seed 1 --jobs 4 \
   --shadow ~/ws/shadow/install/bin/shadow
-# every kill point:
-python3 extra/qa/shadow_test.py ... --cases basic pbs_kill --kill-points all
+# every kill point of one set:
+python3 extra/qa/shadow_test.py ... --cases enc_pbs_kill --kill-points all
 # one scenario, with its full report:
 SEED=7 KILL_AT=35 extra/qa/shadow/shadow_pbs.sh try crash
 ```
@@ -1578,11 +1624,11 @@ server rather than starting one.
      | --- | --- | --- |
      | Mon | `s3_fault_sweep.py` (position), through `s3_fault_proxy.py` the stage starts; `pull_versions` on 9.7; `hostile_source_test.py` (position and gtid, about 1 min each) and `tls_config_test.py` (position, about 5 min); `hostile_source_pull_test.py` (position, about 5 min, and again with `--storage s3`, cases `position/<case>/s3`); `stuck_storage_recovery_test.py` (position, about 4 min) | ASan; debug |
      | Tue | `disk_fault_sweep.py` (position) and `listener_exhaustion_test.py` (position, about 2 min); `pull_versions` on 8.0; `metadata_tamper_test.py` (position, about 4 min) and `checkpoint_loss_test.py` (position, file storage, about 5 min); `purge_search_tamper_test.py` (gtid, about 2 min); `keyring_test.py` (position, about 4 min) and `pull_two_sided_attack_test.py` (position, about 5 min); `source_reply_test.py` (position, 10 s) | debug (`fsfault` is an `LD_PRELOAD`; ASan must come first; the exhaustion test measures descriptors and memory) |
-     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min); `rewrite_attack_test.py` (gtid, about 7 min) and `truncated_transaction_test.py` (position, about 3 min, and gtid with `--storage s3`, about 5 min); `resource_exhaustion_test.py` (position, about 5 min); `log_hygiene_test.py` (position, about 6 min); `shadow_test.py` (position, about 12 min, needs the patched Shadow in `$WS/shadow/install`, `SHADOW_BIN`) | ASan; debug |
+     | Wed | `network_fault_test.py` (position, parts fetch and pull; the nightly starts Toxiproxy) and `large_binlog_test.py` (about 20 GB of disk while it runs, removed at the end); `secrets_exposure_test.py` (position, about 2 min) and `listener_command_fuzz_test.py` (position, about 4 min); `rewrite_attack_test.py` (gtid, about 7 min) and `truncated_transaction_test.py` (position, about 3 min, and gtid with `--storage s3`, about 5 min); `resource_exhaustion_test.py` (position, about 5 min); `log_hygiene_test.py` (position, about 6 min); `shadow_test.py` (position, about 20 min, needs the patched Shadow in `$WS/shadow/install`, `SHADOW_BIN`) | ASan; debug |
      | Thu | `listener_fuzz_test.py` (position and gtid, 600 connections each, `QA_FUZZ_CONNECTIONS`, seed = day of the year) and `source_change_test.py` (position and gtid); `pull_versions` on Percona Server 8.4; `upstream_tls_test.py` (position, about 2 min) and `replica_tamper_test.py` (position, about 4 min); `keyring_test.py` (gtid, about 4 min) | ASan; debug |
      | Fri | `s3_fault_sweep.py` (gtid) and `large_binlog_test.py --storage s3` (position, `binlog_over_4gib` only, about 30 GB of disk while it runs; cases `position/<case>/s3`); `file_security_test.py` (position, about 7 min, with the local S3 server), `s3_upload_tamper_test.py` (position, about 1 min) and `listener_command_fuzz_test.py --tls` (gtid, about 5 min); `truncated_transaction_test.py` (gtid, about 3 min) and `damaged_binlog_consumers_test.py` (position, about 3 min); `stuck_storage_recovery_test.py` (gtid, about 9 min); `pull_soak_test.py` (gtid, `QA_SOAK_SECONDS`, 2 h by default); `source_reply_test.py` (gtid, 10 s) | ASan; debug |
      | Sat | `disk_fault_sweep.py` (gtid) and `pull_load_test.py` (position); `pull_versions` on Percona Server 9.7; `listener_replica_dos_test.py` (gtid, about 5 min); `final_flush_test.py` (position, about 3 min); `hostile_source_pull_test.py --rewrite` (gtid, about 9 min); `resource_exhaustion_test.py` (gtid, about 9 min); `metadata_tamper_test.py` (gtid, about 9 min); `log_hygiene_test.py` (gtid, about 6 min); `clock_test.py` (position, about 35 min) | debug / ASan; debug |
-     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) and `replica_tamper_test.py` (gtid, about 4 min); `truncated_transaction_test.py --rewrite` (gtid, about 5 min) and `damaged_binlog_consumers_test.py` (gtid, about 11 min); `pull_two_sided_attack_test.py` (gtid, about 5 min) and `purge_search_tamper_test.py --storage s3` (gtid, about 22 min); `clock_test.py` (gtid, about 25 min); `shadow_test.py` (gtid, about 12 min) | ASan / debug; debug |
+     | Sun | `network_fault_test.py` (gtid) and `pull_soak_test.py` (position, `QA_SOAK_SECONDS`, 2 h by default); `listener_login_test.py` (position, about 7 min) and `replica_tamper_test.py` (gtid, about 4 min); `truncated_transaction_test.py --rewrite` (gtid, about 5 min) and `damaged_binlog_consumers_test.py` (gtid, about 11 min); `pull_two_sided_attack_test.py` (gtid, about 5 min) and `purge_search_tamper_test.py --storage s3` (gtid, about 22 min); `clock_test.py` (gtid, about 25 min); `shadow_test.py` (gtid, about 20 min) | ASan / debug; debug |
 
      `pull_versions/<series>` runs the replica harnesses of the nightly 8.4
      stage against another MySQL version of `MTR_DISTS`: `upgrade_test.py`,

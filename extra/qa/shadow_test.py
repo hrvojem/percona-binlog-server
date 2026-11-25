@@ -49,13 +49,7 @@ summary):
                end with, so the last transaction is followed by silence
                (ticket 94, PBS-167: with checkpoint_interval it is not
                written until another event arrives);
-  pbs_kill     pull killed with SIGKILL at a microsecond around its first
-               binlog rotation (placed from the basic run's log; the
-               rotation's file operations span about 50 us), then started
-               again 1 s later: the storage must still end up equal to the
-               source. One case per kill point, 'pbs_kill/<offset>us';
-               --kill-points picks how many (by the seed);
-  replica      a MySQL replica of pull's listener on a fourth host: it must
+  replica     a MySQL replica of pull's listener on a fourth host: it must
                end with the source's rows and no replication error (in
                position mode the source and replica run without GTIDs:
                ticket 30, PBS-102);
@@ -66,7 +60,34 @@ summary):
                heartbeats during 20 quiet seconds after the closing FLUSH
                BINARY LOGS (ticket 40, PBS-113);
   stop         SIGTERM to pull while the source is idle: it must exit 0
-               within 5 s (ticket 43, PBS-116).
+               within 5 s (ticket 43, PBS-116);
+  slow         one 20 MB transaction over a 2 Mbit link to the source;
+  cron         'fetch' every 5 minutes for 3 simulated hours of inserts,
+               the source restarted every hour: a fetch may fail only
+               during a restart, and the storage must end equal to the
+               source;
+  replica_restart  the replica killed (SIGKILL) at 40 s and started again,
+               resuming from its relay log position;
+  replica_lossy  2 % packet loss and 20 ms latency between pull and the
+               replica;
+  replicas3    three replicas at once.
+
+Kill sets ('<set>/<offset>us', --kill-points of them per set, picked by
+the seed): pull killed with SIGKILL at a microsecond around an anchor line
+of a reference run's log, and started again 1 s later; a snapshot keeps
+what the kill left in the storage:
+  pbs_kill                 the first binlog rotation (basic run);
+  pbs_kill_checkpoint      the checkpoint at the 5th transaction;
+  pbs_kill_reconnect       pull's reconnect after the source restart of
+                           the restart case;
+  enc_pbs_kill, enc_pbs_kill_checkpoint  the same on an encrypted storage,
+                           checked through a replica; the bytes the kill
+                           left past the recorded size must not be written
+                           again differently under the same encryption
+                           record (ticket 32, PBS-104: AES-CTR keystream
+                           reuse);
+  replica_pbs_kill         one kill at the rotation while a replica
+                           streams from pull: the replica must catch up.
 
 GTID mode is rewrite mode, where PBS writes its own binlogs: there the
 storage is compared with the source by its GTIDs instead of byte by byte.
@@ -78,6 +99,7 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -95,20 +117,49 @@ CASES = {
     "lossy": ("lossy", {}),
     "idle": ("idle", {}),
     "quiet": ("quiet", {}),
-    "pbs_kill": ("pbskill", {}),
     "replica": ("replica", {}),
     "replica_early": ("replica_early", {}),
     "heartbeat": ("heartbeat", {}),
     "stop": ("stop", {}),
+    "slow": ("slow", {}),
+    # 3 simulated hours: about 7 minutes alone, more than 15 next to 4
+    # other simulations
+    "cron": ("cron", {"WALL": "2400"}),
+    "replica_restart": ("replica", {"REPLICA_KILL_AT": "40"}),
+    "replica_lossy": ("replica", {"REPLICA_LOSS": "0.02",
+                                  "REPLICA_LATENCY": "20 ms"}),
+    "replicas3": ("replica", {"REPLICAS": "3"}),
 }
 
-# pbs_kill: kill points in microseconds around the anchor, the first
-# "storage: closed binlog file" line of the basic run; the rotation's file
-# operations (data write and fsync, metadata write, fsync and rename, the
-# new binlog, its metadata and the index) span about 50 us of simulated time
+# kill sets: pull killed with SIGKILL at microseconds around an anchor, a
+# line of a reference run's PBS log (its nth match), and started again 1 s
+# later. A rotation's file operations (data write and fsync, metadata
+# write, fsync and rename, the new binlog, its metadata and the index) span
+# about 50 us of simulated time, a checkpoint about 10 us.
+# set: (reference case, pattern, nth match, environment, kill points or None
+# for --kill-points)
+STAMP = r"^\[2000-01-01T(\d\d):(\d\d):(\d\d)\.(\d{6})\] "
+ROTATION = re.compile(STAMP + r"\[ *info\] storage: closed binlog file")
+# the 5th transaction (round 3, in the first binlog): with 2 s between
+# rounds and a 1 s checkpoint_interval its first event makes PBS write the
+# transaction before it
+CHECKPOINT = re.compile(STAMP + r"\[ *debug\] event  : gtid_log")
+# pull's reconnect after the source restart of the restart case
+RECONNECT = re.compile(STAMP + r"\[ *info\] established connection to mysql")
+KILL_SETS = {
+    "pbs_kill": ("basic", ROTATION, 1, {}, None),
+    "pbs_kill_checkpoint": ("basic", CHECKPOINT, 5, {}, None),
+    "pbs_kill_reconnect": ("restart", RECONNECT, 2, {"KILL_BASE": "restart"},
+                           None),
+    # encrypted storage: the kill leaves bytes past the recorded size, the
+    # restart writes that range again (ticket 32, PBS-104)
+    "enc_pbs_kill": ("basic", ROTATION, 1, {"ENCRYPT": "1"}, None),
+    "enc_pbs_kill_checkpoint": ("basic", CHECKPOINT, 5, {"ENCRYPT": "1"},
+                                None),
+    # a replica streaming from pull while pull is killed
+    "replica_pbs_kill": ("basic", ROTATION, 1, {"WITH_REPLICA": "1"}, 1),
+}
 KILL_OFFSETS = range(-20, 41)
-ANCHOR = re.compile(r"^\[2000-01-01T(\d\d):(\d\d):(\d\d)\.(\d{6})\] "
-                    r"\[ *info\] storage: closed binlog file")
 
 VERDICT = re.compile(r"^-- verdict: (PASS|FAIL) \(shadow exit (-?\d+), "
                      r"storage mismatches (\d+), timestamp check (\d+)"
@@ -118,18 +169,21 @@ HASH = re.compile(r"^-- (outcome hash|storage hash|kill snapshot hash|"
                   r"([0-9a-f]+)")
 
 
-def kill_anchor(args):
-    """microseconds of simulated time of PBS's first rotation in the basic
-    run, or None"""
+def kill_anchor(args, reference: str, pattern, nth: int):
+    """microseconds of simulated time of the nth line matching 'pattern' in
+    the reference run's PBS log, or None"""
     try:
-        lines = (args.workdir / "basic" / "binsrv.log").read_text().splitlines()
+        lines = (args.workdir / reference / "binsrv.log").read_text(
+            errors="replace").splitlines()
     except OSError:
         return None
     for line in lines:
-        match = ANCHOR.match(line)
+        match = pattern.match(line)
         if match:
-            h, m, sec, us = (int(group) for group in match.groups())
-            return ((h * 60 + m) * 60 + sec) * 1000000 + us
+            nth -= 1
+            if nth == 0:
+                h, m, sec, us = (int(group) for group in match.groups())
+                return ((h * 60 + m) * 60 + sec) * 1000000 + us
     return None
 
 
@@ -144,9 +198,10 @@ def run_scenario(args, name: str, scenario: str, extra: dict,
     env.update(extra)
     started = time.monotonic()
     run_name = run_name or name
+    # a case may set a longer wall-clock limit of its own (WALL)
     proc = subprocess.run(["bash", str(SCRIPT), run_name, scenario], env=env,
                           capture_output=True, text=True,
-                          timeout=args.case_timeout + 120)
+                          timeout=int(env["WALL"]) + 120)
     output = proc.stdout + proc.stderr
     (args.workdir / f"{run_name}.out").write_text(output)
     result = {"case": name, "seed": args.seed,
@@ -209,12 +264,13 @@ def main() -> int:
                         help="simulations run at the same time")
     parser.add_argument("--case-timeout", type=int, default=900,
                         help="wall-clock seconds for one simulation")
-    parser.add_argument("--cases", nargs="*", choices=list(CASES))
-    parser.add_argument("--kill-points", default="8",
-                        help="pbs_kill: how many kill points of the "
-                        f"{len(KILL_OFFSETS)} (-20 to +40 us around the "
-                        "first rotation) to run, picked by the seed; offset "
-                        "0 is always run; 'all' runs every one")
+    parser.add_argument("--cases", nargs="*",
+                        choices=list(CASES) + list(KILL_SETS))
+    parser.add_argument("--kill-points", default="4",
+                        help="each kill set: how many kill points of the "
+                        f"{len(KILL_OFFSETS)} (-20 to +40 us around its "
+                        "anchor) to run, picked by the seed; offset 0 is "
+                        "always run; 'all' runs every one")
     args = parser.parse_args()
     args.workdir = args.workdir.expanduser().resolve()
     args.workdir.mkdir(parents=True, exist_ok=True)
@@ -224,14 +280,22 @@ def main() -> int:
         print(json.dumps({"case": "setup", "ok": False,
                           "error": f"no shadow binary at {args.shadow}"}))
         return 1
-    names = args.cases or list(CASES)
-    # determinism and pbs_kill need the basic run; it also makes the
-    # template data directory, so it runs before simulations side by side
-    if ("determinism" in names or "pbs_kill" in names) and \
-            "basic" not in names:
-        names = ["basic"] + names
-    first = (["basic"] if "basic" in names else
-             [name for name in names if name != "determinism"][:1])
+    names = list(args.cases or (list(CASES) + list(KILL_SETS)))
+    kill_sets = [name for name in names if name in KILL_SETS]
+    # the reference runs of the kill sets, and determinism's, run first;
+    # basic also makes the template data directory
+    references = {KILL_SETS[name][0] for name in kill_sets}
+    if "determinism" in names:
+        references.add("basic")
+    for reference in sorted(references, reverse=True):
+        if reference not in names:
+            names.insert(0, reference)
+    first = ["basic"] if "basic" in names else []
+    first += [name for name in names if name in references and
+              name not in first]
+    if not first:
+        first = [name for name in names if name != "determinism" and
+                 name not in KILL_SETS][:1]
     results = {}
     runs = {}  # case: (scenario, extra environment, run directory name)
 
@@ -247,29 +311,37 @@ def main() -> int:
     for name in first:
         results[name] = one(name)
         print(json.dumps(results[name]), flush=True)
-    rest = [name for name in names if name not in first]
-    if "pbs_kill" in rest:
-        anchor = kill_anchor(args)
-        rest.remove("pbs_kill")
-        names.remove("pbs_kill")
+    rest = [name for name in names if name not in first and
+            name not in KILL_SETS]
+    for kill_set in kill_sets:
+        reference, pattern, nth, env, points = KILL_SETS[kill_set]
+        names.remove(kill_set)
+        anchor = kill_anchor(args, reference, pattern, nth)
         if anchor is None:
-            results["pbs_kill"] = {"case": "pbs_kill", "ok": False,
-                                   "error": "no rotation in the basic run's "
-                                   "PBS log to place the kill points at"}
-            names.append("pbs_kill")
-        else:
-            offsets = list(KILL_OFFSETS)
-            if args.kill_points != "all":
-                picked = random.Random(args.seed).sample(
+            results[kill_set] = {"case": kill_set, "ok": False,
+                                 "error": f"no anchor line in the {reference} "
+                                 "run's PBS log to place the kill points at"}
+            names.append(kill_set)
+            continue
+        offsets = list(KILL_OFFSETS)
+        count = points or (None if args.kill_points == "all"
+                           else int(args.kill_points))
+        if count is not None:
+            # a different pick for each set, the same for each seed
+            rng = random.Random(f"{args.seed}/{kill_set}")
+            if points:
+                offsets = sorted(rng.sample(offsets, count))
+            else:
+                offsets = sorted([0] + rng.sample(
                     [offset for offset in offsets if offset != 0],
-                    max(0, int(args.kill_points) - 1))
-                offsets = sorted([0] + picked)
-            for offset in offsets:
-                name = f"pbs_kill/{offset:+d}us"
-                runs[name] = ("pbskill", {"PBS_KILL_US": str(anchor + offset)},
-                              f"pbs_kill{offset:+d}")
-                rest.append(name)
-                names.append(name)
+                    max(0, count - 1)))
+        for offset in offsets:
+            name = f"{kill_set}/{offset:+d}us"
+            runs[name] = ("pbskill",
+                          dict(env, PBS_KILL_US=str(anchor + offset)),
+                          f"{kill_set}{offset:+d}")
+            rest.append(name)
+            names.append(name)
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
         for result in pool.map(one, rest):
             results[result["case"]] = result
@@ -297,6 +369,9 @@ def main() -> int:
                "seed": args.seed, "passed": not failed}
     print(json.dumps(summary), flush=True)
     (args.workdir / "result.json").write_text(json.dumps(ordered, indent=2))
+    # the template data directory is made again by the next run
+    for template in args.workdir.glob("template-*"):
+        shutil.rmtree(template, ignore_errors=True)
     return 0 if not failed else 1
 
 

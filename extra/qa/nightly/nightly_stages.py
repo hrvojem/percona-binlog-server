@@ -406,7 +406,7 @@ def harness_command(args, workdir: Path) -> list:
         # seed in a failing case's JSON line replays it exactly
         return script + base + mode + [
             "--shadow", str(args.shadow), "--seed", str(args.seed),
-            "--jobs", "4"]
+            "--jobs", "5"]
     raise SystemExit(f"unknown harness {args.harness}")
 
 

@@ -13,6 +13,7 @@ usage: check_binlog_timestamps.py <storage dir> [-v]
        check_binlog_timestamps.py --gtids <source datadir> <storage dir>
        check_binlog_timestamps.py --header-only <binlog>
        check_binlog_timestamps.py --rewritten <copy at the kill> <storage> [--encrypted]
+       check_binlog_timestamps.py --prefix <source datadir> <storage> [--gtid]
 exit 0 when every range is inside the file's events (or, with --gtids, the
 storage holds the source's GTIDs in order), 1 otherwise.
 """
@@ -98,6 +99,53 @@ def compare_gtids(source, storage):
     return 1
 
 
+def prefix(source, storage, gtid_mode):
+    """a writer that stopped early (the source purged what it needed) must
+    leave the start of the source's binlogs: every stored binlog equal to the
+    source's, the last one possibly cut short; in rewrite mode the first of
+    the source's transactions, in order"""
+    if gtid_mode:
+        want, got = gtids(source), gtids(storage)
+        if got == want[:len(got)]:
+            print(f"GTIDs: the storage holds the first {len(got)} of the source's "
+                  f"{len(want)} transactions, in order")
+            return 0
+        print(f"GTIDs DIFFER: the storage's {len(got)} transactions are not the start "
+              f"of the source's {len(want)}")
+        return 1
+    stored = sorted(n for n in os.listdir(storage) if re.fullmatch(r"binlog\.\d+", n))
+    names = sorted(n for n in os.listdir(source) if re.fullmatch(r"binlog\.\d+", n))
+    bad = 0
+    full = 0
+    if stored != names[:len(stored)]:
+        bad += 1
+        print(f"BAD the stored binlogs {stored[:3]}.. are not the first of the source's "
+              f"{names[:3]}..")
+    for i, name in enumerate(stored):
+        data = open(os.path.join(storage, name), "rb").read()
+        src_path = os.path.join(source, name)
+        if not os.path.exists(src_path):
+            continue
+        src = open(src_path, "rb").read()
+        last = i == len(stored) - 1
+        # byte 22 (index 21) is LOG_EVENT_BINLOG_IN_USE_F, cleared in PBS's copy
+        same = len(data) <= len(src) and all(
+            a == b for j, (a, b) in enumerate(zip(data, src)) if j != 21)
+        if len(data) == 4 and header_only(src_path) == 0:
+            full += 1
+        elif same and len(data) == len(src):
+            full += 1
+        elif same and last:
+            print(f"ok  {name}: the first {len(data)} of the source's {len(src)} bytes")
+        else:
+            bad += 1
+            print(f"BAD {name}: {len(data)} bytes, not {'a prefix of ' if last else ''}"
+                  f"the source's {len(src)}")
+    print(f"prefix: {full} binlogs equal to the source's, {len(stored) - full} cut short "
+          f"or different; {bad} problems")
+    return 1 if bad else 0
+
+
 def header_only(path):
     """0 when the binlog holds only FORMAT_DESCRIPTION / PREVIOUS_GTIDS
     events: PBS stores such a binlog as the magic alone until the first
@@ -156,6 +204,8 @@ def main():
         return compare_gtids(sys.argv[2], sys.argv[3])
     if sys.argv[1] == "--rewritten":
         return rewritten(sys.argv[2], sys.argv[3], "--encrypted" in sys.argv)
+    if sys.argv[1] == "--prefix":
+        return prefix(sys.argv[2], sys.argv[3], "--gtid" in sys.argv)
     if sys.argv[1] == "--header-only":
         return header_only(sys.argv[2])
     storage = sys.argv[1]

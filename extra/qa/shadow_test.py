@@ -70,7 +70,29 @@ summary):
                resuming from its relay log position;
   replica_lossy  2 % packet loss and 20 ms latency between pull and the
                replica;
-  replicas3    three replicas at once.
+  replicas3    three replicas at once;
+  pause_short, pause_long  pull reaches the source through a relay that
+               goes silent (the connection stays open, nothing arrives, no
+               RST: a network partition as the endpoints see it) for 10 s,
+               less than the read timeout, or for 120 s, through read
+               timeouts and reconnects;
+  pause_stop   SIGTERM to pull 30 s into the 120 s pause: it must exit 0
+               within 5 s;
+  replica_pause  the same relay between pull's listener and the replica,
+               silent for 40 s (the replica's net timeout is 10 s);
+  pause_purge_safe  during the 120 s pause the source purges the binlogs
+               before the one it wrote 2 s before the pause: pull must
+               resume and end with everything;
+  pause_purge_lost  the source purges up to its newest binlog, so what pull
+               still needs is gone: pull must exit with an error and leave
+               a valid prefix of the source's binlogs;
+  s3_basic     basic with an S3 storage (versitygw, posix backend, on its
+               own host);
+  s3_lossy     2 % packet loss and 20 ms latency between pull and the S3
+               server;
+  s3_pause     a relay between pull and the S3 server silent for 60 s;
+  s3_restart   the S3 server killed with SIGKILL at 40 s and started again
+               20 s later.
 
 Kill sets ('<set>/<offset>us', --kill-points of them per set, picked by
 the seed): pull killed with SIGKILL at a microsecond around an anchor line
@@ -87,7 +109,9 @@ what the kill left in the storage:
                            record (ticket 32, PBS-104: AES-CTR keystream
                            reuse);
   replica_pbs_kill         one kill at the rotation while a replica
-                           streams from pull: the replica must catch up.
+                           streams from pull: the replica must catch up;
+  s3_pbs_kill, enc_s3_pbs_kill  the first rotation on an S3 storage (the
+                           s3_basic run), plain and encrypted.
 
 GTID mode is rewrite mode, where PBS writes its own binlogs: there the
 storage is compared with the source by its GTIDs instead of byte by byte.
@@ -129,6 +153,20 @@ CASES = {
     "replica_lossy": ("replica", {"REPLICA_LOSS": "0.02",
                                   "REPLICA_LATENCY": "20 ms"}),
     "replicas3": ("replica", {"REPLICAS": "3"}),
+    # a relay between pull and the source that goes silent (pause_relay.py)
+    "pause_short": ("basic", {"PAUSE": "40-50"}),
+    "pause_long": ("basic", {"PAUSE": "40-160"}),
+    "pause_stop": ("stop", {"PAUSE": "40-160", "PBS_TERM_AT": "70"}),
+    "replica_pause": ("replica", {"REPLICA_PAUSE": "60-100"}),
+    # the source purges binlogs while pull cannot reach it
+    "pause_purge_safe": ("basic", {"PAUSE": "40-160", "PURGE": "safe"}),
+    "pause_purge_lost": ("basic", {"PAUSE": "40-160", "PURGE": "lost"}),
+    # an S3 storage on its own host
+    "s3_basic": ("basic", {"S3": "1"}),
+    "s3_lossy": ("basic", {"S3": "1", "S3_LOSS": "0.02",
+                           "S3_LATENCY": "20 ms"}),
+    "s3_pause": ("basic", {"S3": "1", "S3_PAUSE": "40-100"}),
+    "s3_restart": ("basic", {"S3": "1", "S3_KILL_AT": "40"}),
 }
 
 # kill sets: pull killed with SIGKILL at microseconds around an anchor, a
@@ -158,6 +196,10 @@ KILL_SETS = {
                                 None),
     # a replica streaming from pull while pull is killed
     "replica_pbs_kill": ("basic", ROTATION, 1, {"WITH_REPLICA": "1"}, 1),
+    # an S3 storage: the anchor from the s3_basic run
+    "s3_pbs_kill": ("s3_basic", ROTATION, 1, {"S3": "1"}, None),
+    "enc_s3_pbs_kill": ("s3_basic", ROTATION, 1, {"S3": "1", "ENCRYPT": "1"},
+                        None),
 }
 KILL_OFFSETS = range(-20, 41)
 
@@ -234,7 +276,7 @@ def run_scenario(args, name: str, scenario: str, extra: dict,
         problems = [line.strip() for line in output.splitlines()
                     if re.search(r"differs:|missing in storage|^\s*BAD |"
                                  r"GTIDs DIFFER|expected end state|"
-                                 r"Last_(IO|SQL)_Error: .|^-- stop:", line)]
+                                 r"Last_(IO|SQL)_Error: .|^-- stop:|^-- pull after", line)]
         # an assertion or other last words of PBS
         for stderr in (args.workdir / run_name / "shadow.data" / "hosts" /
                        "pbs").glob("*.stderr"):

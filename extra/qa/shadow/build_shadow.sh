@@ -2,7 +2,8 @@
 # Builds Shadow 3.3.0 with shadow-mysql.patch into <dir>/install (default
 # ~/ws/shadow), without root: rustup, the glib headers and networkx go into
 # <dir> as well. Needs git, curl, python3, pkg-config, cmake, a C compiler
-# and libclang (LIBCLANG_PATH, default /usr/lib/llvm-20/lib).
+# and libclang (LIBCLANG_PATH, default /usr/lib/llvm-20/lib); Go (GO) for
+# versitygw, the S3 cases' server, built into <dir>/install/bin as well.
 #
 # usage: build_shadow.sh [dir]
 set -euo pipefail
@@ -37,3 +38,12 @@ export LIBCLANG_PATH=${LIBCLANG_PATH:-/usr/lib/llvm-20/lib} PYTHONPATH=$S/py
 ./setup build --prefix "$S/install" -j "$(nproc)"
 ./setup install
 "$S/install/bin/shadow" --version
+# the S3 server of the S3 cases: Shadow runs only dynamically linked
+# binaries, and the release builds of Go programs are static
+echo "== versitygw"
+if [ ! -x "$S/install/bin/versitygw" ]; then
+  GO=${GO:-$(command -v go || echo "$HOME/sdk/go/bin/go")}
+  GOPATH=$S/gopath CGO_ENABLED=1 "$GO" install -ldflags=-linkmode=external \
+    github.com/versity/versitygw/cmd/versitygw@v1.8.0
+  cp "$S/gopath/bin/versitygw" "$S/install/bin/versitygw"
+fi

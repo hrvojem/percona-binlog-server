@@ -59,6 +59,25 @@
 #                   compared with what is written there after the restart
 #                   (ticket 32, PBS-104)
 #   KILL_BASE=restart  pbskill on the restart scenario's source
+#   PAUSE=<start>-<end>[,...]  pull reaches the source through a relay
+#                   (pause_relay.py, host 'relay') that goes silent during
+#                   these windows of simulated seconds: the connection stays
+#                   open, nothing arrives, no RST
+#   REPLICA_PAUSE=<start>-<end>[,...]  the same between the replicas and
+#                   pull's listener (host 'rrelay')
+#   PURGE=safe|lost  with PAUSE: during the first window the source runs
+#                   FLUSH BINARY LOGS and PURGE BINARY LOGS TO the binlog it
+#                   wrote 2 s before the window (safe: pull has everything
+#                   before it) or to the newest one (lost: what pull still
+#                   needs is gone; it must exit with an error and leave a
+#                   valid prefix of the source's binlogs)
+#   S3=1            an S3 storage: versitygw (VERSITYGW, posix backend) on
+#                   host 's3', its bucket directory is what gets compared
+#   S3_LOSS / S3_LATENCY  the link between pull and the S3 server
+#   S3_PAUSE=<start>-<end>[,...]  a relay between pull and the S3 server
+#                   (host 's3relay') silent during these windows
+#   S3_KILL_AT=<s>  the S3 server killed (SIGKILL) then, started again
+#                   S3_DOWN (default 20) seconds later
 # env: SEED (default 1), MODE (position|gtid, default position),
 #      STOP (simulated seconds, default by scenario), WALL (default 1500),
 #      PBS (binary), LOSS / LATENCY (any scenario), KILL_AT (crash),
@@ -91,6 +110,23 @@ ENCRYPT=${ENCRYPT:-}
 KILL_BASE=${KILL_BASE:-basic}
 CRON_HOURS=${CRON_HOURS:-3}
 BANDWIDTH=${BANDWIDTH:-1 Gbit}
+PAUSE=${PAUSE:-}
+REPLICA_PAUSE=${REPLICA_PAUSE:-}
+PURGE=${PURGE:-}
+S3=${S3:-}
+S3_LOSS=${S3_LOSS:-0}
+S3_LATENCY=${S3_LATENCY:-1 ms}
+S3_PAUSE=${S3_PAUSE:-}
+S3_KILL_AT=${S3_KILL_AT:-}
+S3_DOWN=${S3_DOWN:-20}
+# dynamically linked: Shadow runs no static binaries (README.md)
+VERSITYGW=${VERSITYGW:-$(dirname "$SHADOW")/versitygw}
+if [ -n "$PURGE" ] && [ -z "$PAUSE" ]; then echo "PURGE needs PAUSE"; exit 2; fi
+if [ -n "$S3" ] && [ ! -x "$VERSITYGW" ]; then
+  echo "S3 needs a dynamically linked versitygw at $VERSITYGW (build_shadow.sh)"; exit 2
+fi
+# the end of the last window of a list of windows
+windows_end() { tr ',' '\n' <<< "$1" | awk -F- '$2 + 0 > m {m = $2 + 0} END {printf "%d\n", m + 0.999}'; }
 REPLICA=""
 case $SCENARIO in
   replica|replica_early|heartbeat) REPLICA=$SCENARIO ;;
@@ -128,6 +164,10 @@ case $SCENARIO in
   pbskill|replica|replica_early|heartbeat|stop|slow|cron) ;;
   *) echo "unknown scenario $SCENARIO"; exit 2 ;;
 esac
+# a pause (or the S3 server's absence) delays everything by its length; pull
+# then needs up to a read timeout (60 s) and a reconnect to catch up
+last_window=$(windows_end "$PAUSE,$REPLICA_PAUSE,$S3_PAUSE,0-${S3_KILL_AT:+$((S3_KILL_AT + S3_DOWN))}")
+[ "$last_window" -gt 0 ] && [ "$STOP" -lt $((last_window + 100)) ] && STOP=$((last_window + 100))
 if [ "$SCENARIO" = pbskill ] && [ -z "${PBS_KILL_US:-}" ]; then
   echo "pbskill needs PBS_KILL_US"; exit 2
 fi
@@ -174,11 +214,29 @@ KEYS
   KEYRING_JSON="\"keyring\": {\"uri\": \"file://$E/keyring.json\"},"
   ENCRYPTION_JSON=", \"encryption\": {\"format\": \"generic\", \"kek_id\": \"shadow\", \"cipher\": \"AES-256-CTR\"}"
 fi
+# pull reaches the source, and the S3 server, directly or through a relay
+SOURCE_HOST=db
+[ -n "$PAUSE" ] && SOURCE_HOST=relay
+# STORE: the directory the checks read, the file storage or the S3 bucket's
+# directory on the S3 server's posix backend
+if [ -n "$S3" ]; then
+  mkdir -p "$E/s3data/pbs" "$E/s3meta"
+  S3_HOST=s3
+  [ -n "$S3_PAUSE" ] && S3_HOST=s3relay
+  STORAGE_URI="http://shadowkey:shadowsecret@$S3_HOST:9000/pbs/vault"
+  STORE=$E/s3data/pbs/vault
+  # its own buffer directory: runs side by side share the real /tmp
+  S3_JSON=", \"fs_buffer_directory\": \"$E/s3buf\""
+else
+  STORAGE_URI="file://$E/storage"
+  STORE=$E/storage
+  S3_JSON=""
+fi
 cat > "$E/binsrv.json" <<JSON
 {
   "instance": {"local_settings_path": "$E/local_settings"},
   "logger": {"level": "debug", "file": "$E/binsrv.log"},
-  "connection": {"host": "db", "port": 3306, "user": "rpl", "password": "",
+  "connection": {"host": "$SOURCE_HOST", "port": 3306, "user": "rpl", "password": "",
                  "connect_timeout": 20, "read_timeout": 60, "write_timeout": 60},
   "replication": {"server_id": 4242, "idle_time": 1, "verify_checksum": true,
                   $REWRITE
@@ -191,7 +249,7 @@ cat > "$E/binsrv.json" <<JSON
                  "authentication": {"user": "repl", "password": "replpass",
                                     "plugin": "caching_sha2_password"}},
   $KEYRING_JSON
-  "storage": {"backend": "file", "uri": "file://$E/storage", "checkpoint_interval": "1s"$ENCRYPTION_JSON},
+  "storage": {"backend": "$([ -n "$S3" ] && echo s3 || echo file)", "uri": "$STORAGE_URI", "checkpoint_interval": "1s"$S3_JSON$ENCRYPTION_JSON},
   "telemetry": {"path": "$E/telemetry"}
 }
 JSON
@@ -245,6 +303,38 @@ echo "workload2 done"
 \$M -e "SELECT COUNT(*) FROM w.t; SHOW BINARY LOGS"
 SH
 chmod +x "$E/workload2.sh"
+# PURGE: started 2 s before the first pause window, purges in its middle.
+# The purged binlogs are copied first (the hosts share the real file
+# system), so the checks can compare the storage with them.
+PAUSE_START=$(cut -d, -f1 <<< "$PAUSE" | cut -d- -f1)
+PAUSE_END=$(cut -d, -f1 <<< "$PAUSE" | cut -d- -f2)
+if [ -n "$PURGE" ]; then
+  cat > "$E/purge.sh" <<SH
+#!/bin/bash
+set -e
+M="$M"
+# the binlog the source writes now: pull has everything before it
+current=\$(\$M -N -e "SHOW BINARY LOGS" | tail -1 | cut -f1)
+sleep $(awk -v s="$PAUSE_START" -v e="$PAUSE_END" 'BEGIN {printf "%d", 2 + (e - s) / 2}')
+\$M -e "FLUSH BINARY LOGS"
+newest=\$(\$M -N -e "SHOW BINARY LOGS" | tail -1 | cut -f1)
+target=\$([ "$PURGE" = safe ] && echo "\$current" || echo "\$newest")
+mkdir -p "$E/purged"
+for f in \$(\$M -N -e "SHOW BINARY LOGS" | cut -f1); do
+  [ "\$f" = "\$target" ] && break
+  cp "$E/data/\$f" "$E/purged/"
+done
+\$M -e "PURGE BINARY LOGS TO '\$target'"
+echo "purged to \$target (the source wrote \$current 2 s before the pause): \$(ls "$E/purged" | tr '\\n' ' ')" | tee "$E/purge.txt"
+SH
+  chmod +x "$E/purge.sh"
+  PURGE_PROCESS="    - path: /bin/bash
+      args: [\"$E/purge.sh\"]
+      start_time: $(awk -v s="$PAUSE_START" 'BEGIN {printf "%d", s - 2}')s
+      expected_final_state: {exited: 0}"
+else
+  PURGE_PROCESS=""
+fi
 # the replicas: configured at REPLICA_AT, checked from CHECK_AT on
 RHOSTS="replica"
 for i in $(seq 2 "$REPLICAS"); do RHOSTS="$RHOSTS replica$i"; done
@@ -258,6 +348,9 @@ fi
 # after pull's reconnect at the read timeout (60 s after the last event): in
 # GTID mode only that writes the last transaction (ticket 94)
 CHECK_AT=${CHECK_AT:-150}
+# the replicas reach pull's listener directly or through a relay
+LISTENER_HOST=pbs
+[ -n "$REPLICA_PAUSE" ] && LISTENER_HOST=rrelay
 cat > "$E/replica_setup.sh" <<SH
 #!/bin/bash
 for h in $RHOSTS; do
@@ -265,7 +358,7 @@ for h in $RHOSTS; do
   # the replica's mysqld may still be starting
   until \$RM -e "SELECT 1" >/dev/null 2>&1; do sleep 0.2; done
   \$RM -e "SET PERSIST replica_net_timeout = 10;
-    CHANGE REPLICATION SOURCE TO SOURCE_HOST='pbs', SOURCE_PORT=3307,
+    CHANGE REPLICATION SOURCE TO SOURCE_HOST='$LISTENER_HOST', SOURCE_PORT=3307,
       SOURCE_USER='repl', SOURCE_PASSWORD='replpass', GET_SOURCE_PUBLIC_KEY=1,
       SOURCE_SSL=0, SOURCE_CONNECT_RETRY=1, SOURCE_RETRY_COUNT=1000,
       SOURCE_HEARTBEAT_PERIOD=1, $START_OPTIONS;
@@ -398,7 +491,20 @@ fi
 PBS_PROCESS="    - path: $PBS
       args: [\"pull\", \"$E/binsrv.json\"]
       environment: { AWS_EC2_METADATA_DISABLED: \"true\" }"
-if [ "$SCENARIO" = pbskill ]; then
+if [ "$PURGE" = lost ]; then
+  # pull must exit, with an error: a wrapper records how and when
+  cat > "$E/pull_wrap.sh" <<SH
+#!/bin/bash
+export AWS_EC2_METADATA_DISABLED=true
+"$PBS" pull "$E/binsrv.json"
+rc=\$?
+echo "pull exit \$rc at \$(( \$(date +%s) - 946684800 )) s" > "$E/pull_exit.txt"
+SH
+  PBS_PROCESSES="    - path: /bin/bash
+      args: [\"$E/pull_wrap.sh\"]
+      start_time: 10s
+      expected_final_state: {exited: 0}"
+elif [ "$SCENARIO" = pbskill ]; then
   PBS_PROCESSES="$PBS_PROCESS
       start_time: 10s
       shutdown_time: $PBS_KILL_US us
@@ -414,8 +520,8 @@ $PBS_PROCESS
   # what the killed pull left in the storage, before the restart repairs it
   cat > "$E/kill_snapshot.sh" <<SH
 #!/bin/bash
-cd "$E/storage" || exit 0
-cp -a "$E/storage" "$E/kill_copy"
+cd "$STORE" || exit 0
+cp -a "$STORE" "$E/kill_copy"
 for f in \$(ls | sort); do echo "\$f \$(stat -c %s "\$f")"; done > "$E/kill_snapshot.txt"
 echo "index: \$(tr '\\n' ' ' < binlog.index 2>/dev/null)" >> "$E/kill_snapshot.txt"
 SH
@@ -504,6 +610,50 @@ $procs
       start_time: ${CHECK_AT}s
       expected_final_state: {exited: 0}"
 fi
+# relays (pause_relay.py) and the S3 server, each on a host of its own
+EXTRA_HOSTS=""
+relay_host() {  # <host> <network node> <listen port> <server> <port> <windows>
+  EXTRA_HOSTS+="  $1:
+    network_node_id: $2
+    processes:
+    - path: /usr/bin/python3
+      args: [\"$HERE/pause_relay.py\", \"$3\", \"$4\", \"$5\", \"$6\"]
+      start_time: 1s
+      expected_final_state: running
+"
+}
+[ -n "$PAUSE" ] && relay_host relay 0 3306 db 3306 "$PAUSE"
+[ -n "$REPLICA_PAUSE" ] && relay_host rrelay 2 3307 pbs 3307 "$REPLICA_PAUSE"
+[ -n "$S3_PAUSE" ] && relay_host s3relay 0 9000 s3 9000 "$S3_PAUSE"
+if [ -n "$S3" ]; then
+  # --disableotmp: an object is published with linkat() through
+  # /proc/self/fd otherwise, which under Shadow names the native process's
+  # descriptors, not the simulated ones (ENOENT, retried forever); the
+  # sidecar directory keeps the metadata out of extended attributes
+  s3_process="    - path: $VERSITYGW
+      args: [\"--access\", \"shadowkey\", \"--secret\", \"shadowsecret\",
+             \"--port\", \"0.0.0.0:9000\", \"posix\", \"--disableotmp\",
+             \"--sidecar\", \"$E/s3meta\", \"$E/s3data\"]"
+  if [ -n "$S3_KILL_AT" ]; then
+    S3_PROCESSES="$s3_process
+      start_time: 1s
+      shutdown_time: ${S3_KILL_AT}s
+      shutdown_signal: SIGKILL
+      expected_final_state: {signaled: SIGKILL}
+$s3_process
+      start_time: $((S3_KILL_AT + S3_DOWN))s
+      expected_final_state: running"
+  else
+    S3_PROCESSES="$s3_process
+      start_time: 1s
+      expected_final_state: running"
+  fi
+  EXTRA_HOSTS+="  s3:
+    network_node_id: 3
+    processes:
+$S3_PROCESSES
+"
+fi
 
 cat > "$E/shadow.yaml" <<YAML
 general:
@@ -570,6 +720,35 @@ network:
           latency "$LATENCY"
           packet_loss $(LC_ALL=C printf %.4f "$LOSS")
         ]
+        node [
+          id 3
+          host_bandwidth_down "1 Gbit"
+          host_bandwidth_up "1 Gbit"
+        ]
+        edge [
+          source 3
+          target 3
+          latency "1 ms"
+          packet_loss 0.0
+        ]
+        edge [
+          source 0
+          target 3
+          latency "$S3_LATENCY"
+          packet_loss $(LC_ALL=C printf %.4f "$S3_LOSS")
+        ]
+        edge [
+          source 1
+          target 3
+          latency "1 ms"
+          packet_loss 0.0
+        ]
+        edge [
+          source 2
+          target 3
+          latency "1 ms"
+          packet_loss 0.0
+        ]
       ]
 hosts:
   db:
@@ -581,6 +760,7 @@ $DB_PROCESSES
     processes:
 $PBS_PROCESSES
 $REPLICA_HOST
+$EXTRA_HOSTS
   client:
     network_node_id: 0
     processes:
@@ -590,6 +770,7 @@ $REPLICA_HOST
       expected_final_state: {exited: 0}
 $SHUTDOWN_PROCESS
 $REPLICA_CLIENTS
+$PURGE_PROCESS
 YAML
 
 cd "$E"
@@ -605,40 +786,53 @@ echo "-- PBS log lines: $(wc -l < "$E/binsrv.log" 2>/dev/null)"
 echo "-- shadow: unsupported syscalls / process states:"
 grep -E "unsupported syscall|final state|panic" "$E/shadow.log" | sed -E 's/.*\] //' | sort -u | head -15 | cut -c1-200
 ok=0; bad=0
+# the purged binlogs, copied before the purge, count as the source's
+if [ -n "$PURGE" ]; then
+  echo "-- purge: $(cat "$E/purge.txt" 2>/dev/null || echo "no purge.txt")"
+  cp "$E"/purged/binlog.[0-9]* "$E/data/" 2>/dev/null
+fi
 if [ -n "$ENCRYPT" ]; then
   echo "-- storage vs source: encrypted, checked through the replica instead"
+elif [ "$PURGE" = lost ] || { [ "$SCENARIO" = stop ] && [ -n "$PAUSE" ]; }; then
+  # pull stopped where the purge left it, or was stopped during the pause:
+  # what it stored must be the start of the source's binlogs, the last one
+  # possibly cut short
+  echo "-- storage vs source, a prefix of it:"
+  python3 "$HERE/check_binlog_timestamps.py" --prefix "$E/data" "$STORE" \
+    $([ "$MODE" = gtid ] && echo --gtid) | sed 's/^/  /'
+  [ "${PIPESTATUS[0]}" = 0 ] || bad=1
 elif [ "$MODE" = gtid ]; then
   # GTID mode is rewrite mode: PBS's binlogs are its own files, so only the
   # transactions can be compared
   echo "-- storage vs source transactions:"
-  python3 "$HERE/check_binlog_timestamps.py" --gtids "$E/data" "$E/storage" | sed 's/^/  /'
+  python3 "$HERE/check_binlog_timestamps.py" --gtids "$E/data" "$STORE" | sed 's/^/  /'
   [ "${PIPESTATUS[0]}" = 0 ] || bad=1
 else
 echo "-- storage vs source binlogs:"
 pending=0
 for f in "$E"/data/binlog.[0-9]*; do
   n=$(basename "$f")
-  if [ ! -e "$E/storage/$n" ]; then echo "  missing in storage: $n"; bad=$((bad + 1)); continue; fi
+  if [ ! -e "$STORE/$n" ]; then echo "  missing in storage: $n"; bad=$((bad + 1)); continue; fi
   # a source binlog without transactions yet (only FORMAT_DESCRIPTION and
   # PREVIOUS_GTIDS): PBS keeps those events back until the first transaction
   # and stores the magic alone, by design (ticket 40 describes it)
-  if [ "$(stat -c %s "$E/storage/$n")" = 4 ] &&
+  if [ "$(stat -c %s "$STORE/$n")" = 4 ] &&
       python3 "$HERE/check_binlog_timestamps.py" --header-only "$f"; then
     pending=$((pending + 1)); continue
   fi
   # byte 22 is the format description event's LOG_EVENT_BINLOG_IN_USE_F
   # flag, set in the source's open file and cleared in PBS's copy
-  if cmp -s "$f" "$E/storage/$n" || [ "$(cmp -l "$f" "$E/storage/$n" 2>/dev/null | awk '$1 != 22' | wc -l)" = 0 -a \
-       "$(stat -c %s "$f")" = "$(stat -c %s "$E/storage/$n")" ]; then ok=$((ok + 1)); else
-    echo "  differs: $n (source $(stat -c %s "$f"), storage $(stat -c %s "$E/storage/$n"))"; bad=$((bad + 1)); fi
+  if cmp -s "$f" "$STORE/$n" || [ "$(cmp -l "$f" "$STORE/$n" 2>/dev/null | awk '$1 != 22' | wc -l)" = 0 -a \
+       "$(stat -c %s "$f")" = "$(stat -c %s "$STORE/$n")" ]; then ok=$((ok + 1)); else
+    echo "  differs: $n (source $(stat -c %s "$f"), storage $(stat -c %s "$STORE/$n"))"; bad=$((bad + 1)); fi
 done
 echo "  identical: $ok, without transactions yet (magic only in storage): $pending, missing or different: $bad"
 fi
-ls "$E/storage" | head -30 | tr '\n' ' '; echo
+ls "$STORE" | head -30 | tr '\n' ' '; echo
 ts_code=0
 if [ -z "$ENCRYPT" ]; then
   echo "-- recorded timestamp ranges (ticket 6, PBS-72):"
-  python3 "$HERE/check_binlog_timestamps.py" "$E/storage" | sed 's/^/  /'
+  python3 "$HERE/check_binlog_timestamps.py" "$STORE" | sed 's/^/  /'
   ts_code=${PIPESTATUS[0]}
 fi
 verdict=PASS
@@ -677,7 +871,7 @@ if [ "$SCENARIO" = pbskill ]; then
   sed 's/^/  /' "$E/kill_snapshot.txt" 2>/dev/null
   echo "-- kill snapshot hash: $(sha256sum < "$E/kill_snapshot.txt" 2>/dev/null | cut -c1-16)"
   echo "-- bytes left unrecorded by the kill, written again (ticket 32, PBS-104):"
-  python3 "$HERE/check_binlog_timestamps.py" --rewritten "$E/kill_copy" "$E/storage" \
+  python3 "$HERE/check_binlog_timestamps.py" --rewritten "$E/kill_copy" "$STORE" \
     ${ENCRYPT:+--encrypted} | sed 's/^/  /'
   if [ "${PIPESTATUS[0]}" != 0 ]; then
     verdict=FAIL; extra="$extra, keystream reused: FAIL"
@@ -700,6 +894,30 @@ if [ "$SCENARIO" = cron ]; then
   extra=", fetch runs $runs, failed outside restarts $failed_bad, last exit ${last_rc:-none}: $cron_ok"
   [ "$cron_ok" = ok ] || verdict=FAIL
 fi
+if [ "$PURGE" = lost ]; then
+  # pull must exit with an error once it finds the source purged what it
+  # needs (ER 1236), not retry it forever
+  pull_exit=$(cat "$E/pull_exit.txt" 2>/dev/null)
+  echo "-- pull after the purge: ${pull_exit:-still running at the end}"
+  echo "   its last error: $(grep -iE '\[ *(error|fatal)\]' "$E/binsrv.log" | tail -1 | cut -c1-260)"
+  rc=$(awk '{print $3}' <<< "$pull_exit")
+  purge_ok=$([ -n "$rc" ] && [ "$rc" != 0 ] && echo ok || echo FAIL)
+  extra="$extra, pull exit ${rc:-none} after the purge: $purge_ok"
+  [ "$purge_ok" = ok ] || verdict=FAIL
+fi
+if [ -n "$PAUSE$REPLICA_PAUSE$S3_PAUSE" ]; then
+  echo "-- relays:"
+  for h in relay rrelay s3relay; do
+    [ -d "$E/shadow.data/hosts/$h" ] || continue
+    echo "  $h: $(cat "$E"/shadow.data/hosts/$h/*.stdout | grep -c accepted) connections"
+    grep -E "pause window|cannot" "$E"/shadow.data/hosts/$h/*.stdout | head -4 | sed 's/^/    /'
+  done
+  echo "-- pull connections to the source: $(grep -c 'established connection to mysql' "$E/binsrv.log" 2>/dev/null)"
+fi
+if [ -n "$S3" ]; then
+  echo "-- S3 server stderr (last 3):"
+  cat "$E"/shadow.data/hosts/s3/*.stderr 2>/dev/null | tail -3 | cut -c1-200 | sed 's/^/  /'
+fi
 if [ "$SCENARIO" = stop ]; then
   # the last line pull logs, against the SIGTERM at PBS_TERM_AT
   last=$(tail -1 "$E/binsrv.log" | sed -E 's/^\[2000-01-01T([0-9:.]+)\].*/\1/')
@@ -714,12 +932,12 @@ echo "-- verdict: $verdict (shadow exit $code, storage mismatches $bad, timestam
 # times jitter by microseconds between runs (README.md), so the bytes and
 # log times may differ, but not the binlogs, their sizes, the transactions
 # PBS received, how each process ended or the verdict
-outcome=$( (cd "$E/storage" 2>/dev/null && for f in $(ls | grep -E '^binlog\.[0-9]+$'); do echo "$f $(stat -c %s "$f")"; done)
+outcome=$( (cd "$STORE" 2>/dev/null && for f in $(ls | grep -E '^binlog\.[0-9]+$'); do echo "$f $(stat -c %s "$f")"; done)
   echo "transactions $(grep -c end_of_transaction "$E/binsrv.log" 2>/dev/null)"
   grep -E "expected end state" "$E/shadow.log" | sed -E 's/.*Error: //' | sort -u
   echo "$verdict $code $bad $ts_code$extra")
 echo "-- outcome hash: $(echo "$outcome" | sha256sum | cut -c1-16)"
-echo "-- storage hash: $(cd "$E/storage" && cat $(ls | grep -E '^binlog\.[0-9]+$') 2>/dev/null | sha256sum | cut -c1-16)"
+echo "-- storage hash: $(cd "$STORE" && cat $(ls | grep -E '^binlog\.[0-9]+$') 2>/dev/null | sha256sum | cut -c1-16)"
 echo "-- PBS log hash, paths removed (determinism check): $(sed "s|$E||g" "$E/binsrv.log" | sha256sum | cut -c1-16)"
 echo "-- mysqld error log hash, paths removed: $(sed "s|$E||g" "$E/db.err" | sha256sum | cut -c1-16)"
 # the data directories of the source and the replicas are most of a run's

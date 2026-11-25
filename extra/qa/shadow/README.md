@@ -14,7 +14,8 @@ What it gives over the harnesses on real hosts:
 * a kill, a restart or a packet drop happens at a simulated instant, the
   same in every run with the same seed;
 * packet loss, latency and bandwidth between hosts come from the network
-  graph, no proxy needed.
+  graph, no proxy needed; a link that goes silent comes from a relay host
+  (`pause_relay.py`).
 
 ## Files
 
@@ -46,6 +47,31 @@ What it gives over the harnesses on real hosts:
   `mtr/binlog_streaming/std_data`), `STRACE=standard` (Shadow's syscall log
   per process: it shows each file operation of a rotation with its
   simulated time, which is how the kill points were placed).
+  Faults between hosts: `PAUSE`, `REPLICA_PAUSE`, `S3_PAUSE` (windows of
+  simulated seconds such as `40-160`), `PURGE=safe|lost` (with `PAUSE`),
+  `S3=1` with `S3_LOSS` / `S3_LATENCY` and `S3_KILL_AT` / `S3_DOWN`.
+* `pause_relay.py`: a TCP relay on a host of its own (`relay` between `pull`
+  and the source, `rrelay` between the replicas and the listener, `s3relay`
+  between `pull` and the S3 server) that forwards nothing during its pause
+  windows and closes nothing: no RST, no FIN, new connections accepted but
+  held. Shadow's network graph cannot change during a run, so this is how a
+  partition is made.
+* `PURGE`: a client on the `client` host notes the source's current binlog
+  2 s before the first pause window, then in the middle of it runs `FLUSH
+  BINARY LOGS` and `PURGE BINARY LOGS TO` that binlog (`safe`) or to the
+  newest one (`lost`), copying the purged files to `purged/` first so the
+  checks can compare with them. With `lost`, `pull` runs under a wrapper that
+  records its exit code (`pull_exit.txt`), and the storage must be a prefix
+  of the source (`check_binlog_timestamps.py --prefix`).
+* `S3=1`: versitygw 1.8.0 (posix backend) on the host `s3`. Its bucket
+  directory holds the objects as plain files, so the same checks read it.
+  Shadow runs only dynamically linked binaries, and the release builds of
+  Go programs are static, so `build_shadow.sh` builds versitygw with
+  `-linkmode=external` into `install/bin` (`VERSITYGW` overrides it). It
+  runs with `--disableotmp`: otherwise it publishes an object with
+  `linkat()` through `/proc/self/fd`, which under Shadow names the native
+  process's descriptors, and retries the ENOENT forever (the AWS client then
+  gives up: "failure to meet throughput minimum").
 * A replica is a fourth host running a second `mysqld` (its own server
   UUID); bash clients configure it (`CHANGE REPLICATION SOURCE TO` the
   `pbs` host, `GET_SOURCE_PUBLIC_KEY=1`) and query it at 150 s.
@@ -59,7 +85,10 @@ What it gives over the harnesses on real hosts:
   mode is rewrite mode, whose binlogs are PBS's own files); with
   `--rewritten <copy> <storage> --encrypted`, the bytes a killed `pull`
   left past each recorded size must not be written again differently
-  under the same encryption record (ticket 32, AES-CTR keystream reuse).
+  under the same encryption record (ticket 32, AES-CTR keystream reuse);
+  with `--prefix <source> <storage> [--gtid]`, the storage must be the start
+  of the source's binlogs (or transactions), the last one possibly cut
+  short.
 * The Shadow changes are also on the fork `hrvojem/shadow`: branch
   `mysql-support-v3.3.0` (this patch on v3.3.0, one commit) and branch
   `mysql-support` (the same changes on shadow's main as five commits,
@@ -67,7 +96,8 @@ What it gives over the harnesses on real hosts:
 * Simulated hosts share the real file system: every run has its own
   directory, the replicas a fixed server UUID and their own `tmpdir` (a
   UUID generated inside the simulation is the same in every run, and
-  concurrent replicas collided on `/tmp/SQL_LOAD-<uuid>`).
+  concurrent replicas collided on `/tmp/SQL_LOAD-<uuid>`), an S3 storage
+  its own `fs_buffer_directory`.
 
 ## How `mysqld` runs under Shadow
 

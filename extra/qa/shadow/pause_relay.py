@@ -11,6 +11,8 @@ greeting. That is a network partition as an endpoint sees it, which Shadow
 cannot model otherwise (its network graph does not change during a run).
 
 usage: pause_relay.py <listen port> <server host> <server port> <windows>
+  server host: a host name, or @<file>: the host named in that file, read
+           again for every new connection (a failover moves it)
   windows: <start>-<end>[,<start>-<end>...] in seconds of simulated time
            since the simulation started (Shadow's clock starts at
            2000-01-01 00:00:00 UTC)
@@ -78,6 +80,9 @@ def pump(src, dst, label):
 def serve(client, peer, host, port, number):
     # a connection accepted during a window is held until the window ends
     wait_open()
+    if host.startswith("@"):
+        with open(host[1:]) as f:
+            host = f.read().strip()
     try:
         server = socket.create_connection((host, port))
     except OSError as error:

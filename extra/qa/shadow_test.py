@@ -92,7 +92,22 @@ summary):
                server;
   s3_pause     a relay between pull and the S3 server silent for 60 s;
   s3_restart   the S3 server killed with SIGKILL at 40 s and started again
-               20 s later.
+               20 s later;
+  failover     a planned switchover at 45 s to db2, a GTID replica of the
+               source: the source read-only, db2 caught up and promoted,
+               the relay in front of pull pointed at db2, the source shut
+               down; in GTID mode the storage must hold the source's
+               transactions and then db2's, each once; in position mode
+               (db2's binlogs are other files) a prefix of the source's
+               binlogs, whatever pull does;
+  failover_overlap  the same, with db2's binlogs rotated twice first so
+               they carry the names of the source's: in position mode pull
+               then asks db2 for an offset in another file;
+  soak         6 simulated hours of inserts every 10 s (about 300
+               rotations): pull's memory (RSS of its native process),
+               threads and files open in the storage, sampled from outside,
+               must not grow from the second hour to the last;
+  soak_s3      the same on an S3 storage.
 
 Kill sets ('<set>/<offset>us', --kill-points of them per set, picked by
 the seed): pull killed with SIGKILL at a microsecond around an anchor line
@@ -167,6 +182,12 @@ CASES = {
                            "S3_LATENCY": "20 ms"}),
     "s3_pause": ("basic", {"S3": "1", "S3_PAUSE": "40-100"}),
     "s3_restart": ("basic", {"S3": "1", "S3_KILL_AT": "40"}),
+    # a planned switchover to a promoted GTID replica of the source
+    "failover": ("basic", {"FAILOVER": "45"}),
+    "failover_overlap": ("basic", {"FAILOVER": "45", "DB2_FLUSHES": "2"}),
+    # 6 simulated hours: about 22 minutes alone
+    "soak": ("soak", {"SOAK_HOURS": "6", "WALL": "4800"}),
+    "soak_s3": ("soak", {"SOAK_HOURS": "6", "S3": "1", "WALL": "4800"}),
 }
 
 # kill sets: pull killed with SIGKILL at microseconds around an anchor, a
@@ -384,6 +405,10 @@ def main() -> int:
                           f"{kill_set}{offset:+d}")
             rest.append(name)
             names.append(name)
+    # the long cases (a WALL of their own) first, so they do not stretch the
+    # end of the stage
+    rest.sort(key=lambda name: -int(CASES.get(name, ("", {}))[1].get(
+        "WALL", 0)))
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
         for result in pool.map(one, rest):
             results[result["case"]] = result

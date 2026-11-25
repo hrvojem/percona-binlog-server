@@ -14,6 +14,7 @@ usage: check_binlog_timestamps.py <storage dir> [-v]
        check_binlog_timestamps.py --header-only <binlog>
        check_binlog_timestamps.py --rewritten <copy at the kill> <storage> [--encrypted]
        check_binlog_timestamps.py --prefix <source datadir> <storage> [--gtid]
+       check_binlog_timestamps.py --failover <old source> <new source> <storage>
 exit 0 when every range is inside the file's events (or, with --gtids, the
 storage holds the source's GTIDs in order), 1 otherwise.
 """
@@ -146,6 +147,28 @@ def prefix(source, storage, gtid_mode):
     return 1 if bad else 0
 
 
+def failover(old, new, storage):
+    """after a switchover to a promoted replica (which holds the old
+    source's transactions in its own binlogs), the storage must hold the old
+    source's transactions, then the ones the new source wrote after its
+    promotion: each once, in order"""
+    first = gtids(old)
+    seen = set(first)
+    later = [g for g in gtids(new) if g not in seen]
+    want, got = first + later, gtids(storage)
+    if want == got:
+        print(f"GTIDs: the storage holds the old source's {len(first)} transactions, then "
+              f"the new source's {len(later)}, in order")
+        return 0
+    missing = [g for g in want if g not in got]
+    extra = len(got) - len(set(got))
+    foreign = [g for g in got if g not in set(want)]
+    print(f"GTIDs DIFFER: expected {len(first)} + {len(later)}, storage {len(got)}, "
+          f"missing {len(missing)}, duplicated {extra}, unknown {len(foreign)}, "
+          f"first missing {missing[:3]}")
+    return 1
+
+
 def header_only(path):
     """0 when the binlog holds only FORMAT_DESCRIPTION / PREVIOUS_GTIDS
     events: PBS stores such a binlog as the magic alone until the first
@@ -204,6 +227,8 @@ def main():
         return compare_gtids(sys.argv[2], sys.argv[3])
     if sys.argv[1] == "--rewritten":
         return rewritten(sys.argv[2], sys.argv[3], "--encrypted" in sys.argv)
+    if sys.argv[1] == "--failover":
+        return failover(sys.argv[2], sys.argv[3], sys.argv[4])
     if sys.argv[1] == "--prefix":
         return prefix(sys.argv[2], sys.argv[3], "--gtid" in sys.argv)
     if sys.argv[1] == "--header-only":

@@ -43,6 +43,11 @@
 #             slow            - 3 rounds and one 20 MB transaction over a
 #                               link of BANDWIDTH (default 2 Mbit) to the
 #                               source
+#             soak            - SOAK_HOURS (default 6) simulated hours of
+#                               inserts every 10 s, with rotations; a native
+#                               sampler records pull's memory, descriptors
+#                               and threads (samples.txt), which must not
+#                               keep growing
 #             cron            - 'fetch' every 5 minutes instead of 'pull',
 #                               for CRON_HOURS (default 3) of inserts every 5
 #                               minutes, the source restarted every hour: a
@@ -76,6 +81,15 @@
 #   S3_LOSS / S3_LATENCY  the link between pull and the S3 server
 #   S3_PAUSE=<start>-<end>[,...]  a relay between pull and the S3 server
 #                   (host 's3relay') silent during these windows
+#   FAILOVER=<s>    a second source, db2, replicates from db with GTIDs;
+#                   at that second a planned switchover: db read-only, db2
+#                   caught up and promoted, the relay in front of pull
+#                   pointed at db2, db shut down, the workload follows; the
+#                   storage must hold db's transactions, then db2's (GTID
+#                   mode), or stay a prefix of db's binlogs (position mode)
+#   DB2_FLUSHES=N   db2 rotates its binlog N times before replicating, so
+#                   it has binlogs with the names of db's (position mode:
+#                   pull then asks it for an offset in another file)
 #   S3_KILL_AT=<s>  the S3 server killed (SIGKILL) then, started again
 #                   S3_DOWN (default 20) seconds later
 # env: SEED (default 1), MODE (position|gtid, default position),
@@ -121,6 +135,9 @@ S3_KILL_AT=${S3_KILL_AT:-}
 S3_DOWN=${S3_DOWN:-20}
 # dynamically linked: Shadow runs no static binaries (README.md)
 VERSITYGW=${VERSITYGW:-$(dirname "$SHADOW")/versitygw}
+FAILOVER=${FAILOVER:-}
+DB2_FLUSHES=${DB2_FLUSHES:-0}
+SOAK_HOURS=${SOAK_HOURS:-6}
 if [ -n "$PURGE" ] && [ -z "$PAUSE" ]; then echo "PURGE needs PAUSE"; exit 2; fi
 if [ -n "$S3" ] && [ ! -x "$VERSITYGW" ]; then
   echo "S3 needs a dynamically linked versitygw at $VERSITYGW (build_shadow.sh)"; exit 2
@@ -150,6 +167,7 @@ case $SCENARIO in
   pbskill) STOP=${STOP:-190} ;;
   slow) STOP=${STOP:-420} ;;
   cron) STOP=${STOP:-$((CRON_HOURS * 3600 + 600))} ;;
+  soak) STOP=${STOP:-$((SOAK_HOURS * 3600 + 300))} ;;
   replica|replica_early|heartbeat) STOP=${STOP:-190} ;;
   stop) STOP=${STOP:-$((PBS_TERM_AT + 70))} ;;
   # past the read timeout (60 s) after the last transaction: in GTID mode
@@ -161,7 +179,7 @@ case $SCENARIO in
   idle) STOP=${STOP:-3700} ;;
   crash) STOP=${STOP:-$((KILL_AT + 60))} ;;
   lossy) STOP=${STOP:-180}; [ "$LOSS" = 0 ] && LOSS=0.02; [ "$LATENCY" = "1 ms" ] && LATENCY="20 ms" ;;
-  pbskill|replica|replica_early|heartbeat|stop|slow|cron) ;;
+  pbskill|replica|replica_early|heartbeat|stop|slow|cron|soak) ;;
   *) echo "unknown scenario $SCENARIO"; exit 2 ;;
 esac
 # a pause (or the S3 server's absence) delays everything by its length; pull
@@ -216,7 +234,10 @@ KEYS
 fi
 # pull reaches the source, and the S3 server, directly or through a relay
 SOURCE_HOST=db
-[ -n "$PAUSE" ] && SOURCE_HOST=relay
+[ -n "$PAUSE$FAILOVER" ] && SOURCE_HOST=relay
+# FAILOVER: the current primary, read by the relay for every new connection
+# and by the workload for every statement
+echo db > "$E/primary"
 # STORE: the directory the checks read, the file storage or the S3 bucket's
 # directory on the S3 server's posix backend
 if [ -n "$S3" ]; then
@@ -256,6 +277,13 @@ JSON
 
 # workload, run by bash on the client host
 M="$B/bin/mysql --no-defaults --host=db --port=3306 --user=rpl --ssl-mode=DISABLED"
+# the workload's client: with FAILOVER a function that asks the current
+# primary
+WM=$M PRELUDE=""
+if [ -n "$FAILOVER" ]; then
+  PRELUDE="mysqlw() { $B/bin/mysql --no-defaults --host=\$(cat $E/primary) --port=3306 --user=rpl --ssl-mode=DISABLED \"\$@\"; }"
+  WM=mysqlw
+fi
 # the event after the last transaction makes PBS write it (ticket 94)
 FINAL_FLUSH="\$M -e 'FLUSH BINARY LOGS'"
 SLEEP=2 BIG=""
@@ -264,6 +292,7 @@ case $SCENARIO in
   # the binlog stream crosses the slow link
   slow) ROUNDS=3; BIG='$M -e "CREATE TABLE w.big (id INT AUTO_INCREMENT PRIMARY KEY, v LONGBLOB); INSERT INTO w.big (v) WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 20) SELECT REPEAT(CHAR(120), 1048576) FROM s"' ;;
   cron) ROUNDS=$((CRON_HOURS * 12)); SLEEP=300 ;;
+  soak) ROUNDS=$((SOAK_HOURS * 360)); SLEEP=10 ;;
   basic|restart|lossy|pbskill|replica|replica_early|heartbeat|stop) ROUNDS=30 ;;
   quiet) ROUNDS=30; FINAL_FLUSH="" ;;
   idle) ROUNDS=5 ;;
@@ -273,7 +302,8 @@ esac
 cat > "$E/workload.sh" <<SH
 #!/bin/bash
 set -e
-M="$M"
+$PRELUDE
+M="$WM"
 \$M -e "CREATE DATABASE w; CREATE TABLE w.t (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(200))"
 i=0
 while [ \$i -lt $ROUNDS ]; do
@@ -482,7 +512,7 @@ else
       args:
 $MYSQLD_ARGS
       start_time: ${DB_START}s
-      expected_final_state: running
+      expected_final_state: $([ -n "$FAILOVER" ] && echo "{exited: 0}" || echo running)
 YAML
 )
   SHUTDOWN_PROCESS=""
@@ -491,19 +521,22 @@ fi
 PBS_PROCESS="    - path: $PBS
       args: [\"pull\", \"$E/binsrv.json\"]
       environment: { AWS_EC2_METADATA_DISABLED: \"true\" }"
-if [ "$PURGE" = lost ]; then
-  # pull must exit, with an error: a wrapper records how and when
+if [ "$PURGE" = lost ] || { [ -n "$FAILOVER" ] && [ "$MODE" = position ]; }; then
+  # pull must (PURGE) or may (a failover in position mode) exit: a wrapper
+  # records how and when; after a failover it stays, so either way ends in
+  # the same final state
   cat > "$E/pull_wrap.sh" <<SH
 #!/bin/bash
 export AWS_EC2_METADATA_DISABLED=true
 "$PBS" pull "$E/binsrv.json"
 rc=\$?
 echo "pull exit \$rc at \$(( \$(date +%s) - 946684800 )) s" > "$E/pull_exit.txt"
+$([ -n "$FAILOVER" ] && echo "exec sleep 1000000")
 SH
   PBS_PROCESSES="    - path: /bin/bash
       args: [\"$E/pull_wrap.sh\"]
       start_time: 10s
-      expected_final_state: {exited: 0}"
+      expected_final_state: $([ -n "$FAILOVER" ] && echo running || echo "{exited: 0}")"
 elif [ "$SCENARIO" = pbskill ]; then
   PBS_PROCESSES="$PBS_PROCESS
       start_time: 10s
@@ -612,6 +645,58 @@ $procs
 fi
 # relays (pause_relay.py) and the S3 server, each on a host of its own
 EXTRA_HOSTS=""
+FAILOVER_PROCESSES=""
+if [ -n "$FAILOVER" ]; then
+  # db2: a copy of the template with a server UUID of its own, a GTID
+  # replica of db that writes its own binlog (log_replica_updates)
+  cp -a "$T" "$E/rdata_db2"
+  printf '[auto]\nserver-uuid=00000000-0000-0000-0000-0000000000d2\n' > "$E/rdata_db2/auto.cnf"
+  mkdir -p "$E/rtmp_db2"
+  DB2_ARGS=$(sed -e "s|--datadir=$E/data|--datadir=$E/rdata_db2|" -e "s|--log-error=$E/db.err|--log-error=$E/db2.err|" \
+    -e "s|--tmpdir=$E/tmp|--tmpdir=$E/rtmp_db2|" -e "s|--server-id=1\"|--server-id=11\"|" \
+    -e "s|--gtid-mode=OFF|--gtid-mode=ON|" -e "s|--enforce-gtid-consistency=OFF|--enforce-gtid-consistency=ON|" <<< "$MYSQLD_ARGS")
+  EXTRA_HOSTS+="  db2:
+    network_node_id: 1
+    processes:
+    - path: $B/bin/mysqld
+      args:
+$DB2_ARGS
+      start_time: 1s
+      expected_final_state: running
+"
+  MC="$B/bin/mysql --no-defaults --port=3306 --user=rpl --ssl-mode=DISABLED"
+  cat > "$E/db2_setup.sh" <<SH
+#!/bin/bash
+until $MC --host=db2 -e "SELECT 1" >/dev/null 2>&1; do sleep 0.2; done
+for i in \$(seq 1 $DB2_FLUSHES); do $MC --host=db2 -e "FLUSH BINARY LOGS"; done
+$MC --host=db2 -e "CHANGE REPLICATION SOURCE TO SOURCE_HOST='db', SOURCE_PORT=3306,
+    SOURCE_USER='rpl', SOURCE_PASSWORD='', SOURCE_SSL=0, GET_SOURCE_PUBLIC_KEY=1,
+    SOURCE_AUTO_POSITION=1, SOURCE_CONNECT_RETRY=1; START REPLICA"
+echo "db2 replicating from db"
+SH
+  # a planned switchover, as an operator or an orchestrator does it
+  cat > "$E/failover.sh" <<SH
+#!/bin/bash
+set -e
+t() { echo \$(( \$(date +%s) - 946684800 )); }
+$MC --host=db -e "SET GLOBAL super_read_only = ON"
+executed=\$($MC --host=db -N -e "SELECT REPLACE(@@GLOBAL.gtid_executed, '\\n', '')")
+caught=\$($MC --host=db2 -N -e "SELECT WAIT_FOR_EXECUTED_GTID_SET('\$executed', 60)")
+$MC --host=db2 -e "STOP REPLICA; RESET REPLICA ALL"
+echo db2 > "$E/primary"
+$MC --host=db -e "SHUTDOWN"
+echo "switchover at \$(t) s: db read-only at $FAILOVER s, db2 caught up (\$caught) with \$executed" | tee "$E/failover.txt"
+SH
+  chmod +x "$E/db2_setup.sh" "$E/failover.sh"
+  FAILOVER_PROCESSES="    - path: /bin/bash
+      args: [\"$E/db2_setup.sh\"]
+      start_time: 5s
+      expected_final_state: {exited: 0}
+    - path: /bin/bash
+      args: [\"$E/failover.sh\"]
+      start_time: ${FAILOVER}s
+      expected_final_state: {exited: 0}"
+fi
 relay_host() {  # <host> <network node> <listen port> <server> <port> <windows>
   EXTRA_HOSTS+="  $1:
     network_node_id: $2
@@ -622,7 +707,7 @@ relay_host() {  # <host> <network node> <listen port> <server> <port> <windows>
       expected_final_state: running
 "
 }
-[ -n "$PAUSE" ] && relay_host relay 0 3306 db 3306 "$PAUSE"
+[ -n "$PAUSE$FAILOVER" ] && relay_host relay 0 3306 "$([ -n "$FAILOVER" ] && echo "@$E/primary" || echo db)" 3306 "$PAUSE"
 [ -n "$REPLICA_PAUSE" ] && relay_host rrelay 2 3307 pbs 3307 "$REPLICA_PAUSE"
 [ -n "$S3_PAUSE" ] && relay_host s3relay 0 9000 s3 9000 "$S3_PAUSE"
 if [ -n "$S3" ]; then
@@ -771,12 +856,35 @@ $EXTRA_HOSTS
 $SHUTDOWN_PROCESS
 $REPLICA_CLIENTS
 $PURGE_PROCESS
+$FAILOVER_PROCESSES
 YAML
 
 cd "$E"
 started=$(date +%s)
+if [ "$SCENARIO" = soak ]; then
+  # Shadow's /proc shows native processes, not simulated ones, so pull is
+  # sampled from outside: the RSS and threads of its native process, with the
+  # simulated time of its last log line. Shadow opens regular files on its
+  # behalf and emulates sockets, so the files pull holds open are counted
+  # among the shadow process's descriptors (those in the storage, the S3
+  # buffer directory and the local settings)
+  (
+    while sleep "${SAMPLE_EVERY:-5}"; do
+      pid=$(pgrep -f "pull $E/binsrv.json" | head -1)
+      # the shadow process itself, not the 'timeout' in front of it
+      spid=$(pgrep -f "^$SHADOW --data-directory $E/shadow.data" | head -1)
+      [ -n "$pid" ] && [ -r "/proc/$pid/status" ] || continue
+      stamp=$(tail -1 "$E/binsrv.log" 2>/dev/null | sed -nE 's/^\[2000-01-(0[1-9])T([0-9:]{8}).*/\1 \2/p')
+      [ -n "$stamp" ] || continue
+      files=$(ls -l "/proc/$spid/fd" 2>/dev/null | grep -cE "$E/(storage|s3buf|local_settings)")
+      echo "$stamp $(awk '/^VmRSS/ {r = $2} /^Threads/ {t = $2} END {print r, t}' "/proc/$pid/status") $files"
+    done > "$E/samples.txt"
+  ) &
+  SAMPLER=$!
+fi
 timeout "${WALL:-1500}" "$SHADOW" --data-directory "$E/shadow.data" "$E/shadow.yaml" > "$E/shadow.log" 2>&1
 code=$?
+[ -n "${SAMPLER:-}" ] && kill "$SAMPLER" 2>/dev/null
 echo "== $NAME ($SCENARIO, $MODE, seed $SEED): shadow exit $code after $(( $(date +%s) - started )) s wall time for $STOP s simulated"
 echo "-- workload stdout:"; cat "$E"/shadow.data/hosts/client/bash.*.stdout 2>/dev/null | grep -E "done|COUNT|^[0-9]" | tail -6
 echo "-- workload stderr (last 5):"; cat "$E"/shadow.data/hosts/client/bash.*.stderr 2>/dev/null | grep -v "password on the command line" | tail -5
@@ -791,7 +899,23 @@ if [ -n "$PURGE" ]; then
   echo "-- purge: $(cat "$E/purge.txt" 2>/dev/null || echo "no purge.txt")"
   cp "$E"/purged/binlog.[0-9]* "$E/data/" 2>/dev/null
 fi
-if [ -n "$ENCRYPT" ]; then
+if [ -n "$FAILOVER" ]; then
+  echo "-- failover: $(cat "$E/failover.txt" 2>/dev/null || echo "no failover.txt")"
+  if [ "$MODE" = gtid ]; then
+    # db's transactions, then the ones db2 wrote after its promotion
+    echo "-- storage vs db, then db2 (transactions):"
+    python3 "$HERE/check_binlog_timestamps.py" --failover "$E/data" "$E/rdata_db2" "$STORE" | sed 's/^/  /'
+  else
+    # db2's binlogs are other files under the same names: whatever pull did
+    # after the switch, what it stored must still be a prefix of db's
+    echo "-- storage vs db, a prefix of it (db2 writes other binlogs under the same names):"
+    python3 "$HERE/check_binlog_timestamps.py" --prefix "$E/data" "$STORE" | sed 's/^/  /'
+  fi
+  [ "${PIPESTATUS[0]}" = 0 ] || bad=1
+  [ -n "$FAILOVER" ] && [ "$MODE" = position ] &&
+    echo "-- pull: $(cat "$E/pull_exit.txt" 2>/dev/null || echo "still running at the end")"
+  echo "-- pull after the switchover: $(grep -E 'established connection|error\]' "$E/binsrv.log" | tail -3 | cut -c1-200 | tr '\n' '|')"
+elif [ -n "$ENCRYPT" ]; then
   echo "-- storage vs source: encrypted, checked through the replica instead"
 elif [ "$PURGE" = lost ] || { [ "$SCENARIO" = stop ] && [ -n "$PAUSE" ]; }; then
   # pull stopped where the purge left it, or was stopped during the pause:
@@ -917,6 +1041,25 @@ fi
 if [ -n "$S3" ]; then
   echo "-- S3 server stderr (last 3):"
   cat "$E"/shadow.data/hosts/s3/*.stderr 2>/dev/null | tail -3 | cut -c1-200 | sed 's/^/  /'
+fi
+if [ "$SCENARIO" = soak ]; then
+  # growth from the second simulated hour (after start-up and the first
+  # rotations) to the last one
+  echo "-- pull's native process, sampled (simulated time, RSS KiB, threads, files open in the storage):"
+  soak=$(awk -v hours="$SOAK_HOURS" '
+    { split($2, c, ":"); t = ($1 - 1) * 86400 + c[1] * 3600 + c[2] * 60 + c[3]
+      n++; if (t >= 3600 && t < 7200) { if ($3 > r0) r0 = $3; if ($5 > f0) f0 = $5; if ($4 > h0) h0 = $4 }
+      if (t >= (hours - 1) * 3600) { if ($3 > r1) r1 = $3; if ($5 > f1) f1 = $5; if ($4 > h1) h1 = $4 } }
+    END { printf "%d %d %d %d %d %d %d\n", n, r0, r1, f0, f1, h0, h1 }' "$E/samples.txt" 2>/dev/null)
+  read -r n r0 r1 f0 f1 h0 h1 <<< "$soak"
+  awk 'NR % 20 == 1' "$E/samples.txt" 2>/dev/null | head -40 | sed 's/^/  /'
+  echo "  $n samples; hour 2 vs the last hour: RSS $r0 -> $r1 KiB, open storage files $f0 -> $f1, threads $h0 -> $h1"
+  [ -n "$S3" ] && echo "  S3 buffer directory at the end: $(du -sk "$E/s3buf" 2>/dev/null | cut -f1) KiB"
+  # a leak shows as steady growth; allowances for allocator noise
+  soak_ok=$([ "${n:-0}" -ge 10 ] && [ "${r1:-0}" -le $(( ${r0:-0} + ${r0:-0} / 4 + 20480 )) ] &&
+    [ "${f1:-0}" -le $(( ${f0:-0} + 5 )) ] && [ "${h1:-0}" -le $(( ${h0:-0} + 2 )) ] && echo ok || echo FAIL)
+  extra="$extra, RSS ${r0}->${r1} KiB files ${f0}->${f1} threads ${h0}->${h1}: $soak_ok"
+  [ "$soak_ok" = ok ] || verdict=FAIL
 fi
 if [ "$SCENARIO" = stop ]; then
   # the last line pull logs, against the SIGTERM at PBS_TERM_AT

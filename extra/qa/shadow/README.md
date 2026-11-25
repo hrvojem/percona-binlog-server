@@ -49,7 +49,25 @@ What it gives over the harnesses on real hosts:
   simulated time, which is how the kill points were placed).
   Faults between hosts: `PAUSE`, `REPLICA_PAUSE`, `S3_PAUSE` (windows of
   simulated seconds such as `40-160`), `PURGE=safe|lost` (with `PAUSE`),
-  `S3=1` with `S3_LOSS` / `S3_LATENCY` and `S3_KILL_AT` / `S3_DOWN`.
+  `S3=1` with `S3_LOSS` / `S3_LATENCY` and `S3_KILL_AT` / `S3_DOWN`,
+  `FAILOVER=<s>` with `DB2_FLUSHES`; the scenario `soak` with
+  `SOAK_HOURS`.
+* `FAILOVER`: a second source `db2` (its own server UUID, a GTID replica of
+  `db` that writes its own binlogs) on the source's network node. At that
+  second a client on the `client` host makes a planned switchover: `db`
+  `super_read_only`, `WAIT_FOR_EXECUTED_GTID_SET` on `db2`, `RESET REPLICA
+  ALL`, then the file `primary` names `db2` and `db` is shut down. The relay
+  in front of `pull` (`pause_relay.py @<file>`) and the workload read
+  `primary` for every new connection. Checks: `--failover` in GTID mode,
+  `--prefix` against `db` in position mode, where `pull` runs under a
+  wrapper that records its exit and stays.
+* `soak`: inserts every 10 s for `SOAK_HOURS` (about 50 rotations an
+  hour). A native loop samples `pull` while Shadow runs, because Shadow's
+  `/proc` shows native processes: the RSS and threads of `pull`'s native
+  process, and the files of the storage that the `shadow` process holds open
+  for it (Shadow opens regular files on a managed process's behalf and
+  emulates sockets, so the native process's own descriptors say nothing).
+  Two simulated hours take about 7.5 minutes.
 * `pause_relay.py`: a TCP relay on a host of its own (`relay` between `pull`
   and the source, `rrelay` between the replicas and the listener, `s3relay`
   between `pull` and the S3 server) that forwards nothing during its pause
@@ -88,7 +106,8 @@ What it gives over the harnesses on real hosts:
   under the same encryption record (ticket 32, AES-CTR keystream reuse);
   with `--prefix <source> <storage> [--gtid]`, the storage must be the start
   of the source's binlogs (or transactions), the last one possibly cut
-  short.
+  short; with `--failover <old> <new> <storage>`, the old source's
+  transactions, then the ones the new source wrote after its promotion.
 * The Shadow changes are also on the fork `hrvojem/shadow`: branch
   `mysql-support-v3.3.0` (this patch on v3.3.0, one commit) and branch
   `mysql-support` (the same changes on shadow's main as five commits,

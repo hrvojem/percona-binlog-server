@@ -51,7 +51,21 @@ What it gives over the harnesses on real hosts:
   simulated seconds such as `40-160`), `PURGE=safe|lost` (with `PAUSE`),
   `S3=1` with `S3_LOSS` / `S3_LATENCY` and `S3_KILL_AT` / `S3_DOWN`,
   `FAILOVER=<s>` with `DB2_FLUSHES`; the scenario `soak` with
-  `SOAK_HOURS`.
+  `SOAK_HOURS`; window flags `/down`, `/up`, `/old` (one direction, or
+  only the connections opened before the window: half-open); `CUT=<n>`
+  with `CUT_MODE=fin|rst` and `RECORD_STREAM=1`; `SOURCE_SSL_MODE`;
+  `S3_BANDWIDTH`; `SAMPLE=1` and `MAX_RSS_MB` (the soak's sampler in any
+  scenario); `BIG_ROW_MB` (slow: one row event of that size).
+* Cuts: the relay closes `pull`'s first connection to the source after
+  exactly `CUT` bytes towards `pull`, with a FIN or an RST (`SO_LINGER` 0).
+  `pull` negotiates TLS with the source by default (`preferred`: the
+  source's auto-generated certificates are not checked, so Shadow's clock
+  does not matter), which hides the packets; with `SOURCE_SSL_MODE=disabled`
+  the recorded stream (`stream.bin`) shows MySQL packets and events, and
+  `shadow_test.py` places its cuts at their boundaries.
+* With `PAUSE`, a client counts the source's Binlog Dump threads 5 s before
+  the first window ends (`dump_threads.txt`): a connection `pull` gave up on
+  must not keep a second one.
 * `FAILOVER`: a second source `db2` (its own server UUID, a GTID replica of
   `db` that writes its own binlogs) on the source's network node. At that
   second a client on the `client` host makes a planned switchover: `db`
@@ -134,7 +148,15 @@ What it gives over the harnesses on real hosts:
 * Shadow does not enforce `fcntl` locks: a restarted `mysqld` must start
   only after the old one has exited, or both use the same data directory.
 * The simulated clock starts at 2000-01-01, so certificates are "not yet
-  valid": the scenarios run without TLS.
+  valid": nothing that verifies a certificate works. `pull`'s default
+  `preferred` mode does not verify, so its connection to the source is TLS;
+  the replicas and the listener run without TLS.
+* One `read()` of a regular file returns at most 10 MiB under Shadow
+  (`read(fd, ..., 50323456) = 10485760` in the source's dump thread). Linux
+  returns a short read of a regular file only at its end, so MySQL's binlog
+  reader takes it for a truncated binlog and sends ER 1236 "binlog truncated
+  in the middle of event". Events in the scenarios stay below 10 MiB
+  (`huge_event` is a 9 MiB row); the same 48 MiB row streams fine natively.
 
 ## Determinism
 

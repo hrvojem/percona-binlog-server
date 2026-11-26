@@ -107,7 +107,29 @@ summary):
                rotations): pull's memory (RSS of its native process),
                threads and files open in the storage, sampled from outside,
                must not grow from the second hour to the last;
-  soak_s3      the same on an S3 storage.
+  soak_s3      the same on an S3 storage;
+  half_open    the relay keeps pull's connection to the source open but
+               silent from 40 to 250 s, while new connections work (a NAT
+               that dropped its state): pull must reconnect after its read
+               timeout, and the source must not keep a second Binlog Dump
+               thread for the dead connection;
+  oneway_down, oneway_up  only source -> pull, or only pull -> source,
+               silent from 40 to 160 s;
+  replica_half_open  the same half-open connection between the replica and
+               pull's listener;
+  s3_slow      one 20 MB transaction with the link to the S3 server at 8
+               Mbit/s: every checkpoint uploads the whole binlog again;
+               pull's memory is sampled;
+  huge_event   one row of 9 MiB, a single row event, over a 4 Mbit/s link
+               (Shadow returns at most 10 MiB from one read() of a file, which
+               MySQL takes for a truncated binlog: shadow/README.md);
+  s3_outage_replica  the S3 server down from 100 to 130 s, while the source
+               is idle (no upload, so ticket 98 does not apply), and a
+               replica that connects at 105 s and reads from pull's S3
+               storage: it must catch up once the S3 server is back;
+  cut_ref, cut_ref_tls  basic, with the relay recording what pull's first
+               connection carried, for the cut sets: without TLS
+               (connection.ssl.mode disabled) and with pull's default TLS.
 
 Kill sets ('<set>/<offset>us', --kill-points of them per set, picked by
 the seed): pull killed with SIGKILL at a microsecond around an anchor line
@@ -126,7 +148,19 @@ what the kill left in the storage:
   replica_pbs_kill         one kill at the rotation while a replica
                            streams from pull: the replica must catch up;
   s3_pbs_kill, enc_s3_pbs_kill  the first rotation on an S3 storage (the
-                           s3_basic run), plain and encrypted.
+                           s3_basic run), plain and encrypted;
+  big_kill                 seconds into the 20 MB transaction of the slow
+                           case (0 to 80 s after its GTID event);
+  huge_event_kill          seconds into the 9 MiB row event (0 to 20 s).
+
+Cut sets ('<set>/<offset>b', --kill-points of them per set): the relay
+closes pull's first connection to the source after exactly <offset> bytes,
+with a FIN (cut_fin) or an RST (cut_rst), without TLS. The offsets come
+from the cut_ref run's recording: the start of each MySQL packet, inside its
+length, its payload, an event's header (inside event_size) and body, the
+middle of the body and its checksum. cut_tls cuts pull's default TLS
+connection inside its records (from cut_ref_tls). pull must reconnect and
+end equal to the source.
 
 GTID mode is rewrite mode, where PBS writes its own binlogs: there the
 storage is compared with the source by its GTIDs instead of byte by byte.
@@ -188,6 +222,25 @@ CASES = {
     # 6 simulated hours: about 22 minutes alone
     "soak": ("soak", {"SOAK_HOURS": "6", "WALL": "4800"}),
     "soak_s3": ("soak", {"SOAK_HOURS": "6", "S3": "1", "WALL": "4800"}),
+    # one-way and half-open silence (pause_relay.py window flags)
+    "half_open": ("basic", {"PAUSE": "40-250/old"}),
+    "oneway_down": ("basic", {"PAUSE": "40-160/down"}),
+    "oneway_up": ("basic", {"PAUSE": "40-160/up"}),
+    "replica_half_open": ("replica", {"REPLICA_PAUSE": "60-160/old",
+                                      "CHECK_AT": "200"}),
+    # big transactions and a slow link to S3
+    "s3_slow": ("slow", {"S3": "1", "BANDWIDTH": "1000 Mbit",
+                         "S3_BANDWIDTH": "8 Mbit", "SAMPLE": "1"}),
+    "huge_event": ("slow", {"BIG_ROW_MB": "9", "BANDWIDTH": "4 Mbit",
+                            "SAMPLE": "1"}),
+    # a replica reading from an S3-backed pull while S3 is down
+    "s3_outage_replica": ("basic", {"S3": "1", "S3_KILL_AT": "100",
+                                    "S3_DOWN": "30", "WITH_REPLICA": "1",
+                                    "REPLICA_AT": "105", "CHECK_AT": "170"}),
+    # the references of the cut sets: without TLS (MySQL packets and events
+    # can be told apart) and with it (TLS records)
+    "cut_ref": ("basic", {"RECORD_STREAM": "1", "SOURCE_SSL_MODE": "disabled"}),
+    "cut_ref_tls": ("basic", {"RECORD_STREAM": "1"}),
 }
 
 # kill sets: pull killed with SIGKILL at microseconds around an anchor, a
@@ -221,8 +274,52 @@ KILL_SETS = {
     "s3_pbs_kill": ("s3_basic", ROTATION, 1, {"S3": "1"}, None),
     "enc_s3_pbs_kill": ("s3_basic", ROTATION, 1, {"S3": "1", "ENCRYPT": "1"},
                         None),
+    # seconds into a big transaction: its GTID event is the 7th (two for
+    # the schema, three inserts, the big table, the big insert)
+    "big_kill": ("slow", CHECKPOINT, 7, {}, None,
+                 {"scenario": "slow", "seconds": range(0, 81, 4)}),
+    "huge_event_kill": ("huge_event", CHECKPOINT, 7,
+                        {"BIG_ROW_MB": "9", "BANDWIDTH": "4 Mbit"}, None,
+                        {"scenario": "slow", "seconds": range(0, 21)}),
 }
 KILL_OFFSETS = range(-20, 41)
+# cut sets: the relay cuts pull's first connection after a byte offset
+# taken from the cut_ref run's recording (stream.bin)
+# set: (FIN or RST, reference case, environment)
+CUT_SETS = {
+    "cut_fin": ("fin", "cut_ref", {"SOURCE_SSL_MODE": "disabled"}),
+    "cut_rst": ("rst", "cut_ref", {"SOURCE_SSL_MODE": "disabled"}),
+    # pull's default: TLS, cut inside its records
+    "cut_tls": ("fin", "cut_ref_tls", {}),
+}
+
+
+def cut_points(path: Path) -> list:
+    """byte offsets of interest in a recorded server -> client stream: each
+    MySQL packet's start, a byte into its length, its payload; for a binlog
+    event packet (payload 0x00 + event) also the event header, a byte into
+    event_size, the body, the middle of the body and the checksum. Once TLS
+    starts (after the greeting): each TLS record's start, a byte into its
+    length, its payload, its middle and its last byte"""
+    data = path.read_bytes()
+    points = set()
+    pos = 0
+    while pos + 4 <= len(data):
+        if data[pos] in (0x14, 0x15, 0x16, 0x17) and data[pos + 1] == 3:
+            end = pos + 5 + int.from_bytes(data[pos + 3:pos + 5], "big")
+            points.update((pos, pos + 4, pos + 5, (pos + end) // 2, end - 1))
+            pos = end
+            continue
+        length = int.from_bytes(data[pos:pos + 3], "little")
+        end = pos + 4 + length
+        points.update((pos, pos + 2, pos + 4))
+        if length >= 20 and data[pos + 4] == 0:
+            event = pos + 5
+            body = event + 19
+            points.update((event, event + 10, body, (body + end) // 2,
+                           end - 4))
+        pos = end
+    return sorted(p for p in points if 0 < p < len(data))
 
 VERDICT = re.compile(r"^-- verdict: (PASS|FAIL) \(shadow exit (-?\d+), "
                      r"storage mismatches (\d+), timestamp check (\d+)"
@@ -328,7 +425,8 @@ def main() -> int:
     parser.add_argument("--case-timeout", type=int, default=900,
                         help="wall-clock seconds for one simulation")
     parser.add_argument("--cases", nargs="*",
-                        choices=list(CASES) + list(KILL_SETS))
+                        choices=list(CASES) + list(KILL_SETS) +
+                        list(CUT_SETS))
     parser.add_argument("--kill-points", default="4",
                         help="each kill set: how many kill points of the "
                         f"{len(KILL_OFFSETS)} (-20 to +40 us around its "
@@ -343,11 +441,14 @@ def main() -> int:
         print(json.dumps({"case": "setup", "ok": False,
                           "error": f"no shadow binary at {args.shadow}"}))
         return 1
-    names = list(args.cases or (list(CASES) + list(KILL_SETS)))
+    names = list(args.cases or (list(CASES) + list(KILL_SETS) +
+                                list(CUT_SETS)))
     kill_sets = [name for name in names if name in KILL_SETS]
-    # the reference runs of the kill sets, and determinism's, run first;
-    # basic also makes the template data directory
+    cut_sets = [name for name in names if name in CUT_SETS]
+    # the reference runs of the kill and cut sets, and determinism's, run
+    # first; basic also makes the template data directory
     references = {KILL_SETS[name][0] for name in kill_sets}
+    references.update(CUT_SETS[name][1] for name in cut_sets)
     if "determinism" in names:
         references.add("basic")
     for reference in sorted(references, reverse=True):
@@ -358,7 +459,7 @@ def main() -> int:
               name not in first]
     if not first:
         first = [name for name in names if name != "determinism" and
-                 name not in KILL_SETS][:1]
+                 name not in KILL_SETS and name not in CUT_SETS][:1]
     results = {}
     runs = {}  # case: (scenario, extra environment, run directory name)
 
@@ -375,9 +476,44 @@ def main() -> int:
         results[name] = one(name)
         print(json.dumps(results[name]), flush=True)
     rest = [name for name in names if name not in first and
-            name not in KILL_SETS]
+            name not in KILL_SETS and name not in CUT_SETS]
+
+    def pick(offsets, set_name, points=None, keep=None):
+        """--kill-points of the offsets (or 'points' of them), the same for
+        each seed, a different pick for each set; 'keep' is always run"""
+        count = points or (None if args.kill_points == "all"
+                           else int(args.kill_points))
+        if count is None or count >= len(offsets):
+            return list(offsets)
+        rng = random.Random(f"{args.seed}/{set_name}")
+        if keep is None or points:
+            return sorted(rng.sample(list(offsets), count))
+        return sorted([keep] + rng.sample(
+            [offset for offset in offsets if offset != keep],
+            max(0, count - 1)))
+
+    for cut_set in cut_sets:
+        names.remove(cut_set)
+        mode, reference, env = CUT_SETS[cut_set]
+        try:
+            offsets = cut_points(args.workdir / reference / "stream.bin")
+        except OSError:
+            offsets = []
+        if not offsets:
+            results[cut_set] = {"case": cut_set, "ok": False,
+                                "error": f"no recording of the {reference} "
+                                "run (stream.bin) to place the cuts at"}
+            names.append(cut_set)
+            continue
+        for offset in pick(offsets, cut_set):
+            name = f"{cut_set}/{offset}b"
+            runs[name] = ("basic", dict(env, CUT=str(offset), CUT_MODE=mode),
+                          f"{cut_set}+{offset}")
+            rest.append(name)
+            names.append(name)
     for kill_set in kill_sets:
-        reference, pattern, nth, env, points = KILL_SETS[kill_set]
+        reference, pattern, nth, env, points, *more = KILL_SETS[kill_set]
+        options = more[0] if more else {}
         names.remove(kill_set)
         anchor = kill_anchor(args, reference, pattern, nth)
         if anchor is None:
@@ -386,23 +522,15 @@ def main() -> int:
                                  "run's PBS log to place the kill points at"}
             names.append(kill_set)
             continue
-        offsets = list(KILL_OFFSETS)
-        count = points or (None if args.kill_points == "all"
-                           else int(args.kill_points))
-        if count is not None:
-            # a different pick for each set, the same for each seed
-            rng = random.Random(f"{args.seed}/{kill_set}")
-            if points:
-                offsets = sorted(rng.sample(offsets, count))
-            else:
-                offsets = sorted([0] + rng.sample(
-                    [offset for offset in offsets if offset != 0],
-                    max(0, count - 1)))
-        for offset in offsets:
-            name = f"{kill_set}/{offset:+d}us"
-            runs[name] = ("pbskill",
-                          dict(env, PBS_KILL_US=str(anchor + offset)),
-                          f"{kill_set}{offset:+d}")
+        seconds = "seconds" in options
+        offsets = (list(options["seconds"]) if seconds
+                   else list(KILL_OFFSETS))
+        for offset in pick(offsets, kill_set, points, keep=0):
+            unit, step = ("s", 1000000) if seconds else ("us", 1)
+            name = f"{kill_set}/{offset:+d}{unit}"
+            runs[name] = (options.get("scenario", "pbskill"),
+                          dict(env, PBS_KILL_US=str(anchor + offset * step)),
+                          f"{kill_set}{offset:+d}{unit}")
             rest.append(name)
             names.append(name)
     # the long cases (a WALL of their own) first, so they do not stretch the

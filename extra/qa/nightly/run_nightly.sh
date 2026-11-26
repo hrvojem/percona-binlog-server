@@ -1078,11 +1078,13 @@ if want qa || want rotation; then
         # over 3 hours, pull killed at 4 points of a rotation, a checkpoint
         # and a reconnect (plain and encrypted), MySQL replicas of pull
         # (crashed, lossy, three at once); a new seed (and so new kill
-        # points) every day of the year (about 20 min)
+        # points) every day of the year; silent and half-open links, byte
+        # cuts of pull's source connection, S3 faults, failover, two 6-hour
+        # soaks (about 65 min)
         qa_run shadow_test "shadow_test ($mode)" \
           "${common[@]}" --workdir "$out/qa/sh-$mode" \
           --shadow "$SHADOW_BIN" --seed "$((10#$(date -u +%j)))" \
-          --timeout 4200 ;;
+          --timeout 5400 ;;
       clock_test)
         # binlog_server under libfaketime (built from source into
         # $WS/clock/libfaketime): wall-clock jumps, a skewed clock, time
